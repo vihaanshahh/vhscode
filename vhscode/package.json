@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "vhscode",
+  "version": "0.1.0",
+  "description": "Opencode preset that splits between GitHub Copilot (subscription) and a local LLM, with headroom compression for maximum token savings.",
+  "type": "commonjs",
+  "license": "MIT",
+  "author": "vihaanshahh",
+  "homepage": "https://github.com/vihaanshahh/VHSCode",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vihaanshahh/VHSCode.git"
+  },
+  "bin": {
+    "vhscode": "./bin/vhscode"
+  },
+  "files": [
+    "bin",
+    "config",
+    "opencode-dir",
+    "scripts",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node ./scripts/postinstall.js || true",
+    "setup": "bash ./scripts/setup.sh"
+  },
+  "peerDependencies": {
+    "opencode-ai": "*"
+  },
+  "peerDependenciesMeta": {
+    "opencode-ai": { "optional": true }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "vhscode",
+    "opencode",
+    "copilot",
+    "ollama",
+    "local-llm",
+    "headroom",
+    "ai",
+    "coding-agent"
+  ]
+}

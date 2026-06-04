@@ -1,0 +1,67 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // VHSCode preset: Copilot for heavy work, local Ollama for utility,
+  // headroom in front of Copilot, orchestrator agent as the default primary.
+
+  "model": "github-copilot/claude-sonnet-4.5",
+  "small_model": "vhscode-local/qwen2.5-coder:3b",
+  "default_agent": "vhs-orchestrator",
+
+  "provider": {
+    "github-copilot": {
+      "options": {
+        // The wrapper rewrites this to the headroom proxy URL at launch time
+        // when VHSCODE_HEADROOM is on (default).
+        "baseURL": "${VHSCODE_COPILOT_BASE_URL:-https://api.githubcopilot.com}"
+      }
+    },
+    "vhscode-local": {
+      "name": "VHSCode Local",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "${VHSCODE_LOCAL_BASE_URL:-http://127.0.0.1:11434/v1}",
+        "apiKey": "ollama"
+      },
+      "models": {
+        "qwen2.5-coder:3b": {
+          "name": "Qwen2.5 Coder 3B (local)",
+          "tool_call": true,
+          "reasoning": false,
+          "attachment": false,
+          "limit": { "context": 32768, "output": 4096 },
+          "cost": { "input": 0, "output": 0 }
+        },
+        "qwen2.5-coder:1.5b": {
+          "name": "Qwen2.5 Coder 1.5B (local)",
+          "tool_call": true,
+          "reasoning": false,
+          "attachment": false,
+          "limit": { "context": 32768, "output": 4096 },
+          "cost": { "input": 0, "output": 0 }
+        },
+        "llama3.2:3b": {
+          "name": "Llama 3.2 3B (local)",
+          "tool_call": true,
+          "reasoning": false,
+          "attachment": false,
+          "limit": { "context": 8192, "output": 2048 },
+          "cost": { "input": 0, "output": 0 }
+        }
+      }
+    }
+  },
+
+  "agent": {
+    "title":      { "model": "vhscode-local/qwen2.5-coder:1.5b" },
+    "summary":    { "model": "vhscode-local/qwen2.5-coder:3b" },
+    "compaction": { "model": "vhscode-local/qwen2.5-coder:3b" },
+    "explore":    { "model": "vhscode-local/qwen2.5-coder:3b" }
+  },
+
+  "compaction": { "auto": true, "prune": true, "tail_turns": 2 },
+
+  "tool_output": { "max_lines": 1500, "max_bytes": 40960 },
+
+  "plugin": ["./plugin/orchestrator.ts"]
+}
