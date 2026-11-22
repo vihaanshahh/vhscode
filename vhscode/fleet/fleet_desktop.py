@@ -522,9 +522,8 @@ def _validate_host(host):
         raise ValueError("Choose a host name and workspace directory")
 
 
-def serve(handle):
+def _reply(handle, data):
     try:
-        data = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
         if len(data) > MAX_REQUEST_BYTES:
             raise ValueError("Fleet request exceeds 2 MiB")
         message = json.loads(data)
@@ -533,7 +532,25 @@ def serve(handle):
         reply = handle(message)
     except Exception as error:
         reply = {"error": str(error)}
-    print(json.dumps(reply))
+    return json.dumps(reply, ensure_ascii=False).encode("utf-8", errors="backslashreplace")
+
+
+def serve(handle):
+    sys.stdout.buffer.write(_reply(handle, sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)) + b"\n")
+
+
+def serve_reads():
+    # One request is in flight at a time. Exit when the app closes the pipe or goes idle.
+    stream = sys.stdin.buffer
+    with DefaultSelector() as ready:
+        ready.register(stream, EVENT_READ)
+        while ready.select(30):
+            line = stream.readline(MAX_REQUEST_BYTES + 2)
+            if not line or not line.endswith(b"\n"):
+                return
+            data = _reply(dispatch, line[:-1])
+            sys.stdout.buffer.write(len(data).to_bytes(4, "big") + data)
+            sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":
@@ -542,5 +559,7 @@ if __name__ == "__main__":
             _run(sys.argv[2], int(sys.argv[3]))
         finally:
             os.close(int(sys.argv[4]))
+    elif sys.argv[1:] == ["--read-stream"]:
+        serve_reads()
     else:
         serve(dispatch)

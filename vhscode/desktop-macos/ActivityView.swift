@@ -104,6 +104,7 @@ struct FleetOverview: View {
     let section: String
     let onOpen: (FleetHost) -> Void
 
+    @Environment(\.scenePhase) private var scenePhase
     @State private var snapshots: [String: FleetSnapshot] = [:]
     @State private var refreshing = false
     @State private var runSelection: String?
@@ -159,7 +160,8 @@ struct FleetOverview: View {
             }
         }
         .padding(22)
-        .task(id: refreshID) {
+        .task(id: scenePhase == .active ? refreshID : nil) {
+            guard scenePhase == .active else { return }
             await refresh(waitForCurrent: true)
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(20)) } catch { break }

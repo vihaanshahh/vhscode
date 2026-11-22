@@ -3,6 +3,7 @@ import SwiftUI
 
 struct WorkspaceView: View {
     let host: FleetHost
+    var monitorRuns = true
     var selectedAgentLane: FleetAgentLaneSelection? = nil
     var onAgentLanesChange: ([FleetAgentLane]) -> Void = { _ in }
     var onActiveAgentLaneChange: (FleetAgentLane) -> Void = { _ in }
@@ -15,7 +16,7 @@ struct WorkspaceView: View {
     var body: some View {
         Group {
             if let model = workspaces[scope] {
-                WorkspacePane(host: host, model: model, selectedAgentLane: selectedAgentLane,
+                WorkspacePane(host: host, monitorRuns: monitorRuns, model: model, selectedAgentLane: selectedAgentLane,
                               onAgentLanesChange: onAgentLanesChange, onActiveAgentLaneChange: onActiveAgentLaneChange)
             } else {
                 ProgressView()
@@ -67,27 +68,6 @@ private enum FolderNavigation { case first, previous, next }
 private struct WorkspaceFailure: LocalizedError {
     let errorDescription: String?
     init(_ message: String) { errorDescription = message }
-}
-
-@MainActor
-private final class SourceBuffer: ObservableObject, Identifiable {
-    nonisolated let path: String
-    nonisolated var id: String { path }
-    @Published var text: String
-    @Published var savedText: String
-    @Published var isSaving = false
-    @Published var diskRevision: String?
-    var revision: String
-
-    init(path: String, text: String, revision: String) {
-        self.path = path
-        self.text = text
-        self.savedText = text
-        self.revision = revision
-    }
-
-    var isDirty: Bool { text != savedText }
-    var name: String { (path as NSString).lastPathComponent }
 }
 
 private struct AgentEvent: Identifiable {
@@ -423,9 +403,7 @@ private final class WorkspaceModel: ObservableObject {
                 buffer.diskRevision = newRevision
                 return
             }
-            buffer.revision = newRevision
-            buffer.savedText = text
-            buffer.diskRevision = nil
+            buffer.didSave(text, revision: newRevision)
             publishDirty()
         } catch {
             notice = error.localizedDescription
@@ -444,10 +422,7 @@ private final class WorkspaceModel: ObservableObject {
                 notice = "The buffer changed during reload. Your edits are intact."
                 return
             }
-            buffer.text = text
-            buffer.savedText = text
-            buffer.revision = revision
-            buffer.diskRevision = nil
+            buffer.reload(text, revision: revision)
             publishDirty()
         } catch {
             notice = error.localizedDescription
@@ -696,45 +671,49 @@ private final class WorkspaceModel: ObservableObject {
 
     func monitor(_ id: String?, agent: WorkspaceAgent) async {
         guard let id else { return }
+        var revision = ""
         while !Task.isCancelled, observedRun(agent) == id {
             do {
-                let reply = try await FleetBridge.call(host, ["op": "detail", "id": id])
+                let reply = try await FleetBridge.call(host, ["op": "detail", "id": id, "revision": revision])
                 try Task.checkCancellation()
                 guard observedRun(agent) == id else { return }
-                guard let run = reply["run"] as? [String: Any],
-                      let status = run["status"] as? String,
-                      let index = conversations[agent]?.firstIndex(where: { $0.id == id }),
-                      var turn = conversations[agent]?[index] else {
-                    throw WorkspaceFailure("This run is not available yet.")
-                }
-                turn.status = status
-                turn.action = run["action"] as? String ?? ""
-                turn.risk = run["risk"] as? String ?? ""
-                turn.outcome = run["outcome"] as? String ?? ""
-                let visibleKinds: Set<String>? = switch turn.reporting {
-                case "summary": ["result", "error", "risk"]
-                case "risks": ["error", "risk"]
-                default: nil
-                }
-                let events = reply["events"] as? [[String: Any]] ?? []
-                if pendingDetails.contains(id), let prompt = events.first(where: { ($0["kind"] as? String) == "prompt" })?["text"] as? String {
-                    turn.prompt = prompt
-                }
-                turn.events = events.enumerated().compactMap { index, value in
-                    guard let kind = value["kind"] as? String, let text = value["text"] as? String,
-                          !["prompt", "status", "session"].contains(kind),
-                          visibleKinds?.contains(kind) ?? true else { return nil }
-                    return AgentEvent(id: index, kind: kind, text: text)
-                }
-                if let session = run["session"] as? String, !session.isEmpty {
-                    sessions[agent] = session
-                }
-                pendingDetails.remove(id)
-                streamErrors[agent] = nil
-                conversations[agent]?[index] = turn
-                if !turn.isActive {
-                    stopping.remove(id)
-                    return
+                if streamErrors[agent] != nil { streamErrors[agent] = nil }
+                if reply["unchanged"] as? Bool != true {
+                    guard let run = reply["run"] as? [String: Any],
+                          let status = run["status"] as? String,
+                          let index = conversations[agent]?.firstIndex(where: { $0.id == id }),
+                          var turn = conversations[agent]?[index] else {
+                        throw WorkspaceFailure("This run is not available yet.")
+                    }
+                    turn.status = status
+                    turn.action = run["action"] as? String ?? ""
+                    turn.risk = run["risk"] as? String ?? ""
+                    turn.outcome = run["outcome"] as? String ?? ""
+                    let visibleKinds: Set<String>? = switch turn.reporting {
+                    case "summary": ["result", "error", "risk"]
+                    case "risks": ["error", "risk"]
+                    default: nil
+                    }
+                    let events = reply["events"] as? [[String: Any]] ?? []
+                    if pendingDetails.contains(id), let prompt = events.first(where: { ($0["kind"] as? String) == "prompt" })?["text"] as? String {
+                        turn.prompt = prompt
+                    }
+                    turn.events = events.enumerated().compactMap { index, value in
+                        guard let kind = value["kind"] as? String, let text = value["text"] as? String,
+                              !["prompt", "status", "session"].contains(kind),
+                              visibleKinds?.contains(kind) ?? true else { return nil }
+                        return AgentEvent(id: index, kind: kind, text: text)
+                    }
+                    if let session = run["session"] as? String, !session.isEmpty, sessions[agent] != session {
+                        sessions[agent] = session
+                    }
+                    if pendingDetails.contains(id) { pendingDetails.remove(id) }
+                    conversations[agent]?[index] = turn
+                    if !turn.isActive {
+                        stopping.remove(id)
+                        return
+                    }
+                    revision = reply["revision"] as? String ?? ""
                 }
             } catch is CancellationError {
                 return
@@ -752,6 +731,7 @@ private final class WorkspaceModel: ObservableObject {
 @MainActor
 private struct WorkspacePane: View {
     let host: FleetHost
+    var monitorRuns: Bool
     @ObservedObject var model: WorkspaceModel
     let selectedAgentLane: FleetAgentLaneSelection?
     let onAgentLanesChange: ([FleetAgentLane]) -> Void
@@ -808,7 +788,7 @@ private struct WorkspacePane: View {
         .background {
             ZStack {
                 ForEach(model.agents) { agent in
-                    let run = model.observedRun(agent)
+                    let run = monitorRuns ? model.observedRun(agent) : nil
                     Color.clear.task(id: run) { await model.monitor(run, agent: agent) }
                 }
             }
@@ -1163,7 +1143,7 @@ private struct WorkspacePane: View {
             .padding(11)
         }
         .background(Color(nsColor: .controlBackgroundColor))
-        .task(id: agent.harness) { await model.loadModelOptions(for: agent.harness) }
+        .task(id: agent.harness, priority: .utility) { await model.loadModelOptions(for: agent.harness) }
     }
 
     private func composerControls(_ agent: WorkspaceAgent) -> some View {
@@ -1861,7 +1841,7 @@ private struct SourceEditor: View {
                 .padding(9)
                 Divider()
             }
-            PlainSourceView(text: $buffer.text, file: buffer.path, edited: { model.publishDirty() }) {
+            PlainSourceView(buffer: buffer, edited: { model.publishDirty() }) {
                 Task { await model.save(buffer) }
             }
             Divider()
@@ -1945,86 +1925,6 @@ private struct TurnCard: View {
                 Button("Trust Workspace for Cursor…", action: trustWorkspace)
                     .help("Trust this workspace in Cursor, then send your prompt again")
             }
-        }
-    }
-}
-
-@MainActor
-private struct PlainSourceView: NSViewRepresentable {
-    @Binding var text: String
-    let file: String
-    let edited: () -> Void
-    let save: () -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(text: $text, edited: edited) }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = true
-        scroll.autohidesScrollers = true
-        let editor = SourceTextView(frame: scroll.contentView.bounds)
-        editor.delegate = context.coordinator
-        editor.string = text
-        editor.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
-        editor.textContainerInset = NSSize(width: 12, height: 10)
-        editor.textContainer?.widthTracksTextView = false
-        editor.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
-                                                     height: CGFloat.greatestFiniteMagnitude)
-        editor.minSize = .zero
-        editor.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        editor.isVerticallyResizable = true
-        editor.isHorizontallyResizable = true
-        editor.autoresizingMask = [.width]
-        editor.isRichText = false
-        editor.allowsUndo = true
-        editor.usesFindBar = true
-        editor.isAutomaticQuoteSubstitutionEnabled = false
-        editor.isAutomaticDashSubstitutionEnabled = false
-        editor.isAutomaticTextReplacementEnabled = false
-        editor.isAutomaticSpellingCorrectionEnabled = false
-        editor.isContinuousSpellCheckingEnabled = false
-        editor.isAutomaticLinkDetectionEnabled = false
-        editor.setAccessibilityLabel("Editor for \(file)")
-        editor.save = save
-        scroll.documentView = editor
-        return scroll
-    }
-
-    func updateNSView(_ scroll: NSScrollView, context: Context) {
-        context.coordinator.text = $text
-        context.coordinator.edited = edited
-        guard let editor = scroll.documentView as? SourceTextView else { return }
-        editor.save = save
-        if editor.string != text { editor.string = text }
-    }
-
-    final class Coordinator: NSObject, NSTextViewDelegate {
-        var text: Binding<String>
-        var edited: () -> Void
-
-        init(text: Binding<String>, edited: @escaping () -> Void) {
-            self.text = text
-            self.edited = edited
-        }
-
-        func textDidChange(_ notification: Notification) {
-            guard let editor = notification.object as? NSTextView else { return }
-            text.wrappedValue = editor.string
-            edited()
-        }
-    }
-
-    final class SourceTextView: NSTextView {
-        var save: (() -> Void)?
-
-        override func performKeyEquivalent(with event: NSEvent) -> Bool {
-            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            if modifiers == .command, event.charactersIgnoringModifiers == "s", let save {
-                save()
-                return true
-            }
-            return super.performKeyEquivalent(with: event)
         }
     }
 }

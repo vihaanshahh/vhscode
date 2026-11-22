@@ -223,6 +223,26 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertNotIn("error", reply, reply)
         return reply
 
+    def test_local_read_stream_keeps_replies_separate_and_recovers_from_request_errors(self):
+        note = "Tabs\tand newlines\n" * 6000
+        self.guide.write_text(note)
+        with subprocess.Popen([sys.executable, "-B", BRIDGE, "--read-stream"], env=self.environment,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as reader:
+            try:
+                def request(fields):
+                    reader.stdin.write(json.dumps({"host": self.host, "request": fields}).encode() + b"\n")
+                    reader.stdin.flush()
+                    length = int.from_bytes(reader.stdout.read(4), "big")
+                    return json.loads(reader.stdout.read(length))
+
+                self.assertIn("error", request({"op": "invalid operation"}))
+                reply = request({"op": "read_file", "path": self.guide.relative_to(self.repo).as_posix()})
+                self.assertEqual(reply["text"], note)
+                self.assertIn("entries", request({"op": "files"}))
+            finally:
+                reader.stdin.close()
+                reader.wait(timeout=5)
+
     def test_import_local_folder_and_code_workspace(self):
         utilities = self.root / "utilities repo"
         utilities.mkdir()

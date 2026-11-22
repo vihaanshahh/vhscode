@@ -322,11 +322,20 @@ def rpc(request):
         with _connect() as db:
             db.execute("BEGIN")
             run = db.execute(RUNS_VIEW + " WHERE id = ?", (run_id,)).fetchone()
+            revision = None
+            if "revision" in request and run is not None:
+                sequence = db.execute("SELECT MAX(seq) FROM events WHERE run_id=?", (run_id,)).fetchone()[0]
+                revision = f"{run['status']}:{sequence}"
+                if revision == request["revision"]:
+                    return {"unchanged": True}
             rows = db.execute(
                 "SELECT kind, text, at FROM events WHERE run_id = ? ORDER BY seq", (run_id,)
             ).fetchall()
         metadata = dict(run, detached=bool(run["detached"])) if run is not None else None
-        return {"events": [dict(row) for row in rows], "run": metadata}
+        reply = {"events": [dict(row) for row in rows], "run": metadata}
+        if revision is not None:
+            reply["revision"] = revision
+        return reply
     if op == "cancel":
         with _connect() as db:
             result = db.execute(

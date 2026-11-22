@@ -6,6 +6,7 @@ app resolves all of these relative to its own location.
 """
 import argparse
 from pathlib import Path
+import platform
 import plistlib
 import shutil
 import subprocess
@@ -81,12 +82,21 @@ exec "$bin/../../MacOS/FleetWorkbench" --ssh-askpass "$@"
 """)
     previous_command = resources / "Launch Fleet.command"
     previous_command.unlink(missing_ok=True)
-    subprocess.run(["/usr/bin/xcrun", "swiftc", "-O", "-whole-module-optimization", "-parse-as-library",
+    sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True).strip()
+    platform_path = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-platform-path"], text=True).strip()
+    plugins = Path(platform_path) / "Developer/usr/lib/swift/host/plugins"
+    plugin_args = []
+    if (plugins / "libSwiftUIMacros.dylib").is_file():
+        server = subprocess.check_output(["xcrun", "--find", "swift-plugin-server"], text=True).strip()
+        plugin_args = ["-external-plugin-path", f"{plugins}#{server}"]
+    subprocess.run(["/usr/bin/xcrun", "--sdk", "macosx", "swiftc", "-sdk", sdk,
+                    "-target", f"{platform.machine()}-apple-macos14.0", *plugin_args,
+                    "-O", "-whole-module-optimization", "-parse-as-library",
                     *map(str, sorted(sources.glob("*.swift"))),
                     "-o", str(contents / "MacOS/FleetWorkbench")], check=True)
     info = dict(CFBundleExecutable="FleetWorkbench", CFBundleName="Fleet Workbench",
                 CFBundleDisplayName="Fleet Workbench", CFBundleIdentifier="io.vhscode.fleet-workbench",
-                CFBundleVersion="4", CFBundleShortVersionString="0.4", CFBundlePackageType="APPL",
+                CFBundleVersion="5", CFBundleShortVersionString="0.5", CFBundlePackageType="APPL",
                 CFBundleIconFile="Fleet.icns", NSHighResolutionCapable=True, LSMinimumSystemVersion="14.0")
     info["CFBundleDocumentTypes"] = [dict(CFBundleTypeName="VS Code Workspace",
                                           CFBundleTypeRole="Editor", LSHandlerRank="Alternate",

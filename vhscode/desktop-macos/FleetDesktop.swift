@@ -30,24 +30,38 @@ struct FleetAgentLane: Hashable {
 enum FleetBridge {
     static let resources = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
 
+    static func makeProcess(_ arguments: [String] = []) -> Process {
+        let process = Process()
+        process.executableURL = resources.appendingPathComponent("python/bin/python3")
+        process.arguments = ["-E", "-s", "-B", resources.appendingPathComponent("fleet/fleet_desktop.py").path] + arguments
+        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = resources.appendingPathComponent("bin").path + ":" + (environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment.removeValue(forKey: "PYTHONHOME")
+        environment.removeValue(forKey: "PYTHONPATH")
+        process.environment = environment
+        return process
+    }
+
     static func call(_ host: FleetHost, _ request: [String: Any]) async throws -> [String: Any] {
-        try await send(["host": host.dictionary, "request": request])
+        let payload: [String: Any] = ["host": host.dictionary, "request": request]
+        if host.ssh.isEmpty, let op = request["op"] as? String,
+           ["sidebar_agents", "detail", "snapshot", "files", "read_file", "workspace_settings", "workspace_agents"].contains(op) {
+            let input = try JSONSerialization.data(withJSONObject: payload)
+            return try decode(await LocalReadWorker.shared.read(input))
+        }
+        return try await send(payload)
     }
 
     static func send(_ payload: [String: Any]) async throws -> [String: Any] {
         let input = try JSONSerialization.data(withJSONObject: payload)
-        let data = try await Task.detached(priority: .userInitiated) { () throws -> Data in
-            let process = Process()
-            process.executableURL = resources.appendingPathComponent("python/bin/python3")
-            process.arguments = ["-E", "-s", "-B", resources.appendingPathComponent("fleet/fleet_desktop.py").path]
-            process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
-            var environment = ProcessInfo.processInfo.environment
-            environment["PATH"] = resources.appendingPathComponent("bin").path + ":" + (environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
-            environment["PYTHONDONTWRITEBYTECODE"] = "1"
-            environment["PYTHONNOUSERSITE"] = "1"
-            environment.removeValue(forKey: "PYTHONHOME")
-            environment.removeValue(forKey: "PYTHONPATH")
-            process.environment = environment
+        if payload["op"] as? String == "hosts" {
+            return try decode(await LocalReadWorker.shared.read(input))
+        }
+        let data = try await Task.detached(priority: Task.currentPriority) { () throws -> Data in
+            let process = makeProcess()
             let stdin = Pipe(), output = Pipe()
             process.standardInput = stdin
             process.standardOutput = output
@@ -63,6 +77,10 @@ enum FleetBridge {
             }
             return result
         }.value
+        return try decode(data)
+    }
+
+    private static func decode(_ data: Data) throws -> [String: Any] {
         guard let reply = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw FleetError(message: "The host returned an unreadable response.")
         }
@@ -70,6 +88,71 @@ enum FleetBridge {
         return reply
     }
 
+}
+
+// Serialize short local reads so only one interpreter is resident. Longer operations use their own process.
+private actor LocalReadWorker {
+    static let shared = LocalReadWorker()
+    private var process: Process?
+    private var input: FileHandle?
+    private var output: FileHandle?
+
+    func read(_ data: Data) throws -> Data {
+        try Task.checkCancellation()
+        do {
+            return try exchange(data)
+        } catch {
+            close()
+            try Task.checkCancellation()
+            // The idle worker may exit between the liveness check and the write.
+            do { return try exchange(data) } catch {
+                close()
+                throw error
+            }
+        }
+    }
+
+    private func exchange(_ data: Data) throws -> Data {
+        if process?.isRunning != true {
+            close()
+            let child = FleetBridge.makeProcess(["--read-stream"])
+            let stdin = Pipe(), stdout = Pipe()
+            child.standardInput = stdin
+            child.standardOutput = stdout
+            child.standardError = FileHandle.nullDevice
+            try child.run()
+            process = child
+            input = stdin.fileHandleForWriting
+            output = stdout.fileHandleForReading
+        }
+        guard let input, let output else { throw FleetError(message: "Workspace reader is unavailable.") }
+        var line = data
+        line.append(10)
+        try input.write(contentsOf: line)
+        let header = output.readData(ofLength: 4)
+        let size = header.reduce(0) { $0 * 256 + Int($1) }
+        guard header.count == 4, size > 0, size <= 16 * 1024 * 1024 else {
+            throw FleetError(message: "The workspace reader returned an invalid response.")
+        }
+        var result = Data()
+        result.reserveCapacity(size)
+        while result.count < size {
+            guard let chunk = try output.read(upToCount: size - result.count), !chunk.isEmpty else {
+                throw FleetError(message: "Workspace response was interrupted.")
+            }
+            result.append(chunk)
+        }
+        return result
+    }
+
+    private func close() {
+        try? input?.close()
+        try? output?.close()
+        if let process, process.isRunning { process.terminate() }
+        input = nil
+        output = nil
+        process = nil
+    }
 }
 
 private func mayDiscardEdits() -> Bool {
@@ -263,7 +346,7 @@ private struct FleetWindow: View {
             Divider()
             ZStack {
                 if let host = current {
-                    WorkspaceView(host: host, selectedAgentLane: laneSelection, onAgentLanesChange: { lanes in
+                    WorkspaceView(host: host, monitorRuns: section == "Workspace" && scenePhase == .active, selectedAgentLane: laneSelection, onAgentLanesChange: { lanes in
                         if localAgentLanes[host] != lanes { localAgentLanes[host] = lanes }
                     }, onActiveAgentLaneChange: { lane in
                         if activeAgentLane[host] != lane { activeAgentLane[host] = lane }
