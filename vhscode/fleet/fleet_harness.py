@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 from selectors import DefaultSelector, EVENT_READ
+import shlex
 import shutil
 import signal
 import subprocess
@@ -67,19 +68,14 @@ def run(
     status = "failed"
     failure = ""
     try:
-        harness = _find_harness(agent)
-        if harness is None:
-            command = "codex" if agent == "codex" else "cursor-agent"
-            failure = f"Fleet could not find {command} on PATH."
+        command, environment = _require_harness(root, agent)
+        code = _run_process(root, agent, command, environment, prompt, tags, session, stream, model)
+        if code:
+            failure = f"{agent} exited with status {code}."
+        elif stream.failed:
+            failure = f"{agent} reported a failed run."
         else:
-            executable, environment = harness
-            code = _run_process(root, agent, executable, environment, prompt, tags, session, stream, model)
-            if code:
-                failure = f"{agent} exited with status {code}."
-            elif stream.failed:
-                failure = f"{agent} reported a failed run."
-            else:
-                status = "completed"
+            status = "completed"
     except KeyboardInterrupt:
         status = "cancelled"
         failure = f"{agent} cancelled."
@@ -97,7 +93,7 @@ def run(
     return stream.session
 
 
-def _run_process(root: Path, agent: str, executable: str, environment: dict[str, str],
+def _run_process(root: Path, agent: str, command: list[str], environment: dict[str, str],
                  prompt: str, tags: set[str], session: str | None, stream: _Stream, model: str | None) -> int:
 
     if tags:
@@ -127,7 +123,7 @@ def _run_process(root: Path, agent: str, executable: str, environment: dict[str,
             stdin.write(prompt.encode("utf-8"))
             stdin.seek(0)
         process = subprocess.Popen(
-            [executable, *args], cwd=root, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [*command, *args], cwd=root, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=environment, start_new_session=True,
         )
         try:
@@ -141,27 +137,23 @@ def _run_process(root: Path, agent: str, executable: str, environment: dict[str,
             process.stderr.close()
 
 
-def native(root: Path, agent: str, session: str | None) -> None:
+def native(root: Path, agent: str, session: str | None) -> int:
     """Give the native TUI the terminal to handle interactive approvals."""
-    harness = _find_harness(agent)
-    if harness is None:
-        command = "codex" if agent == "codex" else "cursor-agent"
-        _print(f"Fleet could not find {command} on PATH.", error=True)
-        return
+    from fleet_models import get
 
-    executable, environment = harness
+    command, environment = _require_harness(root, agent)
     args = []
     if session:
         args = ["resume", "--", session] if agent == "codex" else [f"--resume={session}"]
-    try:
-        process = subprocess.Popen([executable, *args], cwd=root, env=environment)
-    except OSError as error:
-        _print(f"Fleet could not start {agent}: {error}", error=True)
-        return
+    model = get(root, agent)["model"]
+    if model:
+        args.insert(0, f"--model={model}")
+    process = subprocess.Popen([*command, *args], cwd=root, env=environment)
     try:
         code = process.wait()
         if code:
             _print(f"{agent} exited with status {code}.", error=True)
+        return code
     finally:
         if process.poll() is None:
             process.terminate()
@@ -172,7 +164,47 @@ def native(root: Path, agent: str, session: str | None) -> None:
                 process.wait()
 
 
-def _find_harness(agent: str) -> tuple[str, dict[str, str]] | None:
+def command_parts(command: str) -> list[str]:
+    if not isinstance(command, str) or len(command) > 4096 or (command and not command.isprintable()):
+        raise ValueError("Enter a command on one line, up to 4096 characters.")
+    try:
+        parts = shlex.split(command)
+    except ValueError as error:
+        raise ValueError("Check the quotes and escapes in the agent command.") from error
+    if parts and (not parts[0].strip() or parts[0].startswith("-")
+                  or ("/" in parts[0] and not parts[0].startswith(("/", "~/")))):
+        raise ValueError("Use a command name, an absolute path, or a path starting with ~/.")
+    return parts
+
+
+def _require_harness(root: Path, agent: str, command: str | None = None) -> tuple[list[str], dict[str, str]]:
+    if command is None:
+        from fleet_models import cli_command
+
+        command = cli_command(root, agent)
+    parts = command_parts(command)
+    harness = _find_harness(agent, parts)
+    if harness is not None:
+        return harness
+    name = parts[0] if parts else ("codex" if agent == "codex" else "cursor-agent or agent")
+    raise ValueError(f"Could not find an executable for {name} on this host. Edit the agent command or check it in Terminal.")
+
+
+def test_command(root: Path, agent: str, command: str) -> str:
+    if not isinstance(command, str):
+        raise ValueError("Enter a command or leave it blank for automatic discovery.")
+    argv, environment = _require_harness(root, agent, command)
+    try:
+        result = subprocess.run([*argv, "--version"], cwd=root, env=environment, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("The command did not respond to --version within five seconds.") from error
+    if result.returncode:
+        raise ValueError(f"The command returned status {result.returncode} for --version. Run it in Terminal for details.")
+    return argv[0]
+
+
+def _find_harness(agent: str, parts: list[str]) -> tuple[list[str], dict[str, str]] | None:
     if agent not in ("codex", "cursor"):
         raise ValueError(f"Unknown harness: {agent}")
     home = Path.home()
@@ -200,10 +232,20 @@ def _find_harness(agent: str) -> tuple[str, dict[str, str]] | None:
     ]
     paths = list(dict.fromkeys([*inherited, *(str(path) for path in fallback if path.is_absolute())]))
     search_path = os.pathsep.join(paths)
+    if parts:
+        command = os.path.expanduser(parts[0])
+        # Explicit `agent` should prefer the standard Cursor install over unrelated agents.
+        if agent == "cursor" and command == "agent":
+            local_bin = str(home / ".local/bin")
+            search_path = os.pathsep.join([local_bin, *paths])
+        executable = shutil.which(command, path=search_path)
+        if executable is not None:
+            return [executable, *parts[1:]], _harness_environment(executable, paths, inherited)
+        return None
     command = "codex" if agent == "codex" else "cursor-agent"
     executable = shutil.which(command, path=search_path)
     if executable is not None:
-        return executable, _harness_environment(executable, paths, inherited)
+        return [executable], _harness_environment(executable, paths, inherited)
     if agent == "cursor":
         deadline = monotonic() + 5
         for directory in paths:
@@ -215,7 +257,7 @@ def _find_harness(agent: str) -> tuple[str, dict[str, str]] | None:
                 break
             environment = _harness_environment(alias, paths, inherited)
             if _is_cursor_alias(alias, environment, remaining):
-                return alias, environment
+                return [alias], environment
     return None
 
 

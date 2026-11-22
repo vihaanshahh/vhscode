@@ -55,6 +55,42 @@ enum FleetBridge {
         return try await send(payload)
     }
 
+    @MainActor
+    static func openTerminal(_ host: FleetHost, agent: String? = nil, session: String? = nil) async throws {
+        let workspace = NSWorkspace.shared
+        guard let terminal = workspace.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else {
+            throw FleetError(message: "Terminal could not be found.")
+        }
+        var arguments = [resources.appendingPathComponent("bin/vhscode-fleet").path]
+        if let agent {
+            arguments += ["--native", "--agent", agent]
+            if let session, !session.isEmpty { arguments.append("--session=" + session) }
+        } else {
+            arguments.append("--shell")
+        }
+        if !host.ssh.isEmpty { arguments += ["--ssh=" + host.ssh] }
+        arguments += ["--", host.repo]
+        let command = arguments.map { "'" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }.joined(separator: " ")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let script = directory.appendingPathComponent("Fleet Workbench.command")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        do {
+            try """
+            #!/bin/sh
+            /bin/rm -f -- "$0"
+            /bin/rmdir -- "${0%/*}"
+            exec \(command)
+
+            """.write(to: script, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+            _ = try await workspace.open([script], withApplicationAt: terminal, configuration: .init())
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
     static func send(_ payload: [String: Any]) async throws -> [String: Any] {
         let input = try JSONSerialization.data(withJSONObject: payload)
         if payload["op"] as? String == "hosts" {
@@ -650,6 +686,15 @@ private struct HostForm: View {
                 if remote {
                     Button(testing ? "Connecting…" : "Test SSH") { testSSH() }
                         .disabled(saving || testing || folderRequest != nil || destination.isEmpty)
+                    Button("Open Terminal") {
+                        var target = host
+                        target.ssh = destination
+                        target.repo = repository
+                        Task {
+                            do { try await FleetBridge.openTerminal(target) }
+                            catch { issue = error.localizedDescription }
+                        }
+                    }.disabled(saving || destination.isEmpty)
                     if connected { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
                 }
                 Spacer()

@@ -23,7 +23,10 @@ HELP = """/files                 Browse, edit, or tag repository files
 /view MODE             Save actions, summary or risks as this repo's default
 /summary PROMPT        Use summary reporting for one turn (/risks and /actions also work)
 /details               Toggle detailed agent output
+/command [COMMAND]     Show or set the selected agent command for this workspace
+/command --default     Restore automatic command discovery
 /native                Open the harness TUI for interactive commands and approvals
+/shell                 Open a login shell in this workspace
 /new                   Start a new conversation with the selected harness
 /filter                Toggle local filtering of transient progress
 /filter-setup          Download the optional classifier on this machine
@@ -101,9 +104,17 @@ def work(root, agent, quiet, view):
                     print("The file browser needs an interactive terminal.")
             elif cmd == "/agent" and arg in ("codex", "cursor"):
                 agent = arg
+            elif cmd == "/command":
+                from fleet_models import cli_command, set_cli_command
+
+                if arg:
+                    set_cli_command(root, agent, "" if arg == "--default" else arg)
+                print(f"{agent} command: {cli_command(root, agent) or 'Automatic'}")
             elif cmd == "/native":
                 from fleet_harness import native
                 native(root, agent, sessions.get(agent))
+            elif cmd == "/shell":
+                subprocess.run([os.environ.get("SHELL") or "/bin/sh", "-il"], cwd=root)
             elif cmd == "/new":
                 sessions.pop(agent, None)
             elif cmd == "/tags":
@@ -149,8 +160,14 @@ def main():
     parser.add_argument("--filter", action="store_true", help="enable optional local progress classifier")
     parser.add_argument("--persist", action="store_true", help="create or attach a tmux workbench for this repo")
     parser.add_argument("--dashboard", action="store_true", help="view fleet activity and manage schedules")
+    terminal = parser.add_mutually_exclusive_group()
+    terminal.add_argument("--native", action="store_true", help="open the agent's interactive CLI")
+    terminal.add_argument("--shell", action="store_true", help="open a login shell in the workspace")
+    parser.add_argument("--session", help="resume a session with --native")
     parser.add_argument("--rpc", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.session is not None and (not args.native or not args.session.isprintable() or len(args.session) > 512):
+        parser.error("--session requires --native and a valid session ID")
     if args.rpc:
         from fleet_desktop import serve
         from fleet_jobs import rpc
@@ -167,9 +184,17 @@ def main():
     if args.ssh:
         from fleet_ssh import connect
         return connect(args)
-    root = Path(args.repo).expanduser().resolve(strict=True)
-    if not root.is_dir():
-        parser.error("repository path must be a directory")
+    from fleet_hosts import workspace_root
+
+    root = workspace_root(args.repo)
+    if args.shell:
+        os.chdir(root)
+        shell = os.environ.get("SHELL") or "/bin/sh"
+        os.execl(shell, shell, "-il")
+    if args.native:
+        from fleet_harness import native
+
+        return native(root, args.agent, args.session)
     if args.persist:
         if not shutil.which("tmux"):
             parser.error("--persist requires tmux on the target")

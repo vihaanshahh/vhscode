@@ -295,7 +295,7 @@ def rpc(request):
         from fleet_hosts import workspace_root
         return workspace_trust(workspace_root(request["repo"]), request)
     if op in {"workspace_settings", "workspace_agents", "set_model", "models", "reset_session",
-              "list_sessions", "resume_session"}:
+              "list_sessions", "resume_session", "cli_command", "set_cli_command", "test_cli_command"}:
         from fleet_models import workspace
         from fleet_hosts import workspace_root
         return workspace(workspace_root(request["repo"]), request)

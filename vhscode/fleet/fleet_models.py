@@ -78,6 +78,12 @@ def _database():
                  PRIMARY KEY(repo, agent, lane)
                )"""
         )
+        database.execute(
+            """CREATE TABLE IF NOT EXISTS workspace_commands (
+                 repo TEXT NOT NULL, agent TEXT NOT NULL, command TEXT NOT NULL,
+                 PRIMARY KEY(repo, agent)
+               )"""
+        )
     except Exception:
         database.close()
         raise
@@ -86,6 +92,32 @@ def _database():
 
 def _key(repo, agent):
     return str(Path(repo).expanduser().resolve()), _agent(agent)
+
+
+def cli_command(repo, agent):
+    with closing(_database()) as database:
+        row = database.execute(
+            "SELECT command FROM workspace_commands WHERE repo=? AND agent=?", _key(repo, agent)
+        ).fetchone()
+    return row[0] if row else ""
+
+
+def set_cli_command(repo, agent, command):
+    from fleet_harness import command_parts
+
+    command_parts(command)
+    key = _key(repo, agent)
+    command = command.strip()
+    with closing(_database()) as database, database:
+        if command:
+            database.execute(
+                """INSERT INTO workspace_commands(repo, agent, command) VALUES (?, ?, ?)
+                   ON CONFLICT(repo, agent) DO UPDATE SET command=excluded.command""",
+                (*key, command),
+            )
+        else:
+            database.execute("DELETE FROM workspace_commands WHERE repo=? AND agent=?", key)
+    return command
 
 
 def get(repo, agent, lane=1):
@@ -330,6 +362,14 @@ def workspace(repo, request):
             settings["cursor"]["trusted"] = cursor_trust(repo)
         return settings
     agent = _agent(request.get("agent"))
+    if op == "cli_command":
+        return {"command": cli_command(repo, agent)}
+    if op == "set_cli_command":
+        return {"command": set_cli_command(repo, agent, request.get("command"))}
+    if op == "test_cli_command":
+        from fleet_harness import test_command
+
+        return {"executable": test_command(repo, agent, request.get("command"))}
     if op == "models":
         return {"models": _models(repo, agent)}
     if op == "list_sessions":
@@ -558,16 +598,13 @@ def _session_pages(call, method, params, root, *, identifier_key, data_key, sess
 
 
 def _cursor_sessions(repo, *, session=None):
-    from fleet_harness import _find_harness
+    from fleet_harness import _require_harness
 
-    harness = _find_harness("cursor")
-    if harness is None:
-        return []
-    executable, environment = harness
     root = Path(repo).resolve()
     deadline = monotonic() + CATALOG_TIMEOUT
     try:
-        with _agent_process(executable, ["acp"], repo, environment, input_required=True) as process, \
+        command, environment = _require_harness(repo, "cursor")
+        with _agent_process(command[0], [*command[1:], "acp"], repo, environment, input_required=True) as process, \
                 closing(_lines(process, deadline)) as output:
             call, _ = _rpc_client(process, output, deadline, agent="Cursor")
             result = call("initialize", {
@@ -586,17 +623,14 @@ def _cursor_sessions(repo, *, session=None):
 
 
 def _codex_threads(repo, *, session=None):
-    from fleet_harness import _find_harness
+    from fleet_harness import _require_harness
 
-    harness = _find_harness("codex")
-    if harness is None:
-        raise ValueError("The Codex CLI is unavailable on this host.")
-    executable, environment = harness
+    command, environment = _require_harness(repo, "codex")
     root = Path(repo).resolve()
 
     deadline = monotonic() + CATALOG_TIMEOUT
     try:
-        with _agent_process(executable, ["app-server", "--listen", "stdio://"], repo, environment,
+        with _agent_process(command[0], [*command[1:], "app-server", "--listen", "stdio://"], repo, environment,
                             input_required=True) as process, closing(_lines(process, deadline)) as output:
             call = _codex_rpc(process, output, deadline)
             if session is not None:
@@ -649,17 +683,14 @@ def _cursor_models(process, output, deadline):
 
 
 def _models(repo, agent):
-    from fleet_harness import _find_harness
+    from fleet_harness import _require_harness
 
-    harness = _find_harness(agent)
-    if harness is None:
-        raise ValueError(f"The {agent} CLI is unavailable on this host.")
-    executable, environment = harness
+    command, environment = _require_harness(repo, agent)
     codex = agent == "codex"
     arguments = ["app-server", "--listen", "stdio://"] if codex else ["--list-models"]
     deadline = monotonic() + CATALOG_TIMEOUT
     try:
-        with _agent_process(executable, arguments, repo, environment, input_required=codex) as process:
+        with _agent_process(command[0], [*command[1:], *arguments], repo, environment, input_required=codex) as process:
             output = _lines(process, deadline)
             try:
                 candidates = _codex_models(process, output, deadline) if codex else _cursor_models(process, output, deadline)

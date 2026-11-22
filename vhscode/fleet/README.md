@@ -16,6 +16,10 @@ Open **Activity**, **Schedules**, or **Risks** to monitor tasks across hosts. Th
 
 If Cursor needs authentication, select its agent and click **Sign In to Cursor** in the composer or agent options. Approve the browser page on this Mac. Cursor saves the login on the selected workspace machine, and Fleet verifies its model catalog. If Cursor requests workspace trust, **Trust Workspace for Cursor…** opens a confirmation for that folder. You can revoke Fleet’s trust setting in agent options.
 
+Choose **Agent options → Edit Agent Command…** or type `/command` in the composer to change the command for the selected provider and workspace. Enter a name such as `agent`, or an executable path such as `~/.local/bin/agent` to pick a specific install. Quote paths that contain spaces. Optional arguments are passed before the CLI's operation arguments. **Test Command** checks which executable responds to `--version` on the workspace machine. Clear the command to restore automatic discovery. The same setting applies to background runs, schedules, model discovery, and native sessions.
+
+Choose **Open Agent in Terminal** or type `/native` to use the CLI interactively in the workspace and resume the current session when available. Use this to respond to Codex or Cursor trust and approval prompts. **Open Workspace Shell** or `/shell` opens a login shell for checking the installation, signing in manually, or running a CLI command directly. For SSH workspaces, Terminal connects to the workspace machine using your OpenSSH settings. You can also launch a shell from the SSH workspace settings while troubleshooting a connection.
+
 ### Running from a source checkout
 
 Use the fork's launcher from this checkout. Fleet runs on macOS or Linux with Python 3.10+ and a terminal. Install and authenticate the Codex or Cursor CLI on each machine where you want that agent to work.
@@ -53,6 +57,7 @@ Choose a mode in each schedule’s form. In an interactive repository, `/view su
 - Enter `/files` to browse the directory tree, including dotfiles. Enter opens the selected directory or file. Space toggles a file tag. The editor uses the target machine's `$VISUAL`, `$EDITOR`, or `vi`. Save and exit to return to the browser. Press `q` to return to the prompt.
 - Enter `/tag src/main.py` to attach a known path directly. Spaces in a path are literal. Tags persist across prompts until removed with `/untag PATH` or `/untag-all`. Use `/tags` to see the selection. Harnesses receive repository-relative paths and read the files they need.
 - Type a prompt to start a turn. The default view emphasizes actions and the outcome. Use `/details` for more harness output. Use `/agent cursor` or `/agent codex` to switch. Each agent resumes its own conversation within the workbench. `/new` starts a fresh conversation for the selected agent. `/native` opens its interactive CLI for approvals or native commands. If a Fleet turn already has a session ID, the native CLI resumes it.
+- Enter `/command` to show the selected provider's command, `/command agent` to change it, or `/command --default` to restore automatic discovery. Use `/shell` to open a login shell, or start the launcher with `--native` or `--shell` to open either directly. These options work with `--ssh HOST`.
 - Use `/status` and `/diff` to review the working tree. Ctrl-C interrupts an active turn. `/quit` closes the workbench.
 - Use `--persist` on a host with tmux to keep the running workbench, its tags, and its active turn through a disconnect. Detach with Ctrl-B then D. Run the same command for the same remote directory to reattach. A plain SSH session ends when its terminal closes.
 

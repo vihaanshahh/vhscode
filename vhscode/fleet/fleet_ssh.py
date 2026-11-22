@@ -89,12 +89,23 @@ def remote_command(args):
 def connect(args):
     host = destination(args.ssh)
     ssh = ssh_options(host, False)
+    if args.shell:
+        folder = shlex.quote(args.repo)
+        for prefix in ("~", "$HOME", "${HOME}"):
+            if args.repo == prefix or args.repo.startswith(prefix + "/"):
+                folder = '"$HOME"' + shlex.quote(args.repo[len(prefix):])
+                break
+        os.execvp("ssh", [*ssh, "-t", "--", host, f'cd -- {folder}; exec "${{SHELL:-/bin/sh}}" -il'])
     result = install(host, ssh, False)
     if result.returncode:
         return result.returncode
     from fleet_hosts import remember
     remember(host, args.repo)
     remote = ["--agent", args.agent]
+    if args.native:
+        remote.append("--native")
+        if args.session is not None:
+            remote.append(f"--session={args.session}")
     if args.filter:
         remote.append("--filter")
     if args.persist:
@@ -127,7 +138,7 @@ def query(host, payload):
     check = f'test -f "$HOME"/.cache/vhscode/fleet/{digest}/fleet.py || exit 72'
     args = [*ssh, "-T", "--", host, check + "; " + remote_command(["--rpc"])]
     body = json.dumps(payload, ensure_ascii=False).encode()
-    timeout = 20 if payload.get("op") in {"models", "list_sessions", "resume_session"} else 10
+    timeout = 20 if payload.get("op") in {"models", "list_sessions", "resume_session", "test_cli_command"} else 10
     for attempt in range(2):
         result = subprocess.run(args, input=body, capture_output=True, timeout=timeout)
         if result.returncode != 72 or attempt:

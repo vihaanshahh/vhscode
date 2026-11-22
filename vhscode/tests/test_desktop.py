@@ -24,6 +24,15 @@ if name == "agent" and arguments == ["--help"]:
     print("Cursor Agent supports stream-json")
     sys.exit()
 assert Path.cwd() == Path(os.environ["FLEET_TEST_REPO"])
+if os.environ.get("FLEET_TEST_REQUIRE_PREFIX"):
+    assert arguments[:2] == ["--fixture-option", "two words"], arguments
+    arguments = arguments[2:]
+if name == "agent" and arguments == ["--version"]:
+    print("Fixture Cursor")
+    sys.exit()
+if name == "agent" and arguments == ["--resume=cursor-fixture"]:
+    print("Native Cursor resumed")
+    sys.exit()
 
 
 def emit(event_type, **fields):
@@ -385,6 +394,33 @@ class DesktopBridgeTest(unittest.TestCase):
                 self.assertEqual(models[0]["id"], f"fixture-{agent}")
                 row, _ = self.finished_run(agent, prompt="logout")
                 self.assertEqual(row["outcome"], f"{agent}-fixture initial completed.")
+
+    def test_workspace_command_overrides_runs_catalog_and_native_resume(self):
+        fixture_bin = self.root / "fixture bin"
+        agent = fixture_bin / "agent"
+        (fixture_bin / "cursor-agent").rename(agent)
+        (fixture_bin / "cursor-agent").write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        (fixture_bin / "cursor-agent").chmod(0o700)
+        command = f'"{agent}" --fixture-option "two words"'
+        self.environment["FLEET_TEST_REQUIRE_PREFIX"] = "1"
+        self.assertEqual(self.success(self.request("test_cli_command", agent="cursor", command=command)),
+                         {"executable": str(agent)})
+        self.assertEqual(self.success(self.request("set_cli_command", agent="cursor", command=command)),
+                         {"command": command})
+        self.assertIn("quotes", self.request("set_cli_command", agent="cursor", command="'")["error"])
+        self.assertEqual(self.success(self.request("cli_command", agent="cursor")), {"command": command})
+        self.assertEqual(self.success(self.request("cli_command", agent="codex")), {"command": ""})
+        self.assertEqual(self.success(self.request("models", agent="cursor"))["models"][0]["id"], "fixture-cursor")
+        row, _ = self.finished_run("cursor", prompt="logout")
+        self.assertEqual(row["outcome"], "cursor-fixture initial completed.")
+        native = subprocess.run(
+            [sys.executable, str(BRIDGE.with_name("fleet.py")), "--native", "--agent", "cursor",
+             "--session=cursor-fixture", str(self.repo)], capture_output=True, text=True,
+            check=True, timeout=10, env=self.environment,
+        )
+        self.assertEqual(native.stdout.strip(), "Native Cursor resumed")
+        self.success(self.request("set_cli_command", agent="cursor", command=""))
+        self.assertIn("returned status 99", self.request("test_cli_command", agent="cursor", command="")["error"])
 
     def test_cursor_catalog_reports_host_authentication_and_network_errors(self):
         for error, expected in (

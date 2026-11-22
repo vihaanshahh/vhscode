@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 from selectors import DefaultSelector, EVENT_READ
+import shlex
 import signal
 import subprocess
 import sys
@@ -27,8 +28,8 @@ def cursor_url(value):
         return False
 
 
-def _lines(args, env, callback):
-    process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+def _lines(args, env, callback, *, cwd=None):
+    process = subprocess.Popen(args, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, start_new_session=True)
     deadline = monotonic() + LOGIN_TIMEOUT
     pending = b""
@@ -61,8 +62,9 @@ def _lines(args, env, callback):
                     process.wait()
 
 
-def _on_host():
-    from fleet_harness import _find_harness
+def _on_host(repo):
+    from fleet_harness import _require_harness
+    from fleet_hosts import workspace_root
     from fleet_jobs import _try_lock
     from fleet_models import _models
 
@@ -70,10 +72,8 @@ def _on_host():
     if lock is None:
         raise ValueError("A Cursor sign-in is already in progress on this machine.")
     try:
-        harness = _find_harness("cursor")
-        if not harness:
-            raise ValueError("Cursor Agent could not be found on this machine.")
-        executable, env = harness
+        root = workspace_root(repo)
+        command, env = _require_harness(root, "cursor")
         sent = False
 
         def forward(line):
@@ -87,16 +87,16 @@ def _on_host():
                     sent = True
                     break
 
-        if _lines([executable, "login"], dict(env, NO_OPEN_BROWSER="1"), forward):
+        if _lines([*command, "login"], dict(env, NO_OPEN_BROWSER="1"), forward, cwd=root):
             raise ValueError("Cursor did not complete sign-in. Try again and approve the connection in your browser.")
-        if not _models(Path.home(), "cursor"):
+        if not _models(root, "cursor"):
             raise ValueError("Cursor signed in but returned no available models.")
         print(json.dumps({"verified": True}), flush=True)
     finally:
         os.close(lock)
 
 
-def login(host):
+def login(host, repo):
     from fleet_ssh import bundle, destination, install, ssh_options
 
     if host:
@@ -106,9 +106,9 @@ def login(host):
             raise ValueError("Could not connect to the workspace. Use Test SSH in workspace settings.")
         digest = bundle()[1]
         script = f'"$HOME"/.cache/vhscode/fleet/{digest}/fleet_cursor_login.py'
-        args = [*ssh, "-T", "--", target, f"exec python3 -B {script} --on-host"]
+        args = [*ssh, "-T", "--", target, f"exec python3 -B {script} --on-host {shlex.quote(repo)}"]
     else:
-        args = [sys.executable, "-E", "-s", "-B", str(Path(__file__).resolve()), "--on-host"]
+        args = [sys.executable, "-E", "-s", "-B", str(Path(__file__).resolve()), "--on-host", repo]
     verified = opened = False
     issue = None
 
@@ -135,9 +135,9 @@ def login(host):
     return {"verified": True}
 
 
-if __name__ == "__main__" and sys.argv[1:] == ["--on-host"]:
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--on-host":
     try:
-        _on_host()
+        _on_host(sys.argv[2])
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         # A TimeoutExpired can include argv. Keep OS/CLI diagnostics out of the login protocol.
         message = str(error) if isinstance(error, ValueError) else "Could not complete Cursor sign-in on this machine."

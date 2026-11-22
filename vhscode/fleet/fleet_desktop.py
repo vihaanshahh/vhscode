@@ -28,6 +28,7 @@ WORKSPACE_OPS = {
     "files", "find_files", "read_file", "save_file", "submit",
     "workspace_settings", "workspace_agents", "set_model", "models", "reset_session", "list_sessions", "resume_session",
     "cursor_trust_status", "set_cursor_trust",
+    "cli_command", "set_cli_command", "test_cli_command",
 }
 
 
@@ -492,7 +493,7 @@ def dispatch(message):
         from fleet_cursor_login import login
         host = message.get("host")
         _validate_host(host)
-        return login(host["ssh"])
+        return login(host["ssh"], host["repo"])
     if op == "connect_host":
         from fleet_ssh import authenticate
 

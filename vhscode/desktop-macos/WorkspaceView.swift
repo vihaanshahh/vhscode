@@ -108,14 +108,14 @@ private struct AgentDraft {
 }
 
 private enum ComposerCommand: String, CaseIterable, Identifiable {
-    case resume, new, status, help
+    case resume, new, status, command, native, shell, help
 
     var id: Self { self }
     var token: String { "/\(rawValue)" }
     var usage: String {
         switch self {
         case .resume: "\(token) [session ID]"
-        case .new, .status, .help: token
+        case .new, .status, .command, .native, .shell, .help: token
         }
     }
 
@@ -124,6 +124,9 @@ private enum ComposerCommand: String, CaseIterable, Identifiable {
         case .resume: "Continue a previous CLI session"
         case .new: "Start a fresh conversation in this agent"
         case .status: "Show the selected agent’s state"
+        case .command: "Edit the command used to launch this agent"
+        case .native: "Open the agent’s interactive CLI in Terminal"
+        case .shell: "Open a shell in this workspace"
         case .help: "Show available commands"
         }
     }
@@ -189,6 +192,7 @@ private final class WorkspaceModel: ObservableObject {
     private var lastAgentSelection: UUID?
     private var lastDirty: Bool?
     private var folderLoads: [String: UUID] = [:]
+    private var catalogLoads: [String: UUID] = [:]
 
     init(host: FleetHost) { self.host = host }
 
@@ -557,8 +561,10 @@ private final class WorkspaceModel: ObservableObject {
 
     func loadModelOptions(for agent: String, refresh: Bool = false) async {
         var catalog = modelCatalogs[agent] ?? NativeModelCatalog()
-        guard !catalog.loading else { return }
+        guard refresh || !catalog.loading else { return }
         if !refresh, let loadedAt = catalog.loadedAt, loadedAt.duration(to: .now) < .seconds(60) { return }
+        let request = UUID()
+        catalogLoads[agent] = request
         catalog.loading = true
         catalog.error = nil
         modelCatalogs[agent] = catalog
@@ -578,6 +584,8 @@ private final class WorkspaceModel: ObservableObject {
             catalog.error = "Could not load models. \(error.localizedDescription)"
             catalog.loadedAt = nil
         }
+        guard catalogLoads[agent] == request else { return }
+        catalogLoads[agent] = nil
         catalog.loading = false
         modelCatalogs[agent] = catalog
     }
@@ -741,6 +749,7 @@ private struct WorkspacePane: View {
     @State private var showingCommands: WorkspaceAgent?
     @State private var showingStatus: WorkspaceAgent?
     @State private var confirmingCursorTrust = false
+    @State private var terminalError: String?
     @AppStorage("FleetExplorerVisible") private var explorerVisible = true
     private let accent = Color(nsColor: .systemTeal)
 
@@ -783,6 +792,10 @@ private struct WorkspacePane: View {
                 }
             case let .resume(agent, session):
                 ResumeSessionPanel(model: model, agent: agent, session: session)
+            case let .command(agent):
+                AgentCommandPanel(host: host, agent: agent) {
+                    Task { await model.loadModelOptions(for: agent.harness, refresh: true) }
+                }
             }
         }
         .background {
@@ -811,6 +824,24 @@ private struct WorkspacePane: View {
             Button("Trust Workspace") { Task { await model.setCursorTrust(true) } }
         } message: {
             Text("Cursor will use its workspace trust option for \(host.repo) on \(host.label). Only trust workspaces you recognize. You can revoke trust from Agent options.")
+        }
+        .alert("Could Not Open Terminal", isPresented: Binding(
+            get: { terminalError != nil }, set: { if !$0 { terminalError = nil } }
+        )) {
+            Button("OK", role: .cancel) { terminalError = nil }
+        } message: {
+            Text(terminalError ?? "")
+        }
+    }
+
+    private func openTerminal(agent: WorkspaceAgent? = nil) {
+        Task {
+            do {
+                try await FleetBridge.openTerminal(host, agent: agent?.harness,
+                                                   session: agent.flatMap { model.sessions[$0] })
+            } catch {
+                terminalError = error.localizedDescription
+            }
         }
     }
 
@@ -1015,6 +1046,11 @@ private struct WorkspacePane: View {
                     .help("Stop this task")
                 }
                 Menu {
+                    Button("Edit Agent Command…") { panel = .command(agent) }
+                    Button("Open Agent in Terminal") { openTerminal(agent: agent) }
+                        .disabled(!model.canReset)
+                    Button("Open Workspace Shell") { openTerminal() }
+                    Divider()
                     if agent.harness == "cursor" {
                         Button("Sign In to Cursor…") { Task { await model.signInToCursor() } }
                             .disabled(model.cursorSigningIn)
@@ -1053,7 +1089,8 @@ private struct WorkspacePane: View {
                     }
                     ForEach(model.turns) { turn in
                         let offerTrust = agent.harness == "cursor" && !model.cursorTrusted && turn.requiresCursorTrust
-                        TurnCard(turn: turn, trustWorkspace: offerTrust ? { confirmingCursorTrust = true } : nil)
+                        TurnCard(turn: turn, trustWorkspace: offerTrust ? { confirmingCursorTrust = true } : nil,
+                                 openTerminal: turn.status == "failed" && model.canReset ? { openTerminal(agent: agent) } : nil)
                     }
                 }
                 .padding(12)
@@ -1232,6 +1269,19 @@ private struct WorkspacePane: View {
         case .status:
             model.finishCommand(for: agent)
             showingStatus = agent
+        case .command:
+            model.finishCommand(for: agent)
+            panel = .command(agent)
+        case .native:
+            guard model.canReset else {
+                model.finishCommand(for: agent, error: "Wait for this agent’s current operation to finish.")
+                return
+            }
+            model.finishCommand(for: agent)
+            openTerminal(agent: agent)
+        case .shell:
+            model.finishCommand(for: agent)
+            openTerminal()
         case .help:
             model.finishCommand(for: agent)
             showingCommands = agent
@@ -1268,11 +1318,85 @@ private struct WorkspacePane: View {
 private enum WorkspacePanel: Identifiable {
     case quickOpen
     case resume(WorkspaceAgent, String)
+    case command(WorkspaceAgent)
 
     var id: String {
         switch self {
         case .quickOpen: "open"
         case let .resume(agent, _): "resume-\(agent.harness)-\(agent.lane)"
+        case let .command(agent): "command-\(agent.harness)"
+        }
+    }
+}
+
+@MainActor
+private struct AgentCommandPanel: View {
+    let host: FleetHost
+    let agent: WorkspaceAgent
+    let didSave: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var command = ""
+    @State private var ready = false
+    @State private var busy = true
+    @State private var result: String?
+
+    private var name: String { agent.harness == "codex" ? "Codex" : "Cursor" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("\(name) Command").font(.headline)
+            Text("Used by every \(name) agent and schedule in \(host.label). Leave blank for automatic discovery.")
+                .foregroundStyle(.secondary)
+            TextField("Command", text: $command, prompt: Text(agent.harness == "codex" ? "codex" : "cursor-agent or agent"))
+                .font(.system(.body, design: .monospaced))
+                .disabled(!ready || busy)
+                .onChange(of: command) { _, _ in result = nil }
+            Text("Enter an executable name or path, with optional arguments. Quote paths that contain spaces.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let result { Text(result).font(.caption).textSelection(.enabled) }
+            HStack {
+                if busy { ProgressView().controlSize(.small) }
+                if ready {
+                    Button("Use Automatic") { command = "" }.disabled(busy || command.isEmpty)
+                    Button("Test Command") { Task { await update("test_cli_command") } }.disabled(busy)
+                }
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Save") { Task { await update("set_cli_command") } }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!ready || busy)
+            }
+        }
+        .padding(18)
+        .frame(width: 490)
+        .task {
+            defer { busy = false }
+            do {
+                let reply = try await FleetBridge.call(host, ["op": "cli_command", "agent": agent.harness])
+                command = reply["command"] as? String ?? ""
+                ready = true
+            } catch {
+                result = error.localizedDescription
+            }
+        }
+    }
+
+    private func update(_ operation: String) async {
+        guard !busy else { return }
+        busy = true
+        result = nil
+        defer { busy = false }
+        do {
+            let reply = try await FleetBridge.call(host, ["op": operation, "agent": agent.harness, "command": command])
+            if operation == "set_cli_command" {
+                didSave()
+                dismiss()
+            } else if let executable = reply["executable"] as? String {
+                result = "Responded to --version at \(executable)"
+            }
+        } catch {
+            result = error.localizedDescription
         }
     }
 }
@@ -1877,6 +2001,7 @@ private struct SourceEditor: View {
 private struct TurnCard: View {
     let turn: WorkspaceTurn
     var trustWorkspace: (() -> Void)?
+    var openTerminal: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1924,6 +2049,9 @@ private struct TurnCard: View {
             if let trustWorkspace {
                 Button("Trust Workspace for Cursor…", action: trustWorkspace)
                     .help("Trust this workspace in Cursor, then send your prompt again")
+            }
+            if let openTerminal {
+                Button("Open Agent in Terminal", action: openTerminal)
             }
         }
     }
