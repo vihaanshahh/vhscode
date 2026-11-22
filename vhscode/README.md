@@ -18,6 +18,10 @@ vhscode         # launch
 
 ---
 
+## Fleet terminal workbench
+
+Run `./vhscode/bin/vhscode fleet --ssh build-01 /srv/project` from the checkout to browse, edit, and tag files on a remote host with its installed Codex or Cursor agent. Omit `--ssh build-01` to work locally. See the [fleet guide](fleet/README.md) for local output filtering, tmux reconnect, and architecture.
+
 ## The orchestration layer
 
 This is the part that's actually new.

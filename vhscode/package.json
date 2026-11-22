@@ -12,11 +12,14 @@
     "url": "https://github.com/vihaanshahh/VHSCode.git"
   },
   "bin": {
-    "vhscode": "./bin/vhscode"
+    "vhscode": "./bin/vhscode",
+    "vhscode-fleet": "./fleet/fleet.py"
   },
   "files": [
     "bin",
     "config",
+    "fleet/*.py",
+    "fleet/README.md",
     "opencode-dir",
     "scripts",
     "lib",

@@ -1,0 +1,58 @@
+# Fleet workbench
+
+Use the fork's launcher from this checkout. Fleet runs on macOS or Linux with Python 3.10+ and a terminal. Install and authenticate the Codex or Cursor CLI on each machine where you want that agent to work.
+
+```sh
+./vhscode/bin/vhscode fleet ~/src/project
+./vhscode/bin/vhscode fleet --ssh build-01 /srv/project
+./vhscode/bin/vhscode fleet --ssh build-01 --agent cursor --persist /srv/project
+```
+
+For the lowest local startup cost, run `./vhscode/fleet/fleet.py` directly, or use `vhscode-fleet` when this branch’s package is installed. Both start directly in Python.
+
+An SSH destination can be a host alias from your OpenSSH config, including its user, port, identity and jump host. The repo argument is a directory on that machine. Quote a remote home-relative path such as `'~/src/project'` so the local shell leaves it intact. The remote user's noninteractive shell must find `python3` and the agent on its PATH. Remote machines do not need Node, a checkout of this fork, or a running service.
+
+## Fleet dashboard
+
+Launch `./vhscode/fleet/fleet.py` with no arguments for the dashboard. You can also open it with `vhscode fleet --dashboard` or `/dashboard` at the workbench prompt. The inventory belongs to the machine running the dashboard. Open it on your laptop for a fleet-wide view. Successfully connecting with `--ssh` adds that destination to its inventory.
+
+The Activity view lists running tasks and recent completions across machines. Press Enter on a task to inspect its history. Tab cycles through Hosts, Schedules, and Risks. Inspect a run for the public plan, actions, and outcome reported by its harness. Open the schedules view to choose the target repository, Codex or Cursor, prompt, repeat interval in minutes, and reporting mode. You can edit, pause, resume, and remove schedules there. Opening a host interactively lets you complete a first SSH login or host-key prompt. Background polling uses key-based login or an existing authenticated connection.
+
+Each host stores its schedules and bounded run history under `${XDG_STATE_HOME:-$HOME/.local/state}/vhscode/fleet`. A detached user process runs enabled schedules even with the dashboard closed. The host runs up to two scheduled tasks concurrently, skips missed intervals after downtime, and limits each run to 30 minutes. Pausing or deleting a schedule also cancels its active run. After a machine reboots, reconnect with the dashboard to wake that scheduler. The home directory and agent credentials must be available to the SSH user.
+
+### Reporting settings
+
+| Mode | Terminal output |
+| --- | --- |
+| Actions | Main tool actions, errors and outcome. |
+| Summary | A short outcome and any blockers. |
+| Risks | Reported test failures, approvals or potentially breaking changes, plus the outcome. |
+
+Choose a mode in each schedule’s form. In an interactive repository, `/view summary` saves its default. Use `/risks review the migration` for one turn. The Risks tab collects flagged activity across hosts. Open a run for the public plans, actions and evidence behind the flag. Risk indicators depend on what the harness reports.
+
+## Working in a repository
+
+- Enter `/files` to browse the directory tree, including dotfiles. Enter opens the selected directory or file. Space toggles a file tag. The editor uses the target machine's `$VISUAL`, `$EDITOR`, or `vi`. Save and exit to return to the browser. Press `q` to return to the prompt.
+- Enter `/tag src/main.py` to attach a known path directly. Spaces in a path are literal. Tags persist across prompts until removed with `/untag PATH` or `/untag-all`. Use `/tags` to see the selection. Harnesses receive repository-relative paths and read the files they need.
+- Type a prompt to start a turn. The default view emphasizes actions and the outcome. Use `/details` for more harness output. Use `/agent cursor` or `/agent codex` to switch. Each agent resumes its own conversation within the workbench. `/new` starts a fresh conversation for the selected agent. `/native` opens its interactive CLI for approvals or native commands. If a Fleet turn already has a session ID, the native CLI resumes it.
+- Use `/status` and `/diff` to review the working tree. Ctrl-C interrupts an active turn. `/quit` closes the workbench.
+- Use `--persist` on a host with tmux to keep the running workbench, its tags, and its active turn through a disconnect. Detach with Ctrl-B then D. Run the same command for the same remote directory to reattach. A plain SSH session ends when its terminal closes.
+
+## Output filtering
+
+On the machine running the workbench, enter `/filter-setup` once to fetch the pinned quantized MobileBERT model and install its CPU runtime into a user-cache virtual environment. Use `/details` to show public progress, then enter `/filter` to classify eligible progress. You can also enable the filter flag at startup with `--filter`. Model setup requires network access and a compatible Python interpreter. Inference runs locally. You can verify installation directly from the checkout with `python3 vhscode/fleet/fleet_filter.py smoke`.
+
+Only eligible transient events enter the classifier. Final assistant messages, warnings, errors and approval events go straight to the terminal. Under load, on timeout, or if the optional runtime is unavailable, the workbench shows the progress event. The CLI's own session history remains available in the native harness.
+
+## Architecture and performance
+
+| Component | Work performed |
+| --- | --- |
+| Launcher | Dispatches directly into the Python terminal interface before initializing the OpenCode sidecars. |
+| SSH transport | Sends a small compressed Python bundle through OpenSSH, installs it atomically under `~/.cache/vhscode/fleet/<digest>`, and attaches a PTY on the same authenticated connection. Only terminal I/O crosses that connection during editing. |
+| Dashboard and scheduler | Poll hosts in the background and persist host-local schedules in SQLite. The dashboard fetches individual histories on demand. Each host retains up to 100 finished runs and 80 events per run. |
+| File browser | Enumerates one directory on demand and renders a page of entries. The native editor owns the open buffer. The workbench keeps paths for tagged files. |
+| Agent adapters | Spawn the installed harness in the target directory, consume its event stream incrementally, and retain a session ID per harness. Each CLI owns its credentials, permissions, tool execution and conversation history. |
+| Progress worker | Starts on the first eligible event with filtering enabled. The queue and input lengths are bounded. Inference runs in a separate single-CPU-thread process and the supervisor releases it after an idle timeout. |
+
+SSH runtime directories are shared by sessions using identical versions. A running workbench or scheduler can still use a cached runtime. Remove old versions only after closing those sessions and pausing schedules on the host. The optional classifier lives separately under `${XDG_CACHE_HOME:-$HOME/.cache}/opencode/fleet-filter`.

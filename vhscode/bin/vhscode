@@ -215,6 +215,22 @@ function handleBuiltins(argv) {
 }
 
 async function main() {
+  if (process.argv[2] === "fleet") {
+    const child = childProcess.spawn("python3", [path.join(PKG_ROOT, "fleet", "fleet.py"), ...process.argv.slice(3)], {
+      stdio: "inherit",
+    })
+    // The foreground Python process receives terminal interrupts directly.
+    process.on("SIGINT", () => {})
+    for (const sig of ["SIGTERM", "SIGHUP"]) process.on(sig, () => child.kill(sig))
+    child.once("error", (err) => {
+      process.stderr.write(`[vhscode] failed to launch fleet: ${err.message}\n`)
+      process.exitCode = 1
+    })
+    child.once("exit", (code, signal) => {
+      process.exitCode = code ?? (128 + os.constants.signals[signal])
+    })
+    return
+  }
   ensureDirs()
 
   if (handleBuiltins(process.argv.slice(2))) return

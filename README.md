@@ -43,6 +43,10 @@
 
 ---
 
+### Fleet workbench
+
+Run `./vhscode/fleet/fleet.py` from this checkout for an SSH fleet dashboard, repository editor, and scheduled Codex or Cursor tasks. [Fleet guide](vhscode/fleet/README.md)
+
 ### Installation
 
 ```bash
