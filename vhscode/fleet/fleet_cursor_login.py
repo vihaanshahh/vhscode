@@ -97,7 +97,7 @@ def _on_host(repo):
 
 
 def login(host, repo):
-    from fleet_ssh import bundle, destination, install, ssh_options
+    from fleet_ssh import bundle, destination, install, remote_python, ssh_options
 
     if host:
         target = destination(host)
@@ -106,7 +106,7 @@ def login(host, repo):
             raise ValueError("Could not connect to the workspace. Use Test SSH in workspace settings.")
         digest = bundle()[1]
         script = f'"$HOME"/.cache/vhscode/fleet/{digest}/fleet_cursor_login.py'
-        args = [*ssh, "-T", "--", target, f"exec python3 -B {script} --on-host {shlex.quote(repo)}"]
+        args = [*ssh, "-T", "--", target, remote_python(f"{script} --on-host {shlex.quote(repo)}")]
     else:
         args = [sys.executable, "-E", "-s", "-B", str(Path(__file__).resolve()), "--on-host", repo]
     verified = opened = False

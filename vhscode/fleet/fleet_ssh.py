@@ -74,16 +74,27 @@ def ssh_options(host, batch):
     return options
 
 
+def remote_python(arguments):
+    # macOS can expose an older system Python over SSH while the installed app ships a newer one.
+    return (
+        'fleet_python=python3; '
+        'for candidate in "$HOME/Applications/Fleet Workbench.app/Contents/Resources/python/bin/python3" '
+        '"/Applications/Fleet Workbench.app/Contents/Resources/python/bin/python3"; do '
+        'if [ -x "$candidate" ]; then fleet_python="$candidate"; break; fi; done; '
+        f'exec "$fleet_python" -E -s -B {arguments}'
+    )
+
+
 def install(host, ssh, batch):
     data, digest = bundle()
-    return subprocess.run([*ssh, "-T", "--", host, shlex.join(["python3", "-c", INSTALL, digest])],
+    return subprocess.run([*ssh, "-T", "--", host, remote_python(shlex.join(["-c", INSTALL, digest]))],
                           input=data, capture_output=batch, timeout=12 if batch else None)
 
 
 def remote_command(args):
     _, digest = bundle()
     script = f'"$HOME"/.cache/vhscode/fleet/{digest}/fleet.py'
-    return f"exec python3 {script} " + shlex.join(args)
+    return remote_python(f"{script} {shlex.join(args)}")
 
 
 def connect(args):
