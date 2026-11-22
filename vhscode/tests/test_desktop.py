@@ -426,6 +426,7 @@ class DesktopBridgeTest(unittest.TestCase):
         for error, expected in (
             ("Error: Authentication required. Run 'agent login'.", "Sign in to Cursor on this host"),
             ("Error: fetch failed (ENETUNREACH)", "could not reach its model catalog from this host"),
+            ("Error: Your macOS login keychain is locked.", "could not access the login keychain"),
         ):
             with self.subTest(error=error):
                 self.environment["FLEET_TEST_CATALOG_ERROR"] = error

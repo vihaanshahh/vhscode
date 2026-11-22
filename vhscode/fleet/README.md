@@ -32,7 +32,7 @@ Use the fork's launcher from this checkout. Fleet runs on macOS or Linux with Py
 
 For the lowest local startup cost, run `./vhscode/fleet/fleet.py` directly, or use `vhscode-fleet` when this branch’s package is installed. Both start directly in Python.
 
-An SSH destination can be a host alias from your OpenSSH config, including its user, port, identity and jump host. The repo argument is a directory on that machine. Quote a remote home-relative path such as `'~/src/project'` so the local shell leaves it intact. The remote user's noninteractive shell must find `python3` and the agent on its PATH. Remote machines do not need Node, a checkout of this fork, or a running service.
+An SSH destination can be a host alias from your OpenSSH config, including its user, port, identity and jump host. The repo argument is a directory on that machine. Quote a remote home-relative path such as `'~/src/project'` so the local shell leaves it intact. The remote shell must find `python3`. Fleet looks for the agent on PATH, in common user bin directories, and in an installed Fleet Workbench bundle on macOS. Remote machines do not need Node, a checkout of this fork, or a running service. If Cursor reports a locked login keychain over SSH, use Fleet or Terminal in the desktop session on the Mac running Cursor.
 
 ## Fleet dashboard
 

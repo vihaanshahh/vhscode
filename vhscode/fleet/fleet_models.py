@@ -656,12 +656,13 @@ def _codex_threads(repo, *, session=None):
 def _cursor_models(process, output, deadline):
     models = []
     found_header = False
-    authentication_error = network_error = False
+    authentication_error = network_error = locked_keychain = False
     for diagnostic, raw in output:
         line = ANSI.sub("", raw.decode("utf-8", errors="replace")).strip()
         if diagnostic or line.lower().startswith("error:"):
             authentication_error |= bool(CURSOR_AUTH_ERROR.search(line))
             network_error |= bool(CURSOR_NETWORK_ERROR.search(line))
+            locked_keychain |= "login keychain is locked" in line.lower()
             continue
         if line == "Available models":
             found_header = True
@@ -674,6 +675,8 @@ def _cursor_models(process, output, deadline):
         if match and len(models) < MAX_MODELS:
             models.append((match["id"], match["label"]))
     if process.wait(timeout=max(0.01, deadline - monotonic())) != 0:
+        if locked_keychain:
+            raise ValueError("Cursor could not access the login keychain. Open Fleet or Terminal on the Mac that runs Cursor and unlock its login keychain.")
         if authentication_error:
             raise ValueError("Sign in to Cursor on this host with `cursor-agent login` or `agent login` to list models.")
         if network_error:
