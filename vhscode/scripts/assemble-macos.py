@@ -9,6 +9,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import tempfile
 
 
 def script(path, content):
@@ -35,7 +36,21 @@ def main():
         shutil.copy2(file, resources / "fleet" / file.name)
     shutil.copy2(package / "fleet/README.md", resources / "Fleet Guide.md")
     shutil.copy2(package / "LICENSE", resources / "LICENSE")
-    shutil.copy2(package.parent / "packages/desktop/icons/prod/icon.icns", resources / "Fleet.icns")
+    sources = package / "desktop-macos"
+    with tempfile.TemporaryDirectory() as temp:
+        iconset = Path(temp) / "Fleet.iconset"
+        iconset.mkdir()
+        raster = Path(temp) / "Fleet.png"
+        subprocess.run(["sips", "-s", "format", "png", str(sources / "Fleet.svg"), "--out", str(raster)],
+                       check=True, stdout=subprocess.DEVNULL)
+        for size in (16, 32, 128, 256, 512):
+            for scale in (1, 2):
+                pixels = str(size * scale)
+                suffix = "@2x" if scale == 2 else ""
+                output = iconset / f"icon_{size}x{size}{suffix}.png"
+                subprocess.run(["sips", "-z", pixels, pixels, str(raster), "--out", str(output)],
+                               check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(resources / "Fleet.icns")], check=True)
 
     script(resources / "bin/vhscode-fleet", """#!/bin/sh
 set -eu
@@ -54,43 +69,28 @@ export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 if [ -d "$resources/terminfo" ]; then
   export TERMINFO_DIRS="$resources/terminfo:${TERMINFO_DIRS:-}:/usr/share/terminfo"
 fi
+if [ "$#" -eq 0 ]; then
+  exec /usr/bin/open "$resources/../.."
+fi
 exec "$resources/python/bin/python3" "$resources/fleet/fleet.py" "$@"
 """)
-    script(resources / "Launch Fleet.command", """#!/bin/sh
+    script(resources / "bin/fleet-askpass", """#!/bin/sh
 set -eu
-resources=$(cd "$(/usr/bin/dirname "$0")" && pwd -P)
-cd "$HOME"
-exec "$resources/bin/vhscode-fleet" --dashboard
+bin=$(cd "$(/usr/bin/dirname "$0")" && pwd -P)
+exec "$bin/../../MacOS/FleetWorkbench" --ssh-askpass "$@"
 """)
-    # LaunchServices supplies no controlling terminal. Terminal opens the bundled
-    # command as a document without an Apple Events automation permission prompt.
-    launcher = r"""
-#include <limits.h>
-#include <mach-o/dyld.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-int main(void) {
-    char executable[PATH_MAX], path[PATH_MAX], command[PATH_MAX];
-    uint32_t size = sizeof(executable);
-    if (_NSGetExecutablePath(executable, &size) || !realpath(executable, path)) return 1;
-    char *last = strrchr(path, '/');
-    if (!last) return 1;
-    *last = 0;
-    if (snprintf(command, sizeof(command), "%s/../Resources/Launch Fleet.command", path)
-        >= (int)sizeof(command)) return 1;
-    execl("/usr/bin/open", "open", "-b", "com.apple.Terminal", command, (char *)NULL);
-    return 1;
-}
-"""
-    subprocess.run(["/usr/bin/clang", "-Os", "-x", "c", "-", "-o", str(contents / "MacOS/FleetWorkbench")],
-                   input=launcher, text=True, check=True)
+    previous_command = resources / "Launch Fleet.command"
+    previous_command.unlink(missing_ok=True)
+    subprocess.run(["/usr/bin/xcrun", "swiftc", "-O", "-whole-module-optimization", "-parse-as-library",
+                    *map(str, sorted(sources.glob("*.swift"))),
+                    "-o", str(contents / "MacOS/FleetWorkbench")], check=True)
     info = dict(CFBundleExecutable="FleetWorkbench", CFBundleName="Fleet Workbench",
                 CFBundleDisplayName="Fleet Workbench", CFBundleIdentifier="io.vhscode.fleet-workbench",
-                CFBundleVersion="1", CFBundleShortVersionString="0.1", CFBundlePackageType="APPL",
-                CFBundleIconFile="Fleet.icns", LSUIElement=True)
+                CFBundleVersion="2", CFBundleShortVersionString="0.2", CFBundlePackageType="APPL",
+                CFBundleIconFile="Fleet.icns", NSHighResolutionCapable=True, LSMinimumSystemVersion="14.0")
+    info["CFBundleDocumentTypes"] = [dict(CFBundleTypeName="VS Code Workspace",
+                                          CFBundleTypeRole="Editor", LSHandlerRank="Alternate",
+                                          CFBundleTypeExtensions=["code-workspace"])]
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
 
 

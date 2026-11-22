@@ -18,9 +18,9 @@ vhscode         # launch
 
 ---
 
-## Fleet terminal workbench
+## Fleet Workbench
 
-Run `./vhscode/bin/vhscode fleet --ssh build-01 /srv/project` from the checkout to browse, edit, and tag files on a remote host with its installed Codex or Cursor agent. Omit `--ssh build-01` to work locally. See the [fleet guide](fleet/README.md) for local output filtering, tmux reconnect, and architecture.
+Open the macOS app for a graphical workspace editor, fleet activity, and schedules. The native Codex and Cursor CLIs own model execution and session context. Fleet stores per-workspace model preferences and references to the CLI sessions. The source checkout also offers a terminal command for headless hosts. [Fleet guide](fleet/README.md)
 
 ## The orchestration layer
 

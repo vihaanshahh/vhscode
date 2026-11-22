@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 from pathlib import Path
 import shlex
@@ -61,6 +60,7 @@ def work(root, agent, quiet, view):
                 prompt = arg if override else line
                 from fleet_harness import run
                 from fleet_jobs import begin_run, end_run, event
+                from fleet_models import get
                 run_id = begin_run(root, agent, prompt, view=turn_view)
                 status = "failed"
 
@@ -73,7 +73,8 @@ def work(root, agent, quiet, view):
 
                 try:
                     sessions[agent] = run(root, agent, prompt, tags, sessions.get(agent), quiet,
-                                          on_event=record, detailed=detailed and not override, view=turn_view)
+                                          on_event=record, detailed=detailed and not override, view=turn_view,
+                                          model=get(root, agent)["model"])
                 finally:
                     end_run(run_id, status)
                 continue
@@ -151,15 +152,10 @@ def main():
     parser.add_argument("--rpc", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.rpc:
+        from fleet_desktop import serve
         from fleet_jobs import rpc
-        try:
-            body = sys.stdin.buffer.read(512 * 1024 + 1)
-            if len(body) > 512 * 1024:
-                raise ValueError("Fleet request exceeds 512 KiB")
-            reply = rpc(json.loads(body))
-        except Exception as error:
-            reply = {"error": str(error)}
-        print(json.dumps(reply))
+
+        serve(rpc)
         return 0
     if args.dashboard and args.ssh:
         from fleet_hosts import remember

@@ -58,7 +58,7 @@ class HarnessError(RuntimeError):
 def run(
     root: Path, agent: str, prompt: str, tags: set[str], session: str | None, quiet: bool,
     *, on_event: Callable[[str, str], None] | None = None, detailed: bool = False, silent: bool = False,
-    view: str = "actions",
+    view: str = "actions", model: str | None = None,
 ) -> str | None:
     """Run one turn and report public events, ending with one status event."""
     if view not in ("actions", "summary", "risks"):
@@ -72,7 +72,7 @@ def run(
             command = "codex" if agent == "codex" else "cursor-agent"
             failure = f"Fleet could not find {command} on PATH."
         else:
-            code = _run_process(root, agent, executable, prompt, tags, session, stream)
+            code = _run_process(root, agent, executable, prompt, tags, session, stream, model)
             if code:
                 failure = f"{agent} exited with status {code}."
             elif stream.failed:
@@ -97,16 +97,22 @@ def run(
 
 
 def _run_process(root: Path, agent: str, executable: str, prompt: str, tags: set[str], session: str | None,
-                 stream: _Stream) -> int:
+                 stream: _Stream, model: str | None) -> int:
 
     if tags:
         paths = "\n".join(f"- {json.dumps(path, ensure_ascii=True)}" for path in sorted(tags))
         prompt = f"{prompt}\n\nRepository-relative context paths:\n{paths}"
 
     if agent == "codex":
-        args = ["exec", "resume", "--json", "--", session, "-"] if session else ["exec", "--json", "-"]
+        args = ["exec", "resume"] if session else ["exec"]
+        args.append("--json")
+        if model:
+            args.append(f"--model={model}")
+        args.extend(["--", session, "-"] if session else ["-"])
     else:
         args = ["--print", "--output-format", "stream-json"]
+        if model:
+            args.append(f"--model={model}")
         if session:
             args.append(f"--resume={session}")
         # Use the explicit command so root subcommands cannot be mistaken for prompts.
@@ -249,9 +255,9 @@ class _Stream:
             value for name, value in os.environ.items()
             if len(value) >= 8 and re.search(r"(?i)(?:TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL)", name)
         }, key=len, reverse=True))
-        self.pending: deque[tuple[str, Future[bool], float]] = deque()
+        self.pending: deque[tuple[str, str, Future[bool], float]] = deque()
         self.filter = None
-        if quiet and detailed and not silent:
+        if quiet and detailed and (not silent or on_event is not None):
             try:
                 self.filter = _progress_filter()
             except Exception:
@@ -295,7 +301,7 @@ class _Stream:
 
     def flush_progress(self, *, force: bool = False) -> None:
         while self.pending:
-            text, future, deadline = self.pending[0]
+            kind, text, future, deadline = self.pending[0]
             if not force and not future.done() and monotonic() < deadline:
                 return
             self.pending.popleft()
@@ -305,7 +311,21 @@ class _Stream:
                         continue
                 except Exception:
                     pass
-            _print(text)
+            if self.silent:
+                self.on_event(kind, text)
+            else:
+                _print(text)
+
+    def defer_progress(self, kind: str, text: str, progress: bool) -> bool:
+        if not (kind == "info" and progress and self.filter and len(text) <= 512 and not IMPORTANT.search(text)):
+            return False
+        if len(self.pending) >= MAX_PENDING_PROGRESS:
+            return False
+        try:
+            self.pending.append((kind, text, self.filter.submit(text), monotonic() + 1.0))
+        except Exception:
+            return False
+        return True
 
     def emit(self, kind: str, text: str, *, progress: bool = False, visible: bool = True) -> None:
         for credential in self.credentials:
@@ -313,9 +333,17 @@ class _Stream:
         text = _preview(_clean(text).strip(), MAX_TOOL_PREVIEW)
         if not text:
             return
+        if self.silent:
+            if self.on_event is not None:
+                self.flush_progress()
+                if self.defer_progress(kind, text, progress):
+                    return
+                self.flush_progress(force=True)
+                self.on_event(kind, text)
+            return
         if self.on_event is not None:
             self.on_event(kind, text)
-        if self.silent or not visible or kind == "status":
+        if not visible or kind == "status":
             return
         if kind in ("plan", "info") and not self.detailed:
             return
@@ -324,13 +352,8 @@ class _Stream:
         if kind == "risk" and self.view != "risks" and not self.detailed:
             return
         self.flush_progress()
-        if progress and self.filter and len(text) <= 512 and not IMPORTANT.search(text):
-            if len(self.pending) < MAX_PENDING_PROGRESS:
-                try:
-                    self.pending.append((text, self.filter.submit(text), monotonic() + 1.0))
-                    return
-                except Exception:
-                    pass
+        if self.defer_progress(kind, text, progress):
+            return
         self.flush_progress(force=True)
         if kind == "action":
             text = _preview(" ".join(text.split()), 240)
@@ -414,6 +437,13 @@ class _Stream:
             if isinstance(thread_id, str) and thread_id:
                 self.session = thread_id
             return
+        if kind == "turn.completed" and isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+            counts = [(name, usage.get(field)) for name, field in (
+                ("input", "input_tokens"), ("cached input", "cached_input_tokens"), ("output", "output_tokens"))]
+            report = [f"{number:,} {name}" for name, number in counts if type(number) is int]
+            if report:
+                self.emit("info", "CLI token usage for this turn: " + ", ".join(report))
         if kind == "turn.failed":
             self.failed = True
         if isinstance(kind, str) and IMPORTANT.search(kind.replace("_", " ")):

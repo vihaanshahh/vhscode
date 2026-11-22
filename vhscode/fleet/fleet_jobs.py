@@ -26,6 +26,18 @@ TERMINAL = {"completed", "failed", "cancelled"}
 VIEWS = {"actions", "summary", "risks"}
 MANUAL_LOCKS = {}
 RUNTIME = str(Path(__file__).resolve())
+RUNS_VIEW = """
+    WITH display AS (
+        SELECT id, agent, repo, status, started, ended, view, action, risk, title, session, detached,
+               CASE WHEN status IN ('failed', 'cancelled')
+                    THEN COALESCE(diagnostic, outcome) ELSE outcome END AS outcome
+        FROM runs
+    )
+    SELECT id, agent, repo, status, started, ended, view, outcome, session, detached,
+           CASE WHEN ended IS NULL THEN action ELSE COALESCE(outcome, action) END AS action,
+           COALESCE(risk, '') AS risk, title
+    FROM display
+"""
 
 
 def state_dir():
@@ -67,7 +79,9 @@ def _database(directory):
                 risk TEXT,
                 outcome TEXT,
                 diagnostic TEXT,
-                title TEXT NOT NULL DEFAULT ''
+                title TEXT NOT NULL DEFAULT '',
+                session TEXT,
+                detached INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS events (
                 seq INTEGER PRIMARY KEY,
@@ -89,6 +103,7 @@ def _database(directory):
                 ("runs", {
                     "view": "TEXT NOT NULL DEFAULT 'actions'", "risk": "TEXT",
                     "outcome": "TEXT", "diagnostic": "TEXT", "title": "TEXT NOT NULL DEFAULT ''",
+                    "session": "TEXT", "detached": "INTEGER NOT NULL DEFAULT 0",
                 }),
             ):
                 existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
@@ -162,10 +177,10 @@ def _title(prompt):
     return first_line[:100].encode("utf-8", errors="replace").decode("utf-8")
 
 
-def _finish(db, run_id, status, error=None):
+def _finish(db, run_id, status, error=None, session=None):
     result = db.execute(
-        "UPDATE runs SET status = ?, ended = ? WHERE id = ? AND status = 'running'",
-        (status, time.time(), run_id),
+        "UPDATE runs SET status = ?, ended = ?, session = COALESCE(?, session) WHERE id = ? AND status = 'running'",
+        (status, time.time(), session, run_id),
     )
     if not result.rowcount:
         return
@@ -179,7 +194,7 @@ def _finish(db, run_id, status, error=None):
     )
 
 
-def begin_run(repo, agent, prompt, view="actions"):
+def begin_run(repo, agent, prompt, view="actions", *, session=None, detached=False, known_session=False):
     if not isinstance(view, str) or view not in VIEWS:
         raise ValueError("Choose an actions, summary, or risks view")
     run_id = uuid4().hex
@@ -188,10 +203,25 @@ def begin_run(repo, agent, prompt, view="actions"):
         raise RuntimeError("Could not reserve the interactive run")
     try:
         with _connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if detached and db.execute(
+                "SELECT 1 FROM runs WHERE repo=? AND agent=? AND detached=1 AND status='running' LIMIT 1",
+                (str(repo), agent),
+            ).fetchone():
+                raise ValueError("A task is already running for this workspace and agent")
+            if session is not None:
+                previous = db.execute(
+                    "SELECT status FROM runs WHERE repo = ? AND agent = ? AND session = ?",
+                    (str(repo), agent, session),
+                ).fetchall()
+                if any(row["status"] == "running" for row in previous):
+                    raise ValueError("A follow-up is already running in this session")
+                if not known_session and not any(row["status"] == "completed" for row in previous):
+                    raise ValueError("Choose a completed session from this agent and repository")
             db.execute(
-                """INSERT INTO runs(id, agent, repo, prompt, status, started, view, title)
-                   VALUES (?, ?, ?, '', 'running', ?, ?, ?)""",
-                (run_id, agent, str(repo), time.time(), view, _title(prompt)),
+                """INSERT INTO runs(id, agent, repo, prompt, status, started, view, title, session, detached)
+                   VALUES (?, ?, ?, '', 'running', ?, ?, ?, ?, ?)""",
+                (run_id, agent, str(repo), time.time(), view, _title(prompt), session, detached),
             )
             _record(db, run_id, "prompt", prompt)
     except BaseException:
@@ -208,11 +238,11 @@ def event(run_id, kind, text):
             _record(db, run_id, kind, text)
 
 
-def end_run(run_id, status):
+def end_run(run_id, status, *, error=None, session=None):
     if status not in TERMINAL:
         raise ValueError("Invalid run status")
     with _connect() as db:
-        _finish(db, run_id, status)
+        _finish(db, run_id, status, error, session)
     fd = MANUAL_LOCKS.pop(run_id, None)
     if fd is not None:
         _unlock_manual(run_id, fd)
@@ -225,7 +255,9 @@ def _unlock_manual(run_id, fd):
 
 def _reap_manual():
     with _connect() as db:
-        manual_runs = db.execute("SELECT id FROM runs WHERE slot IS NULL AND status = 'running'").fetchall()
+        manual_runs = db.execute(
+            "SELECT id, detached, cancel_requested FROM runs WHERE slot IS NULL AND status = 'running'"
+        ).fetchall()
     for row in manual_runs:
         run_id = row["id"]
         fd = _try_lock(f"manual-{run_id}.lock")
@@ -233,43 +265,57 @@ def _reap_manual():
             continue
         try:
             with _connect() as db:
-                _finish(db, run_id, "failed", "The interactive workbench disconnected during this run.")
+                if row["detached"]:
+                    status = "cancelled" if row["cancel_requested"] else "failed"
+                    _finish(db, run_id, status, "The desktop worker stopped before completing this run.")
+                else:
+                    _finish(db, run_id, "failed", "The interactive workbench disconnected during this run.")
         finally:
             _unlock_manual(run_id, fd)
 
 
 def rpc(request):
     op = request.get("op")
+    if op in {"workspace_settings", "set_model", "models", "reset_session"}:
+        from fleet_models import workspace
+        return workspace(request["repo"], request)
+    if op in {"files", "read_file", "save_file", "find_files", "submit"}:
+        from fleet_desktop import workspace
+
+        return workspace(request)
     if op == "snapshot":
         _ensure_daemon()
         _reap_manual()
         with _connect() as db:
             db.execute("BEGIN")
-            runs = db.execute(
-                """WITH display AS (
-                       SELECT id, agent, repo, status, started, ended, view, action, risk, title,
-                              CASE WHEN status IN ('failed', 'cancelled')
-                                   THEN COALESCE(diagnostic, outcome) ELSE outcome END AS outcome
-                       FROM runs
-                   )
-                   SELECT id, agent, repo, status, started, ended, view, outcome,
-                       CASE WHEN ended IS NULL THEN action ELSE COALESCE(outcome, action) END AS action,
-                       COALESCE(risk, '') AS risk, title
-                   FROM display ORDER BY started DESC, id"""
-            ).fetchall()
+            runs = db.execute(RUNS_VIEW + " ORDER BY started DESC, id").fetchall()
             schedules = db.execute(
                 """SELECT id, agent, repo, substr(prompt, 1, 256) AS prompt, minutes, enabled, next_run, view
                    FROM schedules ORDER BY rowid DESC"""
             ).fetchall()
-        return {"runs": [dict(row) for row in runs], "schedules": [
+        return {"runs": [dict(row, detached=bool(row["detached"])) for row in runs], "schedules": [
             dict(row, enabled=bool(row["enabled"])) for row in schedules
         ]}
     if op == "detail":
+        _reap_manual()
+        run_id = request.get("id")
         with _connect() as db:
+            db.execute("BEGIN")
+            run = db.execute(RUNS_VIEW + " WHERE id = ?", (run_id,)).fetchone()
             rows = db.execute(
-                "SELECT kind, text, at FROM events WHERE run_id = ? ORDER BY seq", (request.get("id"),)
+                "SELECT kind, text, at FROM events WHERE run_id = ? ORDER BY seq", (run_id,)
             ).fetchall()
-        return {"events": [dict(row) for row in rows]}
+        metadata = dict(run, detached=bool(run["detached"])) if run is not None else None
+        return {"events": [dict(row) for row in rows], "run": metadata}
+    if op == "cancel":
+        with _connect() as db:
+            result = db.execute(
+                "UPDATE runs SET cancel_requested = 1 WHERE id = ? AND detached = 1 AND status = 'running'",
+                (request.get("id"),),
+            )
+            if not result.rowcount:
+                raise ValueError("Only an active desktop run can be interrupted")
+        return {}
     if op == "schedule":
         with _connect() as db:
             row = db.execute("SELECT * FROM schedules WHERE id = ?", (request.get("id"),)).fetchone()
@@ -518,9 +564,12 @@ def _run_scheduled(run_id):
         watcher.start()
         from fleet_harness import HarnessError, run
 
+        from fleet_models import get
+
         try:
             run(Path(row["repo"]), row["agent"], row["prompt"], set(), None, False,
-                on_event=on_event, detailed=True, silent=True, view=row["view"])
+                on_event=on_event, detailed=True, silent=True, view=row["view"],
+                model=get(row["repo"], row["agent"])["model"])
         except HarnessError:
             pass
     except KeyboardInterrupt:

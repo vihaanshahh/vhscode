@@ -45,7 +45,7 @@
 
 ### Fleet workbench
 
-Run `./vhscode/fleet/fleet.py` from this checkout for an SSH fleet dashboard, repository editor, and scheduled Codex or Cursor tasks. [Fleet guide](vhscode/fleet/README.md)
+Fleet Workbench is a native macOS editor and SSH fleet dashboard for Codex CLI and Cursor Agent. Import folders or VS Code workspaces, choose a model per repository, and schedule tasks on their execution hosts. [Fleet guide](vhscode/fleet/README.md)
 
 ### Installation
 

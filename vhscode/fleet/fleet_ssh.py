@@ -106,6 +106,19 @@ def connect(args):
     os.execvp("ssh", [*ssh, "-t", "--", host, remote_command(remote)])
 
 
+def authenticate(host):
+    host = destination(host)
+    helper = Path(__file__).resolve().parent.parent / "bin" / "fleet-askpass"
+    if not helper.is_file():
+        raise OSError("Open the desktop app to authenticate this SSH connection.")
+    env = dict(os.environ, SSH_ASKPASS=str(helper), SSH_ASKPASS_REQUIRE="force")
+    options = ssh_options(host, False)
+    result = subprocess.run([*options, "-T", "-o", "ConnectTimeout=12", "--", host, "true"],
+                            stdin=subprocess.DEVNULL, capture_output=True, env=env, timeout=120)
+    if result.returncode:
+        raise OSError(result.stderr.decode(errors="replace").strip()[-800:] or "SSH authentication failed")
+
+
 def query(host, payload):
     host = destination(host)
     ssh = ssh_options(host, True)

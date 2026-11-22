@@ -1,0 +1,1513 @@
+import AppKit
+import SwiftUI
+
+struct WorkspaceView: View {
+    let host: FleetHost
+    @State private var workspaces: [WorkspaceScope: WorkspaceModel] = [:]
+
+    private var scope: WorkspaceScope {
+        WorkspaceScope(id: host.id, ssh: host.ssh, repo: host.repo)
+    }
+
+    var body: some View {
+        Group {
+            if let model = workspaces[scope] {
+                WorkspacePane(host: host, model: model)
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .task(id: scope) {
+                        if workspaces[scope] == nil {
+                            workspaces[scope] = WorkspaceModel(host: host)
+                        }
+                    }
+            }
+        }
+        .id(scope)
+    }
+}
+
+private struct WorkspaceScope: Hashable {
+    let id: String
+    let ssh: String
+    let repo: String
+}
+
+private struct ProjectEntry: Identifiable {
+    let name: String
+    let path: String
+    let isDirectory: Bool
+    var id: String { path }
+
+    init?(_ value: [String: Any]) {
+        guard let name = value["name"] as? String, let path = value["path"] as? String,
+              let kind = value["kind"] as? String else { return nil }
+        self.name = name
+        self.path = path
+        self.isDirectory = kind == "directory"
+    }
+}
+
+private struct DirectoryPage {
+    var entries: [ProjectEntry] = []
+    var currentCursor: String?
+    var nextCursor: String?
+    var previousCursors: [String?] = []
+    var isLoading = false
+    var error: String?
+    var retry = FolderNavigation.first
+}
+
+private enum FolderNavigation { case first, previous, next }
+
+private struct WorkspaceFailure: LocalizedError {
+    let errorDescription: String?
+    init(_ message: String) { errorDescription = message }
+}
+
+@MainActor
+private final class SourceBuffer: ObservableObject, Identifiable {
+    nonisolated let path: String
+    nonisolated var id: String { path }
+    @Published var text: String
+    @Published var savedText: String
+    @Published var isSaving = false
+    @Published var diskRevision: String?
+    var revision: String
+
+    init(path: String, text: String, revision: String) {
+        self.path = path
+        self.text = text
+        self.savedText = text
+        self.revision = revision
+    }
+
+    var isDirty: Bool { text != savedText }
+    var name: String { (path as NSString).lastPathComponent }
+}
+
+private struct AgentEvent: Identifiable {
+    let id: Int
+    let kind: String
+    let text: String
+}
+
+private struct WorkspaceTurn: Identifiable {
+    let id: String
+    let prompt: String
+    let reporting: String
+    var status = "queued"
+    var action = ""
+    var risk = ""
+    var outcome = ""
+    var events: [AgentEvent] = []
+    var isActive: Bool { ["queued", "running"].contains(status) }
+}
+
+@MainActor
+private final class WorkspaceModel: ObservableObject {
+    let host: FleetHost
+    @Published var folders: [String: DirectoryPage] = [:]
+    @Published var expanded = Set<String>()
+    @Published var buffers: [SourceBuffer] = []
+    @Published var selectedPath: String?
+    @Published var loadingFiles = Set<String>()
+    @Published var fileErrors: [String: String] = [:]
+    @Published var tagPaths = Set<String>()
+    @Published var agent = "codex"
+    @Published var reporting = "actions"
+    @Published var filterProgress = false
+    @Published var draft = ""
+    @Published var submitting = false
+    @Published var conversations: [String: [WorkspaceTurn]] = [:]
+    @Published var composerError: String?
+    @Published var streamErrors: [String: String] = [:]
+    @Published var stopping = Set<String>()
+    @Published var notice: String?
+    @Published private(set) var workspaceModels: [String: String] = [:]
+    @Published private(set) var sessions: [String: String] = [:]
+    @Published private(set) var resetting = Set<String>()
+    private var modelsChanged = Set<String>()
+    private var sessionsChanged = Set<String>()
+    private var loadedSettings = false
+    private var checkedWelcome = false
+    private var lastDirty: Bool?
+    private var folderLoads: [String: UUID] = [:]
+
+    init(host: FleetHost) { self.host = host }
+
+    var selectedBuffer: SourceBuffer? { buffers.first { $0.path == selectedPath } }
+    var turns: [WorkspaceTurn] { conversations[agent] ?? [] }
+    var canSend: Bool {
+        !submitting && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && activeRun(agent) == nil && !resetting.contains(agent)
+    }
+
+    func activeRun(_ agent: String) -> String? {
+        guard let last = conversations[agent]?.last, last.isActive else { return nil }
+        return last.id
+    }
+
+    func loadFolder(_ directory: String, direction: FolderNavigation = .first) async {
+        let previousPage = folders[directory]
+        var page = previousPage ?? DirectoryPage()
+        guard !page.isLoading else { return }
+        let cursor: String?
+        switch direction {
+        case .first:
+            cursor = nil
+        case .previous:
+            guard let previous = page.previousCursors.last else { return }
+            cursor = previous
+        case .next:
+            guard let next = page.nextCursor else { return }
+            cursor = next
+        }
+        page.isLoading = true
+        page.error = nil
+        folders[directory] = page
+        let load = UUID()
+        folderLoads[directory] = load
+        var request: [String: Any] = ["op": "files", "path": directory, "limit": 100]
+        var cancelled = false
+        if let cursor { request["cursor"] = cursor }
+        defer {
+            if folderLoads[directory] == load {
+                folderLoads[directory] = nil
+                page.isLoading = false
+                folders[directory] = cancelled ? previousPage : page
+            }
+        }
+        do {
+            let reply = try await FleetBridge.call(host, request)
+            try Task.checkCancellation()
+            guard folderLoads[directory] == load else { return }
+            guard let entries = reply["entries"] as? [[String: Any]] else {
+                throw WorkspaceFailure("The workspace returned an invalid folder page.")
+            }
+            var paths = Set<String>()
+            let newEntries = entries.compactMap(ProjectEntry.init).filter {
+                paths.insert($0.path).inserted
+            }
+            for entry in page.entries where entry.isDirectory && !paths.contains(entry.path) {
+                if expanded.contains(entry.path) { collapseFolder(entry.path) }
+            }
+            page.entries = newEntries
+            switch direction {
+            case .first: page.previousCursors = []
+            case .previous: page.previousCursors.removeLast()
+            case .next: page.previousCursors.append(page.currentCursor)
+            }
+            page.currentCursor = cursor
+            let next = reply["cursor"] as? String
+            page.nextCursor = next == cursor ? nil : next
+        } catch is CancellationError {
+            cancelled = true
+        } catch {
+            page.error = error.localizedDescription
+            page.retry = direction
+        }
+    }
+
+    func toggleFolder(_ path: String) async {
+        if expanded.contains(path) {
+            collapseFolder(path)
+            return
+        }
+        expanded.insert(path)
+        if folders[path] == nil { await loadFolder(path) }
+    }
+
+    private func collapseFolder(_ path: String) {
+        let prefix = path + "/"
+        expanded = expanded.filter { $0 != path && !$0.hasPrefix(prefix) }
+        folders = folders.filter { $0.key != path && !$0.key.hasPrefix(prefix) }
+        folderLoads = folderLoads.filter { $0.key != path && !$0.key.hasPrefix(prefix) }
+    }
+
+    func openFile(_ path: String) async {
+        let previous = selectedPath
+        selectedPath = path
+        guard !buffers.contains(where: { $0.path == path }), !loadingFiles.contains(path) else { return }
+        if buffers.count + loadingFiles.count >= 24 {
+            guard let clean = buffers.first(where: { $0.path != previous && !$0.isDirty && !$0.isSaving }) else {
+                fileErrors[path] = "Save or close an open file before opening another."
+                return
+            }
+            close(clean)
+        }
+        loadingFiles.insert(path)
+        fileErrors[path] = nil
+        defer { loadingFiles.remove(path) }
+        do {
+            let (text, revision) = try await readFile(path)
+            buffers.append(SourceBuffer(path: path, text: text, revision: revision))
+        } catch {
+            fileErrors[path] = error.localizedDescription
+        }
+    }
+
+    func openWelcomeFile() async {
+        guard !checkedWelcome else { return }
+        checkedWelcome = true
+        guard selectedPath == nil else { return }
+        let path = folders[""]?.entries.first {
+            !$0.isDirectory && $0.name.lowercased() == "readme.md"
+        }?.path ?? "README.md"
+        do {
+            let (text, revision) = try await readFile(path)
+            try Task.checkCancellation()
+            guard selectedPath == nil, !buffers.contains(where: { $0.path == path }) else { return }
+            buffers.append(SourceBuffer(path: path, text: text, revision: revision))
+            selectedPath = path
+        } catch is CancellationError {
+            checkedWelcome = false
+        } catch {
+            // A workspace without a readable README uses the project overview.
+        }
+    }
+
+    private func readFile(_ path: String) async throws -> (String, String) {
+        let reply = try await FleetBridge.call(host, ["op": "read_file", "path": path])
+        guard let text = reply["text"] as? String, let revision = reply["revision"] as? String else {
+            throw WorkspaceFailure("The workspace returned an invalid file.")
+        }
+        return (text, revision)
+    }
+
+    func save(_ buffer: SourceBuffer, replace: Bool = false) async {
+        guard (buffer.isDirty || replace), !buffer.isSaving, buffer.diskRevision == nil || replace else { return }
+        let text = buffer.text
+        let revision = replace ? (buffer.diskRevision ?? buffer.revision) : buffer.revision
+        notice = nil
+        buffer.isSaving = true
+        defer { buffer.isSaving = false }
+        do {
+            let reply = try await FleetBridge.call(host, [
+                "op": "save_file", "path": buffer.path, "text": text, "revision": revision,
+            ])
+            guard let newRevision = reply["revision"] as? String else {
+                throw WorkspaceFailure("The workspace did not confirm the save.")
+            }
+            if reply["conflict"] as? Bool == true {
+                buffer.diskRevision = newRevision
+                return
+            }
+            buffer.revision = newRevision
+            buffer.savedText = text
+            buffer.diskRevision = nil
+            publishDirty()
+        } catch {
+            notice = error.localizedDescription
+        }
+    }
+
+    func reload(_ buffer: SourceBuffer) async {
+        guard !buffer.isSaving else { return }
+        let previousText = buffer.text
+        buffer.isSaving = true
+        notice = nil
+        defer { buffer.isSaving = false }
+        do {
+            let (text, revision) = try await readFile(buffer.path)
+            guard buffer.text == previousText else {
+                notice = "The buffer changed during reload. Your edits are intact."
+                return
+            }
+            buffer.text = text
+            buffer.savedText = text
+            buffer.revision = revision
+            buffer.diskRevision = nil
+            publishDirty()
+        } catch {
+            notice = error.localizedDescription
+        }
+    }
+
+    func close(_ buffer: SourceBuffer) {
+        guard let index = buffers.firstIndex(where: { $0.path == buffer.path }) else { return }
+        buffers.remove(at: index)
+        if selectedPath == buffer.path {
+            selectedPath = buffers.isEmpty ? nil : buffers[min(index, buffers.count - 1)].path
+        }
+        publishDirty()
+    }
+
+    func publishDirty(force: Bool = false) {
+        let dirty = buffers.contains(where: \.isDirty)
+        guard force || dirty != lastDirty else { return }
+        lastDirty = dirty
+        NotificationCenter.default.post(name: .init("FleetWorkspaceDirty"), object: dirty)
+    }
+
+    func toggleTag(_ path: String) {
+        if tagPaths.remove(path) == nil { tagPaths.insert(path) }
+    }
+
+    func loadSettings() async {
+        guard !loadedSettings else { return }
+        do {
+            let reply = try await FleetBridge.call(host, ["op": "workspace_settings"])
+            try Task.checkCancellation()
+            for agent in ["codex", "cursor"] {
+                guard let preferences = reply[agent] as? [String: Any] else { continue }
+                if !modelsChanged.contains(agent) { workspaceModels[agent] = preferences["model"] as? String }
+                if !sessionsChanged.contains(agent) { sessions[agent] = preferences["session"] as? String }
+            }
+            loadedSettings = true
+        } catch is CancellationError {
+            return
+        } catch {
+            composerError = "Could not load agent settings. \(error.localizedDescription)"
+        }
+    }
+
+    func setModel(_ id: String, agent: String) async throws {
+        _ = try await FleetBridge.call(host, ["op": "set_model", "agent": agent, "model": id])
+        modelsChanged.insert(agent)
+        workspaceModels[agent] = id.isEmpty ? nil : id
+    }
+
+    func newConversation() async {
+        let agent = self.agent
+        guard activeRun(agent) == nil, !submitting, resetting.insert(agent).inserted else { return }
+        defer { resetting.remove(agent) }
+        composerError = nil
+        do {
+            _ = try await FleetBridge.call(host, ["op": "reset_session", "agent": agent])
+            sessionsChanged.insert(agent)
+            sessions[agent] = nil
+            conversations[agent] = []
+            streamErrors[agent] = nil
+        } catch {
+            composerError = error.localizedDescription
+        }
+    }
+
+    func submit() async {
+        guard canSend else { return }
+        let input = draft
+        let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let agent = self.agent
+        let reporting = self.reporting
+        let request: [String: Any] = [
+            "op": "submit", "agent": agent, "prompt": prompt,
+            "tags": tagPaths.sorted(), "view": reporting, "filter": filterProgress,
+        ]
+        submitting = true
+        composerError = nil
+        streamErrors[agent] = nil
+        defer { submitting = false }
+        do {
+            let reply = try await FleetBridge.call(host, request)
+            guard let id = reply["id"] as? String else {
+                throw WorkspaceFailure("The workspace did not return the new run.")
+            }
+            conversations[agent, default: []].append(WorkspaceTurn(id: id, prompt: prompt, reporting: reporting))
+            let count = conversations[agent]?.count ?? 0
+            if count > 24 { conversations[agent]?.removeFirst(count - 24) }
+            if draft == input { draft = "" }
+        } catch {
+            composerError = error.localizedDescription
+        }
+    }
+
+    func stop() async {
+        guard let id = activeRun(agent), stopping.insert(id).inserted else { return }
+        composerError = nil
+        do {
+            _ = try await FleetBridge.call(host, ["op": "cancel", "id": id])
+        } catch {
+            stopping.remove(id)
+            composerError = error.localizedDescription
+        }
+    }
+
+    func monitor(_ id: String?, agent: String) async {
+        guard let id else { return }
+        while !Task.isCancelled, activeRun(agent) == id {
+            do {
+                let reply = try await FleetBridge.call(host, ["op": "detail", "id": id])
+                try Task.checkCancellation()
+                guard let run = reply["run"] as? [String: Any],
+                      let status = run["status"] as? String,
+                      let index = conversations[agent]?.firstIndex(where: { $0.id == id }),
+                      var turn = conversations[agent]?[index] else {
+                    throw WorkspaceFailure("This run is not available yet.")
+                }
+                turn.status = status
+                turn.action = run["action"] as? String ?? ""
+                turn.risk = run["risk"] as? String ?? ""
+                turn.outcome = run["outcome"] as? String ?? ""
+                let visibleKinds: Set<String>? = switch turn.reporting {
+                case "summary": ["result", "error", "risk"]
+                case "risks": ["error", "risk"]
+                default: nil
+                }
+                turn.events = (reply["events"] as? [[String: Any]] ?? []).enumerated().compactMap { index, value in
+                    guard let kind = value["kind"] as? String, let text = value["text"] as? String,
+                          !["prompt", "status", "session"].contains(kind),
+                          visibleKinds?.contains(kind) ?? true else { return nil }
+                    return AgentEvent(id: index, kind: kind, text: text)
+                }
+                if let session = run["session"] as? String, !session.isEmpty {
+                    sessionsChanged.insert(agent)
+                    sessions[agent] = session
+                }
+                streamErrors[agent] = nil
+                conversations[agent]?[index] = turn
+                if !turn.isActive {
+                    stopping.remove(id)
+                    return
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                streamErrors[agent] = error.localizedDescription
+            }
+            do {
+                try await Task.sleep(for: .seconds(streamErrors[agent] == nil ? 1 : 4))
+            } catch { return }
+        }
+    }
+}
+
+@MainActor
+private struct WorkspacePane: View {
+    let host: FleetHost
+    @ObservedObject var model: WorkspaceModel
+    @State private var closing: SourceBuffer?
+    @State private var panel: WorkspacePanel?
+    @AppStorage("FleetExplorerVisible") private var explorerVisible = true
+    private let accent = Color(nsColor: .systemTeal)
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            HSplitView {
+                if explorerVisible { browser.frame(minWidth: 145, idealWidth: 188) }
+                editor.frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+                composer.frame(minWidth: 255, idealWidth: 316)
+            }
+        }
+        .task {
+            if model.folders[""] == nil { await model.loadFolder("") }
+            await model.openWelcomeFile()
+        }
+        .task { await model.loadSettings() }
+        .onAppear { model.publishDirty(force: true) }
+        .onDisappear { NotificationCenter.default.post(name: .init("FleetWorkspaceDirty"), object: false) }
+        .onReceive(NotificationCenter.default.publisher(for: .init("FleetQuickOpen"))) { _ in
+            panel = .quickOpen
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .init("FleetToggleExplorer"))) { _ in
+            explorerVisible.toggle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .init("FleetCloseTab"))) { _ in
+            if let buffer = model.selectedBuffer { requestClose(buffer) }
+        }
+        .sheet(item: $panel) { panel in
+            switch panel {
+            case .quickOpen:
+                QuickOpenPanel(host: host, openFiles: model.buffers.map(\.path).reversed()) { path in
+                    self.panel = nil
+                    Task { await model.openFile(path) }
+                }
+            case let .model(agent):
+                AgentModelPanel(host: host, agent: agent, current: model.workspaceModels[agent]) { id in
+                    try await model.setModel(id, agent: agent)
+                }
+            }
+        }
+        .task(id: model.activeRun("codex")) {
+            await model.monitor(model.activeRun("codex"), agent: "codex")
+        }
+        .task(id: model.activeRun("cursor")) {
+            await model.monitor(model.activeRun("cursor"), agent: "cursor")
+        }
+        .alert("Discard unsaved changes?", isPresented: Binding(
+            get: { closing != nil }, set: { if !$0 { closing = nil } }
+        ), presenting: closing) { buffer in
+            Button("Discard Edits", role: .destructive) {
+                model.close(buffer)
+                closing = nil
+            }
+            Button("Keep Editing", role: .cancel) { closing = nil }
+        } message: { buffer in
+            Text("The changes to \(buffer.name) will be lost.")
+        }
+    }
+
+    private func requestClose(_ buffer: SourceBuffer) {
+        guard !buffer.isSaving else { return }
+        if buffer.isDirty { closing = buffer } else { model.close(buffer) }
+    }
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "point.3.connected.trianglepath.dotted")
+                .font(.system(size: 20, weight: .medium))
+                .foregroundStyle(accent)
+                .frame(width: 34, height: 34)
+                .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 9))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(host.label).font(.headline)
+                Text(host.repo)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            Button { explorerVisible.toggle() } label: {
+                Image(systemName: explorerVisible ? "sidebar.left" : "sidebar.leading")
+            }
+            .help(explorerVisible ? "Hide Explorer (⌘B)" : "Show Explorer (⌘B)")
+            .accessibilityLabel(explorerVisible ? "Hide Explorer" : "Show Explorer")
+            Button { panel = .quickOpen } label: {
+                Label("Quick Open", systemImage: "magnifyingglass")
+            }
+            .help("Find a file by name or path (⌘P)")
+        }
+        .padding(.horizontal, 15)
+        .padding(.vertical, 10)
+    }
+
+    private var browser: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Explorer").font(.subheadline.weight(.semibold))
+                Spacer()
+                Button {
+                    Task { await model.loadFolder("") }
+                } label: {
+                    Image(systemName: "arrow.clockwise").frame(width: 20, height: 20)
+                }
+                .buttonStyle(.plain)
+                .help("Refresh files")
+                .accessibilityLabel("Refresh files")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    FileBranch(model: model, directory: "", depth: 0)
+                }
+                .padding(.vertical, 6)
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.7))
+    }
+
+    private var editor: some View {
+        VStack(spacing: 0) {
+            if !model.buffers.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        ForEach(model.buffers) { buffer in
+                            FileTab(buffer: buffer, selected: model.selectedPath == buffer.path) {
+                                model.selectedPath = buffer.path
+                            } close: {
+                                requestClose(buffer)
+                            }
+                        }
+                    }
+                    .padding(6)
+                }
+                Divider()
+            }
+            if let path = model.selectedPath { breadcrumbs(path) }
+            if let buffer = model.selectedBuffer {
+                SourceEditor(model: model, buffer: buffer)
+                    .id(buffer.path)
+            } else if let path = model.selectedPath, model.loadingFiles.contains(path) {
+                ProgressView("Loading file…").frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let path = model.selectedPath, let error = model.fileErrors[path] {
+                ContentUnavailableView {
+                    Label("File unavailable", systemImage: "doc.badge.ellipsis")
+                } description: {
+                    Text(error)
+                } actions: {
+                    Button("Retry") { Task { await model.openFile(path) } }
+                }
+            } else {
+                projectOverview
+            }
+            if let notice = model.notice {
+                Divider()
+                HStack(alignment: .firstTextBaseline) {
+                    Text(notice).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    Spacer()
+                    Button { model.notice = nil } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Dismiss")
+                }
+                .padding(8)
+            }
+        }
+        .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    private func breadcrumbs(_ path: String) -> some View {
+        let segments = path.split(separator: "/").map(String.init)
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                Image(systemName: "folder").accessibilityHidden(true)
+                ForEach(segments.indices, id: \.self) { index in
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .accessibilityHidden(true)
+                    Text(segments[index])
+                        .foregroundStyle(index == segments.count - 1 ? Color.primary : .secondary)
+                        .lineLimit(1)
+                }
+            }
+            .font(.system(.caption, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 6)
+        }
+        .help(path)
+        .accessibilityLabel(path)
+    }
+
+    private var projectOverview: some View {
+        let entries = (model.folders[""]?.entries ?? []).filter { !$0.isDirectory }.prefix(7)
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 13) {
+                Image(systemName: "folder.badge.gearshape")
+                    .font(.system(size: 36, weight: .light))
+                    .foregroundStyle(accent)
+                Text((host.repo as NSString).lastPathComponent.isEmpty ? host.label : (host.repo as NSString).lastPathComponent)
+                    .font(.system(.largeTitle, design: .rounded).weight(.semibold))
+                Text("Open a file from the project tree or send a prompt from the agent panel.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                if !entries.isEmpty {
+                    Divider().padding(.vertical, 3)
+                    ForEach(entries) { entry in
+                        Button {
+                            Task { await model.openFile(entry.path) }
+                        } label: {
+                            Label(entry.name, systemImage: "doc")
+                                .font(.system(.callout, design: .monospaced))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else if model.folders[""]?.isLoading == true {
+                    ProgressView("Loading project…").controlSize(.small)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(32)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var composer: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Agent").font(.subheadline.weight(.semibold))
+                Spacer()
+                if let id = model.activeRun(model.agent) {
+                    Button {
+                        Task { await model.stop() }
+                    } label: {
+                        Label(model.stopping.contains(id) ? "Stopping…" : "Stop", systemImage: "stop.fill")
+                    }
+                    .controlSize(.small)
+                    .disabled(model.stopping.contains(id))
+                    .help("Stop this task")
+                }
+                Menu {
+                    Button("Choose Model…") { panel = .model(model.agent) }
+                    Toggle("Filter routine progress", isOn: $model.filterProgress)
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Agent options")
+                .accessibilityLabel("Agent options")
+                Button { Task { await model.newConversation() } } label: {
+                    Image(systemName: "square.and.pencil").frame(width: 20, height: 20)
+                }
+                .buttonStyle(.plain)
+                .disabled(model.activeRun(model.agent) != nil || model.submitting || model.resetting.contains(model.agent))
+                .help(model.sessions[model.agent] == nil ? "New conversation" : "Start a fresh CLI session")
+                .accessibilityLabel("New conversation")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    if model.turns.isEmpty {
+                        Text("Send a prompt or attach files from the tree.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(model.turns) { turn in
+                        TurnCard(turn: turn)
+                    }
+                }
+                .padding(12)
+            }
+            .defaultScrollAnchor(.bottom)
+            Divider()
+            VStack(alignment: .leading, spacing: 10) {
+                if !model.tagPaths.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 5) {
+                            ForEach(model.tagPaths.sorted(), id: \.self) { path in
+                                HStack(spacing: 5) {
+                                    Button {
+                                        Task { await model.openFile(path) }
+                                    } label: {
+                                        Text((path as NSString).lastPathComponent)
+                                            .font(.caption)
+                                            .lineLimit(1)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help(path)
+                                    Button {
+                                        model.toggleTag(path)
+                                    } label: {
+                                        Image(systemName: "xmark").font(.caption2.weight(.semibold))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Detach \(path)")
+                                    .accessibilityLabel("Detach \(path)")
+                                }
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 4)
+                                .background(accent.opacity(0.12), in: Capsule())
+                            }
+                        }
+                    }
+                }
+                TextEditor(text: $model.draft)
+                    .font(.system(.body))
+                    .scrollContentBackground(.hidden)
+                    .frame(minHeight: 64, idealHeight: 82, maxHeight: 100)
+                    .padding(5)
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary))
+                    .accessibilityLabel("Agent prompt")
+                HStack(spacing: 6) {
+                    Picker("Agent", selection: $model.agent) {
+                        Text("Codex CLI").tag("codex")
+                        Text("Cursor Agent").tag("cursor")
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    .accessibilityLabel("Agent")
+                    .disabled(model.submitting)
+                    Picker("Reporting", selection: $model.reporting) {
+                        Text("Actions").tag("actions")
+                        Text("Summary").tag("summary")
+                        Text("Risks").tag("risks")
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    .accessibilityLabel("Reporting")
+                    Spacer(minLength: 2)
+                    Button {
+                        Task { await model.submit() }
+                    } label: {
+                        Label("Send", systemImage: "arrow.up").labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(accent)
+                    .disabled(!model.canSend)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .help("Send prompt (⌘↩)")
+                    .accessibilityLabel("Send prompt")
+                }
+                Button { panel = .model(model.agent) } label: {
+                    Label(model.workspaceModels[model.agent] ?? "CLI default", systemImage: "cpu")
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Choose the model for this workspace")
+                if let error = model.composerError ?? model.streamErrors[model.agent] {
+                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                }
+            }
+            .padding(11)
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+}
+
+private enum WorkspacePanel: Identifiable {
+    case quickOpen
+    case model(String)
+
+    var id: String {
+        switch self {
+        case .quickOpen: "open"
+        case let .model(agent): "model-\(agent)"
+        }
+    }
+}
+
+private struct NativeModelOption: Identifiable {
+    let id: String
+    let label: String
+}
+
+@MainActor
+private struct AgentModelPanel: View {
+    let host: FleetHost
+    let agent: String
+    let save: (String) async throws -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var value: String
+    @State private var models: [NativeModelOption] = []
+    @State private var listing = true
+    @State private var saving = false
+    @State private var listingError: String?
+    @State private var saveError: String?
+
+    init(host: FleetHost, agent: String, current: String?, save: @escaping (String) async throws -> Void) {
+        self.host = host
+        self.agent = agent
+        self.save = save
+        _value = State(initialValue: current ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(agent == "codex" ? "Codex CLI Model" : "Cursor Agent Model").font(.headline)
+            TextField("Exact CLI model ID", text: $value)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Exact CLI model ID")
+                .disabled(saving)
+            if listing {
+                ProgressView("Loading available models…").controlSize(.small)
+            } else if let listingError {
+                Text(listingError).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            } else if models.isEmpty {
+                Text("Enter a model ID accepted by this CLI.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(models) { item in
+                            Button {
+                                value = item.id
+                            } label: {
+                                HStack {
+                                    Text(item.label)
+                                    Spacer()
+                                    if value == item.id { Image(systemName: "checkmark") }
+                                }
+                                .padding(6)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help(item.id)
+                        }
+                    }
+                }
+                .frame(maxHeight: 200)
+                .disabled(saving)
+            }
+            if let saveError {
+                Text(saveError).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+            }
+            HStack {
+                Button("Use CLI Default") { Task { await apply("") } }
+                    .disabled(saving)
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(saving)
+                Button("Save Model") {
+                    Task { await apply(value.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(saving || value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(18)
+        .frame(width: 450)
+        .interactiveDismissDisabled(saving)
+        .task { await load() }
+    }
+
+    private func load() async {
+        defer { listing = false }
+        do {
+            let reply = try await FleetBridge.call(host, ["op": "models", "agent": agent])
+            try Task.checkCancellation()
+            let listed = reply["models"] as? [[String: Any]] ?? []
+            var seen = Set<String>()
+            models = listed.compactMap { entry in
+                guard let id = entry["id"] as? String, !id.isEmpty, seen.insert(id).inserted else { return nil }
+                return NativeModelOption(id: id, label: entry["label"] as? String ?? id)
+            }
+            listingError = reply["error"] as? String
+        } catch is CancellationError {
+            return
+        } catch {
+            listingError = error.localizedDescription
+        }
+    }
+
+    private func apply(_ id: String) async {
+        guard !saving else { return }
+        saving = true
+        saveError = nil
+        defer { saving = false }
+        do {
+            try await save(id)
+            dismiss()
+        } catch {
+            saveError = error.localizedDescription
+        }
+    }
+}
+
+@MainActor
+private final class QuickOpenSearch: ObservableObject {
+    struct Response {
+        let query: String
+        let files: [String]
+        let hasMore: Bool
+        let error: String?
+    }
+
+    @Published private(set) var response: Response?
+    private let host: FleetHost
+    private var requested = ""
+    private var worker: Task<Void, Never>?
+
+    init(host: FleetHost) { self.host = host }
+
+    func schedule(_ query: String) {
+        requested = query
+        guard !query.isEmpty, worker == nil else { return }
+        worker = Task { await process() }
+    }
+
+    func cancel() {
+        requested = ""
+        worker?.cancel()
+    }
+
+    private func process() async {
+        defer { worker = nil }
+        while !requested.isEmpty && requested != response?.query && !Task.isCancelled {
+            let query = requested
+            do {
+                try await Task.sleep(for: .milliseconds(180))
+                guard requested == query else { continue }
+                let reply = try await FleetBridge.call(host, ["op": "find_files", "query": query, "limit": 60])
+                try Task.checkCancellation()
+                guard requested == query else { continue }
+                guard let files = reply["files"] as? [String] else {
+                    throw WorkspaceFailure("The workspace returned an invalid file search.")
+                }
+                var seen = Set<String>()
+                var matches: [String] = []
+                for file in files where seen.insert(file).inserted {
+                    matches.append(file)
+                    if matches.count == 60 { break }
+                }
+                response = Response(query: query, files: matches,
+                                    hasMore: reply["more"] as? Bool == true || files.count > 60, error: nil)
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, requested == query else { continue }
+                response = Response(query: query, files: [], hasMore: false, error: error.localizedDescription)
+            }
+        }
+    }
+}
+
+@MainActor
+private struct QuickOpenPanel: View {
+    let openFiles: [String]
+    let open: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var search: QuickOpenSearch
+    @State private var query = ""
+    @State private var selected: String?
+
+    init(host: FleetHost, openFiles: [String], open: @escaping (String) -> Void) {
+        self.openFiles = openFiles
+        self.open = open
+        _search = StateObject(wrappedValue: QuickOpenSearch(host: host))
+    }
+
+    private var searchQuery: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var response: QuickOpenSearch.Response? {
+        guard !searchQuery.isEmpty, search.response?.query == searchQuery else { return nil }
+        return search.response
+    }
+    private var searching: Bool { !searchQuery.isEmpty && response == nil }
+    private var files: [String] {
+        if searchQuery.isEmpty { return openFiles }
+        if let response { return response.files }
+        return openFiles.filter { $0.localizedCaseInsensitiveContains(searchQuery) }
+    }
+    private var focusedFile: String? {
+        if let selected, files.contains(selected) { return selected }
+        return files.first
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                QuickOpenInput(query: $query, move: move, open: {
+                    if let focusedFile { open(focusedFile) }
+                }, cancel: { dismiss() })
+                .frame(height: 23)
+                if searching { ProgressView().controlSize(.small) }
+            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 3) {
+                        if searchQuery.isEmpty && !files.isEmpty {
+                            Text("Open files").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                .padding(.horizontal, 8).padding(.vertical, 3)
+                        }
+                        ForEach(files, id: \.self) { path in
+                            Button { open(path) } label: { row(path) }
+                                .buttonStyle(.plain)
+                                .id(path)
+                        }
+                        if files.isEmpty {
+                            Text(message).font(.callout).foregroundStyle(response?.error != nil ? .orange : .secondary)
+                                .padding(8)
+                        }
+                    }
+                }
+                .onChange(of: focusedFile) { _, path in
+                    if let path { proxy.scrollTo(path) }
+                }
+            }
+            Divider()
+            HStack {
+                Text(response?.hasMore == true ? "Keep typing to narrow results" : "↑ ↓ Select   ↩ Open")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 540, height: 365)
+        .onChange(of: searchQuery) { _, value in
+            selected = nil
+            search.schedule(value)
+        }
+        .onDisappear { search.cancel() }
+    }
+
+    private var message: String {
+        if searchQuery.isEmpty { return "Search by file name or path." }
+        if searching { return "Searching files…" }
+        return response?.error ?? "No matching files."
+    }
+
+    private func row(_ path: String) -> some View {
+        let name = (path as NSString).lastPathComponent
+        let folder = (path as NSString).deletingLastPathComponent
+        return HStack(spacing: 8) {
+            Image(systemName: "doc").foregroundStyle(.secondary).accessibilityHidden(true)
+            Text(name).font(.system(.callout, design: .monospaced)).lineLimit(1)
+            if !folder.isEmpty {
+                Text(folder).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .background(focusedFile == path ? Color.accentColor.opacity(0.17) : .clear,
+                    in: RoundedRectangle(cornerRadius: 5))
+        .help(path)
+    }
+
+    private func move(_ offset: Int) {
+        let files = self.files
+        guard !files.isEmpty else { return }
+        let index = focusedFile.flatMap { files.firstIndex(of: $0) } ?? 0
+        selected = files[max(0, min(files.count - 1, index + offset))]
+    }
+
+}
+
+@MainActor
+private struct QuickOpenInput: NSViewRepresentable {
+    @Binding var query: String
+    let move: (Int) -> Void
+    let open: () -> Void
+    let cancel: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(input: self) }
+
+    func makeNSView(context: Context) -> NSSearchField {
+        let input = InitialSearchField()
+        input.placeholderString = "File name or relative path"
+        input.setAccessibilityLabel("Find a file by name or path")
+        input.delegate = context.coordinator
+        input.stringValue = query
+        return input
+    }
+
+    func updateNSView(_ input: NSSearchField, context: Context) {
+        context.coordinator.input = self
+        if input.stringValue != query { input.stringValue = query }
+    }
+
+    final class InitialSearchField: NSSearchField {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            DispatchQueue.main.async { [weak self] in
+                if let self { self.window?.makeFirstResponder(self) }
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, NSSearchFieldDelegate {
+        var input: QuickOpenInput
+
+        init(input: QuickOpenInput) { self.input = input }
+
+        func controlTextDidChange(_ notification: Notification) {
+            if let control = notification.object as? NSSearchField { input.query = control.stringValue }
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            switch selector {
+            case #selector(NSResponder.moveUp(_:)): input.move(-1)
+            case #selector(NSResponder.moveDown(_:)): input.move(1)
+            case #selector(NSResponder.insertNewline(_:)): input.open()
+            case #selector(NSResponder.cancelOperation(_:)): input.cancel()
+            default: return false
+            }
+            return true
+        }
+    }
+}
+
+@MainActor
+private struct FileBranch: View {
+    @ObservedObject var model: WorkspaceModel
+    let directory: String
+    let depth: Int
+
+    var body: some View {
+        if let page = model.folders[directory] {
+            ForEach(page.entries) { entry in
+                entryRow(entry)
+                if entry.isDirectory, model.expanded.contains(entry.path) {
+                    FileBranch(model: model, directory: entry.path, depth: depth + 1)
+                }
+            }
+            if page.isLoading {
+                ProgressView().controlSize(.small).padding(.leading, indent)
+            } else if let error = page.error {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(error).font(.caption).foregroundStyle(.orange)
+                    Button("Retry") { Task { await model.loadFolder(directory, direction: page.retry) } }
+                }
+                .padding(.horizontal, 10).padding(.leading, indent)
+            } else if page.nextCursor != nil || !page.previousCursors.isEmpty {
+                HStack(spacing: 6) {
+                    Button {
+                        Task { await model.loadFolder(directory, direction: .previous) }
+                    } label: {
+                        Image(systemName: "chevron.left")
+                    }
+                    .disabled(page.previousCursors.isEmpty)
+                    .help("Previous files")
+                    .accessibilityLabel("Previous files")
+                    Button {
+                        Task { await model.loadFolder(directory, direction: .next) }
+                    } label: {
+                        Image(systemName: "chevron.right")
+                    }
+                    .disabled(page.nextCursor == nil)
+                    .help("Next files")
+                    .accessibilityLabel("Next files")
+                }
+                .controlSize(.small)
+                .padding(.leading, indent)
+            } else if page.entries.isEmpty {
+                Text("Empty folder").font(.caption).foregroundStyle(.secondary).padding(.leading, indent)
+            }
+        }
+    }
+
+    private var indent: CGFloat { CGFloat(min(depth, 9) * 11 + 8) }
+
+    private func entryRow(_ entry: ProjectEntry) -> some View {
+        let tagged = model.tagPaths.contains(entry.path)
+        let selected = model.selectedPath == entry.path
+        return HStack(spacing: 3) {
+            Button {
+                Task {
+                    if entry.isDirectory {
+                        await model.toggleFolder(entry.path)
+                    } else {
+                        await model.openFile(entry.path)
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: entry.isDirectory
+                          ? (model.expanded.contains(entry.path) ? "chevron.down" : "chevron.right")
+                          : "doc")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(entry.isDirectory ? Color(nsColor: .systemTeal) : .secondary)
+                        .frame(width: 12)
+                    Text(entry.name).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, minHeight: 24)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(entry.path)
+            if !entry.isDirectory {
+                Button { model.toggleTag(entry.path) } label: {
+                    Image(systemName: tagged ? "paperclip.circle.fill" : "paperclip")
+                        .font(.system(size: 11))
+                        .foregroundStyle(tagged ? Color(nsColor: .systemTeal) : .secondary)
+                        .frame(width: 20, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help(tagged ? "Detach \(entry.name)" : "Attach \(entry.name) to prompts")
+                .accessibilityLabel(tagged ? "Detach \(entry.name)" : "Attach \(entry.name)")
+            }
+        }
+        .padding(.leading, indent)
+        .padding(.trailing, 4)
+        .background(selected ? Color(nsColor: .systemTeal).opacity(0.16) : .clear,
+                    in: RoundedRectangle(cornerRadius: 5))
+        .padding(.horizontal, 4)
+    }
+}
+
+@MainActor
+private struct FileTab: View {
+    @ObservedObject var buffer: SourceBuffer
+    let selected: Bool
+    let activate: () -> Void
+    let close: () -> Void
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Button(action: activate) {
+                HStack(spacing: 5) {
+                    if buffer.isDirty {
+                        Circle().fill(Color(nsColor: .systemTeal)).frame(width: 5, height: 5)
+                            .accessibilityHidden(true)
+                    }
+                    Text(buffer.name).font(.caption).lineLimit(1)
+                }
+            }
+            .buttonStyle(.plain)
+            .help(buffer.path)
+            Button(action: close) {
+                Image(systemName: "xmark").font(.caption2).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Close \(buffer.name)")
+            .accessibilityLabel("Close \(buffer.name)")
+            .disabled(buffer.isSaving)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(selected ? Color(nsColor: .systemTeal).opacity(0.14) : .clear,
+                    in: RoundedRectangle(cornerRadius: 5))
+    }
+}
+
+@MainActor
+private struct SourceEditor: View {
+    @ObservedObject var model: WorkspaceModel
+    @ObservedObject var buffer: SourceBuffer
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if buffer.diskRevision != nil {
+                VStack(alignment: .leading, spacing: 7) {
+                    Label("This file changed on disk. Your edits are intact.", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    HStack {
+                        Button("Reload and Discard Edits") { Task { await model.reload(buffer) } }
+                        Button("Save My Version") { Task { await model.save(buffer, replace: true) } }
+                    }
+                    .controlSize(.small)
+                    .disabled(buffer.isSaving)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(9)
+                Divider()
+            }
+            PlainSourceView(text: $buffer.text, file: buffer.path, edited: { model.publishDirty() }) {
+                Task { await model.save(buffer) }
+            }
+            Divider()
+            HStack {
+                Text(buffer.path)
+                    .font(.system(.caption, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if buffer.isSaving { ProgressView().controlSize(.small) }
+                else if buffer.isDirty { Text("Unsaved").font(.caption).foregroundStyle(.secondary) }
+                Button {
+                    model.toggleTag(buffer.path)
+                } label: {
+                    Image(systemName: model.tagPaths.contains(buffer.path) ? "paperclip.circle.fill" : "paperclip")
+                }
+                .help(model.tagPaths.contains(buffer.path) ? "Detach file" : "Attach file to prompts")
+                .accessibilityLabel(model.tagPaths.contains(buffer.path) ? "Detach file" : "Attach file to prompts")
+                Button("Save") { Task { await model.save(buffer) } }
+                    .disabled(!buffer.isDirty || buffer.isSaving || buffer.diskRevision != nil)
+                    .keyboardShortcut("s", modifiers: .command)
+                    .help("Save (⌘S)")
+            }
+            .controlSize(.small)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+        }
+    }
+}
+
+@MainActor
+private struct TurnCard: View {
+    let turn: WorkspaceTurn
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(turn.prompt)
+                .font(.callout.weight(.medium))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(Color(nsColor: .systemTeal).opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
+            HStack(spacing: 6) {
+                if turn.isActive { ProgressView().controlSize(.small) }
+                Text(turn.status.capitalized).font(.caption.weight(.semibold))
+                if turn.isActive, turn.reporting == "actions", !turn.action.isEmpty {
+                    Text(turn.action).font(.caption).lineLimit(2)
+                }
+            }
+            .foregroundStyle(.secondary)
+            if !turn.risk.isEmpty {
+                Label(turn.risk, systemImage: "exclamationmark.triangle")
+                    .font(.callout).foregroundStyle(.orange).textSelection(.enabled)
+            }
+            if turn.reporting != "risks", !turn.outcome.isEmpty,
+               !turn.events.contains(where: { $0.text == turn.outcome }) {
+                Text(turn.outcome).font(.callout).textSelection(.enabled)
+            }
+            ForEach(turn.events) { event in
+                VStack(alignment: .leading, spacing: 3) {
+                    if event.kind != "result" {
+                        Text(event.kind.capitalized).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                    }
+                    Text(event.text)
+                        .font(event.kind == "result" ? .callout : .caption)
+                        .foregroundStyle(event.kind == "error" ? .orange : .primary)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+}
+
+@MainActor
+private struct PlainSourceView: NSViewRepresentable {
+    @Binding var text: String
+    let file: String
+    let edited: () -> Void
+    let save: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text, edited: edited) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = true
+        let editor = SourceTextView(frame: scroll.contentView.bounds)
+        editor.delegate = context.coordinator
+        editor.string = text
+        editor.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        editor.textContainerInset = NSSize(width: 12, height: 10)
+        editor.textContainer?.widthTracksTextView = false
+        editor.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                                     height: CGFloat.greatestFiniteMagnitude)
+        editor.minSize = .zero
+        editor.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        editor.isVerticallyResizable = true
+        editor.isHorizontallyResizable = true
+        editor.autoresizingMask = [.width]
+        editor.isRichText = false
+        editor.allowsUndo = true
+        editor.usesFindBar = true
+        editor.isAutomaticQuoteSubstitutionEnabled = false
+        editor.isAutomaticDashSubstitutionEnabled = false
+        editor.isAutomaticTextReplacementEnabled = false
+        editor.isAutomaticSpellingCorrectionEnabled = false
+        editor.isContinuousSpellCheckingEnabled = false
+        editor.isAutomaticLinkDetectionEnabled = false
+        editor.setAccessibilityLabel("Editor for \(file)")
+        editor.save = save
+        scroll.documentView = editor
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        context.coordinator.text = $text
+        context.coordinator.edited = edited
+        guard let editor = scroll.documentView as? SourceTextView else { return }
+        editor.save = save
+        if editor.string != text { editor.string = text }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var text: Binding<String>
+        var edited: () -> Void
+
+        init(text: Binding<String>, edited: @escaping () -> Void) {
+            self.text = text
+            self.edited = edited
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let editor = notification.object as? NSTextView else { return }
+            text.wrappedValue = editor.string
+            edited()
+        }
+    }
+
+    final class SourceTextView: NSTextView {
+        var save: (() -> Void)?
+
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if modifiers == .command, event.charactersIgnoringModifiers == "s", let save {
+                save()
+                return true
+            }
+            return super.performKeyEquivalent(with: event)
+        }
+    }
+}

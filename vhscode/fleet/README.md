@@ -2,9 +2,13 @@
 
 ### Installed Mac app
 
-Open **Fleet Workbench** in Applications. Press **2** for Hosts, select the local Mac, then press **w** to open its repository. Type `/files` to browse and edit. Edit a host with **e** to choose a different repository directory.
+Open **Fleet Workbench** in Applications. Choose **File → Open Folder** (⌘O) or **File → Open Workspace from File** (⇧⌘O) to import a VS Code `.code-workspace` project. You can also drop folders or workspace files onto the window. Imported roots appear in the sidebar and persist between launches.
 
-The Intel Mac app includes the Fleet runtime, Git, tmux, Codex, Cursor, and the local MobileBERT model. The offline classifier is ready when you enable it. Local agent turns use your own provider login. Remote agents execute on their respective SSH hosts.
+The file explorer, editor tabs, and agent controls share a native Mac window. Use ⌘P to find files, ⌘S to save, ⌘B to toggle the explorer, and ⌘W to close the current editor tab. Attach files using the paperclip beside a path in the explorer.
+
+Choose **Codex CLI** or **Cursor Agent** in the task composer. Fleet runs the signed-in CLI in the selected folder and resumes its native session. The model defaults to the CLI's own settings. Choose a workspace model from the agent options to override it for that repository and agent, including its scheduled tasks. Starting a new conversation clears the workspace's saved session reference. Each scheduled task starts a fresh conversation.
+
+Open **Activity**, **Schedules**, or **Risks** in the sidebar to monitor tasks across hosts. The plus menu adds SSH workspaces. Use **Test SSH** in workspace settings for interactive SSH authentication. The Intel Mac bundle includes Python, Git, tmux, both agent CLIs, and the local MobileBERT model. Remote tasks run with the credentials and CLIs available on the target host.
 
 ### Running from a source checkout
 
