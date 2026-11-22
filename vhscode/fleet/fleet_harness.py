@@ -111,7 +111,11 @@ def _run_process(root: Path, agent: str, executable: str, environment: dict[str,
             args.append(f"--model={model}")
         args.extend(["--", session, "-"] if session else ["-"])
     else:
+        from fleet_cursor_trust import cursor_trust
+
         args = ["--print", "--output-format", "stream-json"]
+        if cursor_trust(root):
+            args.append("--trust")
         if model:
             args.append(f"--model={model}")
         if session:
@@ -297,6 +301,10 @@ class _Stream:
         self.assistant = ""
         self.outcome = ""
         self.assistant_digest = hashlib.sha256()
+        self.codex_messages = {}
+        self.cursor_chunks = []
+        self.cursor_chunk_length = 0
+        self.cursor_partial = False
         self.credentials = tuple(sorted({
             value for name, value in os.environ.items()
             if len(value) >= 8 and re.search(r"(?i)(?:TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL)", name)
@@ -380,8 +388,8 @@ class _Stream:
         if kind == "result" and self.silent:
             from fleet_jobs import MAX_RESULT_TEXT
             limit = MAX_RESULT_TEXT
-        text = _preview(_clean(text).strip(), limit)
-        if not text:
+        text = _preview(_clean(text).rstrip("\r\n"), limit)
+        if not text.strip():
             return
         if self.silent:
             if self.on_event is not None:
@@ -395,7 +403,7 @@ class _Stream:
             self.on_event(kind, text)
         if not visible or kind == "status":
             return
-        if kind in ("plan", "info") and not self.detailed:
+        if kind in ("plan", "info", "log") and not self.detailed:
             return
         if kind == "action" and self.view != "actions" and not self.detailed:
             return
@@ -412,6 +420,7 @@ class _Stream:
         _print(text, error=kind == "error")
 
     def finish(self, status: str) -> None:
+        self.flush_cursor_message()
         if status == "completed":
             self.emit("result", self.outcome or self.assistant or "Run completed.")
         else:
@@ -434,6 +443,8 @@ class _Stream:
             self.emit("error", text)
         elif phase == "commentary":
             self.emit("info", text, progress=True)
+        elif phase in ("final", "final_answer"):
+            self.outcome = text
         else:
             self.assistant = text
         for line in text.splitlines():
@@ -450,7 +461,7 @@ class _Stream:
             if FAILED_TESTS.search(line):
                 self.emit("risk", "Test output: " + line.strip())
                 break
-        self.emit("info", text)
+        self.emit("log", text)
 
     def on_line(self, line: str, *, error: bool = False) -> None:
         if not line.strip():
@@ -507,19 +518,26 @@ class _Stream:
         if item_kind in ("reasoning", "thinking"):
             return
         if item_kind == "agent_message":
-            if kind == "item.completed" and isinstance(item.get("text"), str):
-                self.assistant_message(item["text"], item.get("phase"))
+            identifier = item.get("id")
+            text, phase = item.get("text"), item.get("phase") or event.get("phase")
+            if kind == "item.completed":
+                previous = self.codex_messages.pop(identifier, (None, None)) if isinstance(identifier, str) else (None, None)
+                text = text or previous[0]
+                if isinstance(text, str) and text:
+                    self.assistant_message(text, phase or previous[1])
+            elif isinstance(identifier, str) and isinstance(text, str) and len(self.codex_messages) < 64:
+                self.codex_messages[identifier] = (_preview(text, MAX_EVENT_BYTES), phase)
             return
         if item_kind == "todo_list":
             self.commentary()
             items = item.get("items")
             if isinstance(items, list):
                 notes = [
-                    ("✓ " if row.get("completed") else "• ") + row["text"]
+                    ("- ✓ " if row.get("completed") else "- ") + row["text"]
                     for row in items if isinstance(row, dict) and isinstance(row.get("text"), str)
                 ]
                 if notes:
-                    self.emit("plan", "Plan\n" + "\n".join(notes))
+                    self.emit("plan", "### Plan\n\n" + "\n".join(notes))
             return
 
         self.commentary()
@@ -541,7 +559,7 @@ class _Stream:
                 if isinstance(output, str) and output:
                     if failed:
                         self.emit("error", _preview(output.strip(), MAX_OUTCOME))
-                        self.emit("info", output, visible=False)
+                        self.emit("log", output, visible=False)
                     else:
                         self.tool_output(output)
             return
@@ -565,6 +583,16 @@ class _Stream:
                 label += f" {name}"
             self.emit("action", f"{'Run' if kind == 'item.started' else 'Completed'} {label}")
 
+    def cursor_message(self, text: str, phase=None) -> None:
+        self.assistant_digest.update(text.encode("utf-8", errors="surrogatepass"))
+        self.assistant_message(text, phase)
+
+    def flush_cursor_message(self) -> None:
+        if self.cursor_chunks:
+            self.cursor_message("".join(self.cursor_chunks))
+            self.cursor_chunks.clear()
+            self.cursor_chunk_length = 0
+
     def cursor(self, event: dict) -> None:
         kind, subtype = event.get("type"), event.get("subtype")
         session_id = event.get("session_id")
@@ -581,20 +609,28 @@ class _Stream:
                     if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
                 )
                 if text:
-                    self.assistant_digest.update(text.encode("utf-8", errors="surrogatepass"))
-                    self.assistant_message(text, message.get("phase"))
+                    if "timestamp_ms" in event and not event.get("model_call_id"):
+                        self.cursor_partial = True
+                        remaining = MAX_EVENT_BYTES - self.cursor_chunk_length
+                        if remaining > 0:
+                            self.cursor_chunks.append(text[:remaining])
+                            self.cursor_chunk_length += min(len(text), remaining)
+                    elif not self.cursor_partial:
+                        self.cursor_message(text, message.get("phase"))
             return
         if kind == "result":
+            self.flush_cursor_message()
             result = event.get("result")
             if subtype != "success" or event.get("is_error"):
                 self.failed = True
                 self.diagnostic(result or event.get("error"), "Cursor reported a failed result.")
             elif isinstance(result, str) and result:
                 digest = hashlib.sha256(result.encode("utf-8", errors="surrogatepass")).digest()
-                if digest != self.assistant_digest.digest():
+                if digest != self.assistant_digest.digest() and result != self.assistant:
                     self.outcome = result
             return
         if kind == "tool_call":
+            self.flush_cursor_message()
             self.commentary()
             tool_call = event.get("tool_call")
             if isinstance(tool_call, dict) and len(tool_call) == 1:
@@ -609,11 +645,11 @@ class _Stream:
                     todos = args.get("todos") if name == "updateTodosToolCall" and isinstance(args, dict) else None
                     if isinstance(todos, list):
                         notes = [
-                            ("✓ " if row.get("status") == "completed" else "• ") + row["content"]
+                            ("- ✓ " if row.get("status") == "completed" else "- ") + row["content"]
                             for row in todos if isinstance(row, dict) and isinstance(row.get("content"), str)
                         ]
                         if notes:
-                            self.emit("plan", "Plan\n" + "\n".join(notes))
+                            self.emit("plan", "### Plan\n\n" + "\n".join(notes))
                 elif subtype == "completed":
                     result = tool.get("result") if isinstance(tool, dict) else None
                     if isinstance(result, dict) and "success" in result:

@@ -76,7 +76,7 @@ def work(root, agent, quiet, view):
                                           on_event=record, detailed=detailed and not override, view=turn_view,
                                           model=get(root, agent)["model"])
                 finally:
-                    end_run(run_id, status)
+                    end_run(run_id, status, session=sessions.get(agent) if status == "completed" else None)
                 continue
             if cmd in ("/quit", "/exit"):
                 return 0

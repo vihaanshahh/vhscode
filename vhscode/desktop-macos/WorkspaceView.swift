@@ -106,6 +106,10 @@ private struct WorkspaceTurn: Identifiable {
     var outcome = ""
     var events: [AgentEvent] = []
     var isActive: Bool { ["queued", "running"].contains(status) }
+    var requiresCursorTrust: Bool {
+        events.contains { ["error", "risk"].contains($0.kind) && $0.text.localizedCaseInsensitiveContains("Workspace Trust Required") }
+            || risk.localizedCaseInsensitiveContains("Workspace Trust Required")
+    }
 }
 
 private struct WorkspaceAgent: Hashable, Identifiable {
@@ -121,6 +125,48 @@ private struct AgentDraft {
     var tags = Set<String>()
     var reporting = "actions"
     var filterProgress = false
+}
+
+private enum ComposerCommand: String, CaseIterable, Identifiable {
+    case resume, new, status, help
+
+    var id: Self { self }
+    var token: String { "/\(rawValue)" }
+    var usage: String {
+        switch self {
+        case .resume: "\(token) [session ID]"
+        case .new, .status, .help: token
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .resume: "Continue a previous CLI session"
+        case .new: "Start a fresh conversation in this agent"
+        case .status: "Show the selected agent’s state"
+        case .help: "Show available commands"
+        }
+    }
+
+    static func parse(_ input: String) -> (command: Self, argument: String)? {
+        let line = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.contains(where: \.isNewline) else { return nil }
+        let parts = line.split(maxSplits: 1, whereSeparator: \.isWhitespace)
+        guard let first = parts.first, first.hasPrefix("/"),
+              let command = Self(rawValue: first.dropFirst().lowercased()) else { return nil }
+        return (command, parts.count == 2 ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines) : "")
+    }
+
+    static func suggestions(_ input: String) -> [Self] {
+        let prefix = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard prefix.hasPrefix("/"), !prefix.contains(where: \.isWhitespace) else { return [] }
+        return allCases.filter { $0.token.hasPrefix(prefix) }
+    }
+}
+
+private struct NativeSessionOption: Identifiable {
+    let id: String
+    let title: String
 }
 
 @MainActor
@@ -142,6 +188,8 @@ private final class WorkspaceModel: ObservableObject {
     @Published private var pendingDetails = Set<String>()
     @Published private(set) var loadError: String?
     @Published private var settingsError: String?
+    @Published private(set) var cursorSigningIn = false
+    @Published private(set) var cursorLoginMessage: String?
     @Published private(set) var agentsLoaded = false
     @Published var stopping = Set<String>()
     @Published var notice: String?
@@ -151,6 +199,10 @@ private final class WorkspaceModel: ObservableObject {
     @Published private(set) var sessions: [WorkspaceAgent: String] = [:]
     @Published private var resetting = Set<WorkspaceAgent>()
     @Published private(set) var modelCatalogs: [String: NativeModelCatalog] = [:]
+    @Published private(set) var cursorTrusted = false
+    @Published private(set) var savingCursorTrust = false
+    @Published private(set) var cursorTrustError: String?
+    private var cursorTrustChanged = false
     private var modelsChanged = Set<String>()
     private var loadedSettings = false
     private var checkedWelcome = false
@@ -174,7 +226,22 @@ private final class WorkspaceModel: ObservableObject {
 
     private func canSend(from agent: WorkspaceAgent) -> Bool {
         canReset(agent) && !savingModels.contains(agent.harness)
+            && (agent.harness != "cursor" || !savingCursorTrust)
             && drafts[agent]?.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    func input(for agent: WorkspaceAgent) -> String { drafts[agent]?.text ?? "" }
+
+    func finishCommand(for agent: WorkspaceAgent, error: String? = nil) {
+        composerErrors[agent] = error
+        if error == nil { drafts[agent]?.text = "" }
+    }
+
+    func status(for agent: WorkspaceAgent) -> String {
+        let state = if resetting.contains(agent) { "Switching session" }
+        else if submitting.contains(agent) { "Starting" }
+        else { conversations[agent]?.last?.status.capitalized ?? "Idle" }
+        return "\(agent.label) · \(state)\nModel: \(workspaceModels[agent.harness] ?? "CLI default")\nSession: \(sessions[agent] ?? "None")"
     }
 
     private func canReset(_ agent: WorkspaceAgent) -> Bool {
@@ -449,17 +516,37 @@ private final class WorkspaceModel: ObservableObject {
         guard !loadedSettings else { return }
         settingsError = nil
         do {
-            let reply = try await FleetBridge.call(host, ["op": "workspace_settings"])
+            let reply = try await FleetBridge.call(host, ["op": "workspace_settings", "include_cursor_trust": true])
             try Task.checkCancellation()
             for agent in ["codex", "cursor"] {
                 guard let preferences = reply[agent] as? [String: Any] else { continue }
                 if !modelsChanged.contains(agent) { workspaceModels[agent] = preferences["model"] as? String }
+            }
+            if !cursorTrustChanged, let cursor = reply["cursor"] as? [String: Any] {
+                cursorTrusted = cursor["trusted"] as? Bool ?? false
             }
             loadedSettings = true
         } catch is CancellationError {
             return
         } catch {
             settingsError = "Could not load agent settings. \(error.localizedDescription)"
+        }
+    }
+
+    func setCursorTrust(_ trusted: Bool) async {
+        guard !savingCursorTrust else { return }
+        savingCursorTrust = true
+        cursorTrustError = nil
+        defer { savingCursorTrust = false }
+        do {
+            let reply = try await FleetBridge.call(host, ["op": "set_cursor_trust", "trusted": trusted])
+            guard let saved = reply["trusted"] as? Bool, saved == trusted else {
+                throw WorkspaceFailure("The host could not verify the workspace trust setting.")
+            }
+            cursorTrustChanged = true
+            cursorTrusted = saved
+        } catch {
+            cursorTrustError = error.localizedDescription
         }
     }
 
@@ -473,6 +560,23 @@ private final class WorkspaceModel: ObservableObject {
             workspaceModels[agent] = id.isEmpty ? nil : id
         } catch {
             modelErrors[agent] = "Could not save the model. \(error.localizedDescription)"
+        }
+    }
+
+    func signInToCursor() async {
+        guard !cursorSigningIn else { return }
+        cursorSigningIn = true
+        cursorLoginMessage = "Complete Cursor sign-in in your browser."
+        defer { cursorSigningIn = false }
+        do {
+            let reply = try await FleetBridge.send(["op": "cursor_login", "host": host.dictionary])
+            guard reply["verified"] as? Bool == true else {
+                throw WorkspaceFailure("Cursor could not verify this login.")
+            }
+            cursorLoginMessage = "Signed in to Cursor on " + host.label + "."
+            await loadModelOptions(for: "cursor", refresh: true)
+        } catch {
+            cursorLoginMessage = error.localizedDescription
         }
     }
 
@@ -503,24 +607,59 @@ private final class WorkspaceModel: ObservableObject {
         modelCatalogs[agent] = catalog
     }
 
-    func newConversation(_ agent: WorkspaceAgent) async {
-        guard canReset(agent), resetting.insert(agent).inserted else { return }
+    func newConversation(_ agent: WorkspaceAgent, commandInput: String? = nil) async {
+        guard canReset(agent), resetting.insert(agent).inserted else {
+            if commandInput != nil { finishCommand(for: agent, error: "Wait for this agent’s current operation to finish.") }
+            return
+        }
         defer { resetting.remove(agent) }
         composerErrors[agent] = nil
         do {
             _ = try await FleetBridge.call(host, ["op": "reset_session", "agent": agent.harness, "lane": agent.lane])
-            sessions[agent] = nil
-            if let id = conversations[agent]?.last?.id { pendingDetails.remove(id) }
-            conversations[agent] = []
-            streamErrors[agent] = nil
+            setSession(nil, for: agent)
+            if let commandInput, input(for: agent) == commandInput { finishCommand(for: agent) }
         } catch {
             composerErrors[agent] = error.localizedDescription
         }
     }
 
+    func listSessions(for agent: WorkspaceAgent) async throws -> [NativeSessionOption] {
+        let reply = try await FleetBridge.call(host, ["op": "list_sessions", "agent": agent.harness, "lane": agent.lane])
+        try Task.checkCancellation()
+        guard let rows = reply["sessions"] as? [[String: Any]] else {
+            throw WorkspaceFailure("The workspace did not return its sessions.")
+        }
+        var seen = Set<String>()
+        return rows.compactMap { row in
+            guard let id = row["id"] as? String, !id.isEmpty, seen.insert(id).inserted else { return nil }
+            return NativeSessionOption(id: id, title: row["title"] as? String ?? "")
+        }
+    }
+
+    func resumeSession(_ id: String, for agent: WorkspaceAgent) async throws {
+        guard canReset(agent), resetting.insert(agent).inserted else {
+            throw WorkspaceFailure("Wait for this agent’s current operation to finish.")
+        }
+        defer { resetting.remove(agent) }
+        guard sessions[agent] != id else { return }
+        let reply = try await FleetBridge.call(host, [
+            "op": "resume_session", "agent": agent.harness, "lane": agent.lane, "session": id,
+        ])
+        setSession(reply["session"] as? String ?? id, for: agent)
+    }
+
+    private func setSession(_ id: String?, for agent: WorkspaceAgent) {
+        sessions[agent] = id
+        if let run = conversations[agent]?.last?.id { pendingDetails.remove(run) }
+        conversations[agent] = []
+        streamErrors[agent] = nil
+        composerErrors[agent] = nil
+    }
+
     func submit(from agent: WorkspaceAgent) async {
         guard canSend(from: agent), let draft = drafts[agent] else { return }
         let prompt = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ComposerCommand.parse(prompt) == nil else { return }
         let request: [String: Any] = [
             "op": "submit", "agent": agent.harness, "lane": agent.lane, "prompt": prompt,
             "tags": draft.tags.sorted(), "view": draft.reporting, "filter": draft.filterProgress,
@@ -619,6 +758,9 @@ private struct WorkspacePane: View {
     let onActiveAgentLaneChange: (FleetAgentLane) -> Void
     @State private var closing: SourceBuffer?
     @State private var panel: WorkspacePanel?
+    @State private var showingCommands: WorkspaceAgent?
+    @State private var showingStatus: WorkspaceAgent?
+    @State private var confirmingCursorTrust = false
     @AppStorage("FleetExplorerVisible") private var explorerVisible = true
     private let accent = Color(nsColor: .systemTeal)
 
@@ -659,6 +801,8 @@ private struct WorkspacePane: View {
                     self.panel = nil
                     Task { await model.openFile(path) }
                 }
+            case let .resume(agent, session):
+                ResumeSessionPanel(model: model, agent: agent, session: session)
             }
         }
         .background {
@@ -681,6 +825,12 @@ private struct WorkspacePane: View {
             Button("Keep Editing", role: .cancel) { closing = nil }
         } message: { buffer in
             Text("The changes to \(buffer.name) will be lost.")
+        }
+        .alert("Trust This Workspace for Cursor?", isPresented: $confirmingCursorTrust) {
+            Button("Cancel", role: .cancel) {}
+            Button("Trust Workspace") { Task { await model.setCursorTrust(true) } }
+        } message: {
+            Text("Cursor will use its workspace trust option for \(host.repo) on \(host.label). Only trust workspaces you recognize. You can revoke trust from Agent options.")
         }
     }
 
@@ -715,6 +865,20 @@ private struct WorkspacePane: View {
                 Label("Quick Open", systemImage: "magnifyingglass")
             }
             .help("Find a file by name or path (⌘P)")
+            Menu {
+                Button("Codex CLI") { model.addAgent("codex") }
+                    .disabled(model.availableAgent("codex") == nil)
+                Button("Cursor Agent") { model.addAgent("cursor") }
+                    .disabled(model.availableAgent("cursor") == nil)
+            } label: {
+                Label("New Agent", systemImage: "plus").font(.callout.weight(.semibold))
+            }
+            .menuStyle(.borderedButton)
+            .menuOrder(.fixed)
+            .fixedSize()
+            .help("Create an agent in \(host.label)")
+            .accessibilityLabel("New Agent")
+            .disabled(!model.agentsLoaded || (model.availableAgent("codex") == nil && model.availableAgent("cursor") == nil))
         }
         .padding(.horizontal, 15)
         .padding(.vertical, 10)
@@ -871,10 +1035,24 @@ private struct WorkspacePane: View {
                     .help("Stop this task")
                 }
                 Menu {
+                    if agent.harness == "cursor" {
+                        Button("Sign In to Cursor…") { Task { await model.signInToCursor() } }
+                            .disabled(model.cursorSigningIn)
+                        if model.cursorTrusted {
+                            Button("Revoke Cursor Workspace Trust") { Task { await model.setCursorTrust(false) } }
+                                .disabled(model.savingCursorTrust)
+                        } else {
+                            Button("Trust Workspace for Cursor…") { confirmingCursorTrust = true }
+                                .disabled(model.savingCursorTrust)
+                        }
+                    }
                     Toggle("Filter routine progress", isOn: model.draftBinding(for: agent, \.filterProgress))
+                    Button("Resume Session…") { panel = .resume(agent, "") }
+                        .disabled(!model.canReset)
                     Button("New Conversation") { Task { await model.newConversation(agent) } }
                         .disabled(!model.canReset)
                         .help(model.sessions[agent] == nil ? "New conversation" : "Start a fresh CLI session")
+                    Button("Composer Commands") { showingCommands = agent }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
@@ -894,7 +1072,8 @@ private struct WorkspacePane: View {
                             .foregroundStyle(.secondary)
                     }
                     ForEach(model.turns) { turn in
-                        TurnCard(turn: turn)
+                        let offerTrust = agent.harness == "cursor" && !model.cursorTrusted && turn.requiresCursorTrust
+                        TurnCard(turn: turn, trustWorkspace: offerTrust ? { confirmingCursorTrust = true } : nil)
                     }
                 }
                 .padding(12)
@@ -941,16 +1120,43 @@ private struct WorkspacePane: View {
                     .padding(5)
                     .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
                     .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary))
+                    .overlay(alignment: .topLeading) {
+                        if model.input(for: agent).isEmpty {
+                            Text("Type a prompt or / for commands")
+                                .foregroundStyle(.tertiary)
+                                .padding(.leading, 11).padding(.top, 6)
+                                .allowsHitTesting(false).accessibilityHidden(true)
+                        }
+                    }
                     .accessibilityLabel("Agent prompt")
+                commandChoices(for: agent)
                 composerControls(agent)
+                if showingStatus == agent, model.input(for: agent).isEmpty {
+                    Text(model.status(for: agent)).font(.caption).textSelection(.enabled)
+                }
                 if let error = model.modelErrors[agent.harness] ?? model.modelCatalogs[agent.harness]?.error {
-                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    if agent.harness == "cursor", error.localizedCaseInsensitiveContains("sign in") || error.localizedCaseInsensitiveContains("authentication") {
+                        Button("Sign In to Cursor…") { Task { await model.signInToCursor() } }
+                            .disabled(model.cursorSigningIn)
+                            .help("Use the browser on this Mac to sign in on " + host.label)
+                    } else {
+                        Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    }
+                }
+                if agent.harness == "cursor", let message = model.cursorLoginMessage {
+                    HStack(spacing: 5) {
+                        if model.cursorSigningIn { ProgressView().controlSize(.small) }
+                        Text(message).font(.caption).textSelection(.enabled)
+                    }
                 }
                 if let error = model.loadError {
                     Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
                     Button("Retry Loading Agents") { Task { await model.loadAgents() } }
                 }
                 if let error = model.composerError {
+                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                }
+                if agent.harness == "cursor", let error = model.cursorTrustError {
                     Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
                 }
             }
@@ -961,7 +1167,8 @@ private struct WorkspacePane: View {
     }
 
     private func composerControls(_ agent: WorkspaceAgent) -> some View {
-        HStack(alignment: .bottom, spacing: 7) {
+        let isCommand = ComposerCommand.parse(model.input(for: agent)) != nil
+        return HStack(alignment: .bottom, spacing: 7) {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 6) {
                     providerControls
@@ -979,17 +1186,75 @@ private struct WorkspacePane: View {
             }
             Spacer(minLength: 0)
             Button {
-                Task { await model.submit(from: agent) }
+                send(from: agent)
             } label: {
                 Label("Send", systemImage: "arrow.up").labelStyle(.iconOnly)
             }
             .buttonStyle(.borderedProminent)
             .tint(accent)
             .fixedSize()
-            .disabled(!model.canSend)
+            .disabled(!model.canSend && !isCommand)
             .keyboardShortcut(.return, modifiers: .command)
-            .help("Send prompt (⌘↩)")
-            .accessibilityLabel("Send prompt")
+            .help(isCommand ? "Run command (⌘↩)" : "Send prompt (⌘↩)")
+            .accessibilityLabel(isCommand ? "Run command" : "Send prompt")
+        }
+    }
+
+    @ViewBuilder private func commandChoices(for agent: WorkspaceAgent) -> some View {
+        let input = model.input(for: agent)
+        let commands = showingCommands == agent && input.isEmpty
+            ? ComposerCommand.allCases : ComposerCommand.suggestions(input)
+        if !commands.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(commands) { command in
+                    Button {
+                        model.draftBinding(for: agent, \.text).wrappedValue = command.token
+                        send(from: agent)
+                    } label: {
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(command.usage).font(.system(.caption, design: .monospaced).weight(.medium))
+                            Text(command.description).font(.caption).foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(7)
+            .background(.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+        }
+    }
+
+    private func send(from agent: WorkspaceAgent) {
+        let input = model.input(for: agent)
+        showingCommands = nil
+        showingStatus = nil
+        guard let invocation = ComposerCommand.parse(input) else {
+            Task { await model.submit(from: agent) }
+            return
+        }
+        if invocation.command != .resume, !invocation.argument.isEmpty {
+            model.finishCommand(for: agent, error: "Use \(invocation.command.usage) without arguments.")
+            return
+        }
+        switch invocation.command {
+        case .resume:
+            guard model.canReset else {
+                model.finishCommand(for: agent, error: "Wait for this agent’s current operation to finish.")
+                return
+            }
+            model.finishCommand(for: agent)
+            panel = .resume(agent, invocation.argument)
+        case .new:
+            Task { await model.newConversation(agent, commandInput: input) }
+        case .status:
+            model.finishCommand(for: agent)
+            showingStatus = agent
+        case .help:
+            model.finishCommand(for: agent)
+            showingCommands = agent
         }
     }
 
@@ -1003,19 +1268,6 @@ private struct WorkspacePane: View {
             }
             .labelsHidden()
             .accessibilityLabel("Provider and agent instance")
-            Menu {
-                Button("Codex CLI") { model.addAgent("codex") }
-                    .disabled(model.availableAgent("codex") == nil)
-                Button("Cursor Agent") { model.addAgent("cursor") }
-                    .disabled(model.availableAgent("cursor") == nil)
-            } label: {
-                Label("New Agent", systemImage: "plus").labelStyle(.iconOnly)
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("New Agent")
-            .accessibilityLabel("New Agent")
-            .disabled(!model.agentsLoaded || (model.availableAgent("codex") == nil && model.availableAgent("cursor") == nil))
         }
     }
 
@@ -1035,10 +1287,124 @@ private struct WorkspacePane: View {
 
 private enum WorkspacePanel: Identifiable {
     case quickOpen
+    case resume(WorkspaceAgent, String)
 
     var id: String {
         switch self {
         case .quickOpen: "open"
+        case let .resume(agent, _): "resume-\(agent.harness)-\(agent.lane)"
+        }
+    }
+}
+
+@MainActor
+private struct ResumeSessionPanel: View {
+    @ObservedObject var model: WorkspaceModel
+    let agent: WorkspaceAgent
+    @Environment(\.dismiss) private var dismiss
+    @State private var sessionID: String
+    @State private var options: [NativeSessionOption] = []
+    @State private var loading = true
+    @State private var resuming = false
+    @State private var listError: String?
+    @State private var resumeError: String?
+
+    init(model: WorkspaceModel, agent: WorkspaceAgent, session: String) {
+        self.model = model
+        self.agent = agent
+        self._sessionID = State(initialValue: session)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Resume Session in \(agent.label)").font(.headline)
+            TextField("Session ID", text: $sessionID, prompt: Text("Enter a session ID or choose one below"))
+                .font(.system(.body, design: .monospaced))
+                .textFieldStyle(.roundedBorder)
+                .disabled(resuming)
+            if loading {
+                ProgressView("Loading sessions…").controlSize(.small)
+            } else if let listError {
+                Text(listError).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                Button("Retry") { Task { await load() } }
+                    .disabled(resuming)
+            } else if options.isEmpty {
+                Text("No sessions found.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(options) { option in
+                            Button {
+                                sessionID = option.id
+                                resumeError = nil
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: sessionID == option.id ? "largecircle.fill.circle" : "circle")
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(option.title.isEmpty ? option.id : option.title).lineLimit(1)
+                                        if !option.title.isEmpty, option.title != option.id {
+                                            Text(option.id).font(.system(.caption2, design: .monospaced)).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer(minLength: 0)
+                                    if model.sessions[agent] == option.id {
+                                        Text("Current").font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                                .padding(5)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityAddTraits(sessionID == option.id ? .isSelected : [])
+                        }
+                    }
+                }
+                .frame(maxHeight: 230)
+                .disabled(resuming)
+            }
+            if let resumeError {
+                Text(resumeError).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(resuming)
+                Button(resuming ? "Resuming…" : "Resume") { Task { await resume() } }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(resuming || sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(18)
+        .frame(width: 460)
+        .interactiveDismissDisabled(resuming)
+        .task { await load() }
+    }
+
+    private func load() async {
+        loading = true
+        defer { loading = false }
+        listError = nil
+        do {
+            options = try await model.listSessions(for: agent)
+        } catch is CancellationError {
+            return
+        } catch {
+            listError = error.localizedDescription
+        }
+    }
+
+    private func resume() async {
+        let id = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty, !resuming else { return }
+        resuming = true
+        defer { resuming = false }
+        resumeError = nil
+        do {
+            try await model.resumeSession(id, for: agent)
+            dismiss()
+        } catch {
+            resumeError = error.localizedDescription
         }
     }
 }
@@ -1530,6 +1896,7 @@ private struct SourceEditor: View {
 @MainActor
 private struct TurnCard: View {
     let turn: WorkspaceTurn
+    var trustWorkspace: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1543,13 +1910,16 @@ private struct TurnCard: View {
                 if turn.isActive { ProgressView().controlSize(.small) }
                 Text(turn.status.capitalized).font(.caption.weight(.semibold))
                 if turn.isActive, turn.reporting == "actions", !turn.action.isEmpty {
-                    Text(turn.action).font(.caption).lineLimit(2)
+                    let isPlan = turn.events.contains { $0.kind == "plan" && $0.text.hasPrefix(turn.action) }
+                    if !isPlan { Text(turn.action).font(.caption).lineLimit(2) }
                 }
             }
             .foregroundStyle(.secondary)
-            if !turn.risk.isEmpty {
-                Label(turn.risk, systemImage: "exclamationmark.triangle")
-                    .font(.callout).foregroundStyle(.orange).textSelection(.enabled)
+            if !turn.risk.isEmpty, !turn.events.contains(where: { $0.kind == "risk" }) {
+                HStack(alignment: .top) {
+                    Image(systemName: "exclamationmark.triangle").accessibilityHidden(true)
+                    AgentMarkdown(source: turn.risk).equatable()
+                }.foregroundStyle(.orange)
             }
             if turn.reporting != "risks", !turn.outcome.isEmpty,
                !turn.events.contains(where: { $0.kind == "result" || $0.text == turn.outcome }) {
@@ -1560,8 +1930,9 @@ private struct TurnCard: View {
                     if event.kind != "result" {
                         Text(event.kind.capitalized).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
                     }
-                    if event.kind == "result" {
+                    if AgentMarkdown.rendersEvent(event.kind) {
                         AgentMarkdown(source: event.text).equatable()
+                            .foregroundStyle(event.kind == "error" || event.kind == "risk" ? .orange : .primary)
                     } else {
                         Text(event.text)
                             .font(.caption)
@@ -1569,6 +1940,10 @@ private struct TurnCard: View {
                             .textSelection(.enabled)
                     }
                 }
+            }
+            if let trustWorkspace {
+                Button("Trust Workspace for Cursor…", action: trustWorkspace)
+                    .help("Trust this workspace in Cursor, then send your prompt again")
             }
         }
     }

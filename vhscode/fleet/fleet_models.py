@@ -1,6 +1,7 @@
 """Host-owned model preferences and native model discovery for Fleet workspaces."""
 
 from contextlib import closing, contextmanager
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -13,10 +14,10 @@ from time import monotonic
 
 
 AGENTS = ("codex", "cursor")
-OPERATIONS = {"workspace_settings", "workspace_agents", "set_model", "reset_session", "models"}
 CATALOG_TIMEOUT = 8
 MAX_CATALOG_BYTES = 1024 * 1024
 MAX_MODELS = 500
+MAX_SESSIONS = 100
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CURSOR_MODEL = re.compile(r"(?P<id>[A-Za-z0-9][A-Za-z0-9_./:+@~\-]*)(?:\s+-\s+(?P<label>.+))?")
 CURSOR_STATUS = re.compile(r"\s+\((?:current|default)(?:, (?:current|default))?\)$")
@@ -45,6 +46,10 @@ def _session_table(repo, agent, lane):
     if agent_lane(lane) == 1:
         return "workspace_settings", ("repo", "agent"), key
     return "additional_sessions", ("repo", "agent", "lane"), (*key, lane)
+
+
+def _valid_session(session):
+    return isinstance(session, str) and 1 <= len(session) <= 512 and session.isprintable() and bool(session.strip())
 
 
 def _database():
@@ -101,11 +106,14 @@ def get(repo, agent, lane=1):
 
 def remember(repo, agent, session, generation, lane=1):
     """Remember a completed session only if no reset happened after its submission."""
-    if not isinstance(session, str) or not 1 <= len(session) <= 512 or not session.isprintable():
+    if not _valid_session(session):
         return False
     table, columns, key = _session_table(repo, agent, lane)
     names = ", ".join(columns)
     with closing(_database()) as database, database:
+        database.execute("BEGIN IMMEDIATE")
+        if _session_in_other_lane(database, key[:2], lane, session):
+            return False
         database.execute(f"INSERT OR IGNORE INTO {table}({names}) VALUES ({','.join('?' for _ in key)})", key)
         result = database.execute(
             f"UPDATE {table} SET session=? WHERE " + " AND ".join(f"{name}=?" for name in columns) + " AND generation=?",
@@ -198,18 +206,136 @@ def _instances(repo):
     return {"instances": instances}
 
 
+def _assigned_sessions(database, key):
+    return database.execute(
+        "SELECT 1, session FROM workspace_settings WHERE repo=? AND agent=? AND session IS NOT NULL "
+        "UNION ALL SELECT lane, session FROM additional_sessions WHERE repo=? AND agent=? AND session IS NOT NULL",
+        (*key, *key),
+    ).fetchall()
+
+
+def _session_in_other_lane(database, key, lane, session):
+    return any(identifier == session and assigned_lane != lane
+               for assigned_lane, identifier in _assigned_sessions(database, key))
+
+
+def verify_session_admission(repo, agent, lane, session, generation):
+    if get(repo, agent, lane)["generation"] != generation:
+        raise ValueError("The agent session changed. Refresh the workspace before sending a prompt.")
+    if session is not None:
+        with closing(_database()) as settings:
+            if _session_in_other_lane(settings, _key(repo, agent), lane, session):
+                raise ValueError("This session is already assigned to another agent instance.")
+
+
+def _list_sessions(repo, agent):
+    from fleet_harness import _clean
+    from fleet_jobs import _connect
+
+    key = _key(repo, agent)
+    sessions = {}
+    with _connect() as runs:
+        records = runs.execute(
+            "SELECT session, title, COALESCE(ended, started) AS updated_at FROM runs "
+            "WHERE repo=? AND agent=? AND status='completed' AND session IS NOT NULL "
+            "ORDER BY updated_at DESC, id DESC",
+            key,
+        )
+        for row in records:
+            identifier = row["session"]
+            if _valid_session(identifier):
+                sessions.setdefault(identifier, (row["title"], row["updated_at"], "fleet"))
+            if len(sessions) >= MAX_SESSIONS:
+                break
+    with closing(_database()) as settings:
+        for _, identifier in _assigned_sessions(settings, key):
+            if _valid_session(identifier):
+                sessions.setdefault(identifier, ("", 0, "fleet"))
+    try:
+        threads = _codex_threads(repo) if agent == "codex" else _cursor_sessions(repo)
+        for thread in threads:
+            identifier = thread["id"] if agent == "codex" else thread["sessionId"]
+            previous_title, previous_time, _ = sessions.get(identifier, ("", 0, "fleet"))
+            title = next((text for name in ("name", "title", "preview")
+                          if isinstance((text := thread.get(name)), str) and text.strip()), previous_title)
+            updated = thread.get("updatedAt", thread.get("createdAt"))
+            sessions[identifier] = (title, max(_session_time(updated), previous_time), agent)
+    except (OSError, ValueError):
+        if not sessions and agent == "codex":
+            raise
+    ordered = sorted(sessions.items(), key=lambda row: (-row[1][1], row[0]))[:MAX_SESSIONS]
+    return {"sessions": [
+        {"id": identifier, "title": " ".join(_clean(title).split())[:160] or identifier,
+         "updated_at": updated, "source": source}
+        for identifier, (title, updated, source) in ordered
+    ]}
+
+
+def _resume_session(repo, agent, lane, session):
+    from fleet_jobs import _connect, _reap_manual
+
+    if not _valid_session(session):
+        raise ValueError("Choose a valid native session.")
+    table, columns, key = _session_table(repo, agent, lane)
+    workspace = key[:2]
+    with _connect() as runs, closing(_database()) as settings:
+        known = any(identifier == session for _, identifier in _assigned_sessions(settings, workspace))
+        if not known:
+            known = runs.execute(
+                "SELECT 1 FROM runs WHERE repo=? AND agent=? AND session=? AND status='completed' LIMIT 1",
+                (*workspace, session),
+            ).fetchone() is not None
+    if not known:
+        try:
+            threads = (_codex_threads(repo, session=session) if agent == "codex"
+                       else _cursor_sessions(repo, session=session))
+        except ValueError:
+            if agent == "codex":
+                raise
+            threads = []
+        if not threads:
+            raise ValueError("Choose a session from this agent and workspace.")
+    _reap_manual()
+    names = ", ".join(columns)
+    with _connect() as runs, closing(_database()) as settings, settings:
+        runs.execute("BEGIN IMMEDIATE")
+        if runs.execute(
+            "SELECT 1 FROM runs WHERE repo=? AND agent=? AND status='running' "
+            "AND (lane=? OR session=? OR (session IS NULL AND ?=0)) LIMIT 1",
+            (*workspace, lane, session, known),
+        ).fetchone():
+            raise ValueError("Wait for the active task before resuming this session.")
+        settings.execute("BEGIN IMMEDIATE")
+        if _session_in_other_lane(settings, workspace, lane, session):
+            raise ValueError("This session is already assigned to another agent instance.")
+        settings.execute(
+            f"INSERT INTO {table}({names}, session, generation) VALUES ({','.join('?' for _ in key)}, ?, 1) "
+            f"ON CONFLICT({names}) DO UPDATE SET session=excluded.session, generation=generation+1",
+            (*key, session),
+        )
+    return {"session": session}
+
+
 def workspace(repo, request):
     op = request.get("op")
     if op == "workspace_agents":
         return _instances(repo)
     if op == "workspace_settings":
-        return {
+        settings = {
             agent: {key: value for key, value in get(repo, agent).items() if key != "generation"}
             for agent in AGENTS
         }
+        if request.get("include_cursor_trust") is True:
+            from fleet_cursor_trust import cursor_trust
+            settings["cursor"]["trusted"] = cursor_trust(repo)
+        return settings
     agent = _agent(request.get("agent"))
     if op == "models":
         return {"models": _models(repo, agent)}
+    if op == "list_sessions":
+        return _list_sessions(repo, agent)
+    if op == "resume_session":
+        return _resume_session(repo, agent, agent_lane(request.get("lane", 1)), request.get("session"))
     key = _key(repo, agent)
     if op == "set_model":
         model = request.get("model")
@@ -284,7 +410,7 @@ def _lines(process, deadline):
             remaining = deadline - monotonic()
             ready = selector.select(remaining) if remaining > 0 else []
             if not ready:
-                raise TimeoutError("The model list did not respond in time.")
+                raise TimeoutError("The agent did not respond in time.")
             for key, _ in ready:
                 diagnostic = key.fileobj is process.stderr
                 chunk = os.read(key.fd, min(32 * 1024, MAX_CATALOG_BYTES + 1 - total))
@@ -295,7 +421,7 @@ def _lines(process, deadline):
                     continue
                 total += len(chunk)
                 if total > MAX_CATALOG_BYTES:
-                    raise ValueError("The model list exceeded Fleet's output limit.")
+                    raise ValueError("The agent response exceeded Fleet's output limit.")
                 key.data.extend(chunk)
                 lines = key.data.split(b"\n")
                 key.data[:] = lines.pop()
@@ -303,20 +429,20 @@ def _lines(process, deadline):
                     yield diagnostic, line
 
 
-def _codex_models(process, output, deadline):
+def _rpc_client(process, output, deadline, *, agent):
     descriptor = process.stdin.fileno()
     os.set_blocking(descriptor, False)
 
     def send(message):
         data = json.dumps(message, ensure_ascii=True).encode("ascii") + b"\n"
         if len(data) > 4096:
-            raise ValueError("The Codex model list could not be requested.")
+            raise ValueError(f"The {agent} request exceeded Fleet's input limit.")
         with DefaultSelector() as selector:
             selector.register(descriptor, EVENT_WRITE)
             while data:
                 remaining = deadline - monotonic()
                 if remaining <= 0 or not selector.select(remaining):
-                    raise TimeoutError("The model list request did not reach Codex in time.")
+                    raise TimeoutError(f"The request did not reach {agent} in time.")
                 try:
                     data = data[os.write(descriptor, data):]
                 except BlockingIOError:
@@ -332,25 +458,39 @@ def _codex_models(process, output, deadline):
                 continue
             result = reply.get("result")
             if not isinstance(result, dict):
-                raise ValueError("Codex declined the model list request.")
+                raise ValueError(f"{agent} declined the request.")
             return result
-        raise ValueError("Codex returned no model catalog.")
+        raise ValueError(f"{agent} returned no response.")
 
-    send({
-        "id": 1, "method": "initialize",
-        "params": {"clientInfo": {"name": "vhscode_fleet", "title": "Fleet", "version": "1"}},
-    })
-    response(1)
+    identifier = 0
+    envelope = {"jsonrpc": "2.0"} if agent == "Cursor" else {}
+
+    def call(method, params):
+        nonlocal identifier
+        identifier += 1
+        send({**envelope, "id": identifier, "method": method, "params": params})
+        return response(identifier)
+
+    return call, send
+
+
+def _codex_rpc(process, output, deadline):
+    call, send = _rpc_client(process, output, deadline, agent="Codex")
+    call("initialize", {"clientInfo": {"name": "vhscode_fleet", "title": "Fleet", "version": "1"}})
     send({"method": "initialized"})
+    return call
+
+
+def _codex_models(process, output, deadline):
+    call = _codex_rpc(process, output, deadline)
     models = []
     cursor = None
     seen_cursors = set()
-    for identifier in range(2, 12):
+    for _ in range(10):
         params = {"limit": 100, "includeHidden": False}
         if cursor is not None:
             params["cursor"] = cursor
-        send({"id": identifier, "method": "model/list", "params": params})
-        result = response(identifier)
+        result = call("model/list", params)
         data = result.get("data")
         if not isinstance(data, list):
             raise ValueError("Codex returned an unreadable model catalog.")
@@ -365,6 +505,118 @@ def _codex_models(process, output, deadline):
             raise ValueError("Codex returned an invalid model list cursor.")
         seen_cursors.add(cursor)
     return models
+
+
+def _session_time(value):
+    if type(value) in (int, float) and -1e15 < value < 1e15:
+        return value
+    if isinstance(value, str) and len(value) <= 64:
+        try:
+            date = datetime.fromisoformat(value.removesuffix("Z") + ("+00:00" if value.endswith("Z") else ""))
+            if date.tzinfo is not None:
+                return date.timestamp()
+        except (ValueError, OSError, OverflowError):
+            pass
+    return 0
+
+
+def _matches_workspace(root, cwd):
+    if not isinstance(cwd, str) or not cwd.startswith("/"):
+        return False
+    try:
+        return Path(cwd).resolve() == root
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _session_pages(call, method, params, root, *, identifier_key, data_key, session=None):
+    found = {}
+    seen = set()
+    for _ in range(4):
+        result = call(method, params)
+        threads = result.get(data_key)
+        if not isinstance(threads, list):
+            raise ValueError("The agent returned an unreadable session list.")
+        for thread in threads:
+            if not isinstance(thread, dict):
+                continue
+            identifier = thread.get(identifier_key)
+            if not _valid_session(identifier) or (session is not None and identifier != session):
+                continue
+            if _matches_workspace(root, thread.get("cwd")):
+                found.setdefault(identifier, thread)
+                if session is not None or len(found) >= MAX_SESSIONS:
+                    return list(found.values())
+        cursor = result.get("nextCursor")
+        if cursor is None:
+            break
+        if not isinstance(cursor, str) or len(cursor) > 2048 or cursor in seen:
+            raise ValueError("The agent returned an invalid session list cursor.")
+        seen.add(cursor)
+        params["cursor"] = cursor
+    return list(found.values())
+
+
+def _cursor_sessions(repo, *, session=None):
+    from fleet_harness import _find_harness
+
+    harness = _find_harness("cursor")
+    if harness is None:
+        return []
+    executable, environment = harness
+    root = Path(repo).resolve()
+    deadline = monotonic() + CATALOG_TIMEOUT
+    try:
+        with _agent_process(executable, ["acp"], repo, environment, input_required=True) as process, \
+                closing(_lines(process, deadline)) as output:
+            call, _ = _rpc_client(process, output, deadline, agent="Cursor")
+            result = call("initialize", {
+                "protocolVersion": 1, "clientCapabilities": {},
+                "clientInfo": {"name": "vhscode_fleet", "version": "1"},
+            })
+            capabilities = result.get("agentCapabilities")
+            sessions = capabilities.get("sessionCapabilities") if isinstance(capabilities, dict) else None
+            if not isinstance(sessions, dict) or not isinstance(sessions.get("list"), dict):
+                return []
+            return _session_pages(call, "session/list", {"cwd": str(root)}, root,
+                                  identifier_key="sessionId", data_key="sessions", session=session)
+    except (OSError, ValueError):
+        # An older CLI, an unavailable account, or a failed ACP session can still have Fleet history.
+        return []
+
+
+def _codex_threads(repo, *, session=None):
+    from fleet_harness import _find_harness
+
+    harness = _find_harness("codex")
+    if harness is None:
+        raise ValueError("The Codex CLI is unavailable on this host.")
+    executable, environment = harness
+    root = Path(repo).resolve()
+
+    deadline = monotonic() + CATALOG_TIMEOUT
+    try:
+        with _agent_process(executable, ["app-server", "--listen", "stdio://"], repo, environment,
+                            input_required=True) as process, closing(_lines(process, deadline)) as output:
+            call = _codex_rpc(process, output, deadline)
+            if session is not None:
+                try:
+                    thread = call("thread/read", {"threadId": session, "includeTurns": False}).get("thread")
+                except ValueError:
+                    return []
+                if isinstance(thread, dict) and thread.get("id") == session and _matches_workspace(root, thread.get("cwd")):
+                    return [thread]
+                return []
+
+            params = {
+                "cwd": str(root), "limit": 50, "sortKey": "updated_at", "modelProviders": [],
+                "sourceKinds": ["cli", "vscode", "exec", "appServer", "unknown"],
+            }
+            return _session_pages(call, "thread/list", params, root, identifier_key="id", data_key="data")
+    except (TimeoutError, subprocess.TimeoutExpired) as error:
+        raise ValueError("The Codex session list did not respond in time.") from error
+    except OSError as error:
+        raise ValueError("The Codex CLI could not read its sessions.") from error
 
 
 def _cursor_models(process, output, deadline):

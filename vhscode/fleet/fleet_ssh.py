@@ -127,8 +127,9 @@ def query(host, payload):
     check = f'test -f "$HOME"/.cache/vhscode/fleet/{digest}/fleet.py || exit 72'
     args = [*ssh, "-T", "--", host, check + "; " + remote_command(["--rpc"])]
     body = json.dumps(payload, ensure_ascii=False).encode()
+    timeout = 20 if payload.get("op") in {"models", "list_sessions", "resume_session"} else 10
     for attempt in range(2):
-        result = subprocess.run(args, input=body, capture_output=True, timeout=20 if payload.get("op") == "models" else 10)
+        result = subprocess.run(args, input=body, capture_output=True, timeout=timeout)
         if result.returncode != 72 or attempt:
             break
         result = install(host, ssh, True)

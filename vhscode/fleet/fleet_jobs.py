@@ -212,6 +212,10 @@ def begin_run(repo, agent, prompt, view="actions", *, session=None, detached=Fal
                 (str(repo), agent, lane),
             ).fetchone():
                 raise ValueError("A task is already running for this workspace and agent")
+            if detached:
+                from fleet_models import verify_session_admission
+
+                verify_session_admission(repo, agent, lane, session, generation)
             if session is not None:
                 previous = db.execute(
                     "SELECT status FROM runs WHERE repo = ? AND agent = ? AND session = ?",
@@ -286,7 +290,12 @@ def rpc(request):
     if op == "sidebar_agents":
         from fleet_models import sidebar_agents
         return sidebar_agents(request.get("repos"))
-    if op in {"workspace_settings", "workspace_agents", "set_model", "models", "reset_session"}:
+    if op in {"cursor_trust_status", "set_cursor_trust"}:
+        from fleet_cursor_trust import workspace_trust
+        from fleet_hosts import workspace_root
+        return workspace_trust(workspace_root(request["repo"]), request)
+    if op in {"workspace_settings", "workspace_agents", "set_model", "models", "reset_session",
+              "list_sessions", "resume_session"}:
         from fleet_models import workspace
         from fleet_hosts import workspace_root
         return workspace(workspace_root(request["repo"]), request)
@@ -554,7 +563,7 @@ def _run_scheduled(run_id):
     done = threading.Event()
     interrupted = []
     status = "failed"
-    error = None
+    error = session = None
     with _connect() as db:
         row = db.execute("SELECT * FROM runs WHERE id = ? AND status = 'running'", (run_id,)).fetchone()
     if row is None:
@@ -578,9 +587,9 @@ def _run_scheduled(run_id):
         from fleet_models import get
 
         try:
-            run(Path(row["repo"]), row["agent"], row["prompt"], set(), None, False,
-                on_event=on_event, detailed=True, silent=True, view=row["view"],
-                model=get(row["repo"], row["agent"])["model"])
+            session = run(Path(row["repo"]), row["agent"], row["prompt"], set(), None, False,
+                          on_event=on_event, detailed=True, silent=True, view=row["view"],
+                          model=get(row["repo"], row["agent"])["model"])
         except HarnessError:
             pass
     except KeyboardInterrupt:
@@ -595,7 +604,7 @@ def _run_scheduled(run_id):
             if status == "failed":
                 error = "The scheduled run reached its 30-minute time limit."
         with _connect() as db:
-            _finish(db, run_id, status, error)
+            _finish(db, run_id, status, error, session if status == "completed" else None)
 
 
 if __name__ == "__main__" and len(sys.argv) == 4:

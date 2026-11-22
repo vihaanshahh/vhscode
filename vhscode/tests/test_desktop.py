@@ -30,6 +30,19 @@ def emit(event_type, **fields):
     print(json.dumps({"type": event_type, **fields}), flush=True)
 
 
+if name in ("cursor-agent", "agent") and arguments[-2:] == ["--", "Trust fixture"]:
+    assert arguments[:3] == ["--print", "--output-format", "stream-json"], arguments
+    assert arguments[-3:] == ["agent", "--", "Trust fixture"], arguments
+    options = arguments[3:-3]
+    assert all(flag in {"--trust", "--resume=cursor-fixture"} for flag in options), arguments
+    if "--trust" not in options:
+        print("Workspace Trust Required", file=sys.stderr)
+        sys.exit(1)
+    emit("system", subtype="init", session_id="cursor-fixture")
+    emit("result", subtype="success", result="Trusted workspace completed.", session_id="cursor-fixture")
+    sys.exit()
+
+
 if name == "codex" and arguments == ["app-server", "--listen", "stdio://"]:
     if os.environ.get("FLEET_TEST_STALL_CATALOG") == "1":
         Path("catalog.pid").write_text(str(os.getpid()), encoding="ascii")
@@ -39,6 +52,20 @@ if name == "codex" and arguments == ["app-server", "--listen", "stdio://"]:
     print(json.dumps({"id": request["id"], "result": {}}), flush=True)
     assert json.loads(sys.stdin.readline())["method"] == "initialized"
     request = json.loads(sys.stdin.readline())
+    if request["method"] in ("thread/list", "thread/read"):
+        threads = [
+            {"id": "native-codex", "name": "Native Codex title", "cwd": str(Path.cwd()), "updatedAt": 20},
+            {"id": "other-workspace", "name": "Other workspace", "cwd": str(Path.cwd().parent), "updatedAt": 30},
+        ]
+        if request["method"] == "thread/list":
+            assert request["params"]["cwd"] == str(Path.cwd()), request
+            assert "exec" in request["params"]["sourceKinds"], request
+            result = {"data": threads, "nextCursor": None}
+        else:
+            assert not request["params"]["includeTurns"], request
+            result = {"thread": next((item for item in threads if item["id"] == request["params"]["threadId"]), None)}
+        print(json.dumps({"id": request["id"], "result": result}), flush=True)
+        sys.exit()
     assert request["method"] == "model/list" and not request["params"]["includeHidden"], request
     print(json.dumps({"id": request["id"], "result": {"data": [
         {"id": "fixture-alias", "model": "fixture-codex", "displayName": "Fixture Codex"},
@@ -56,6 +83,24 @@ if name in ("cursor-agent", "agent") and arguments == ["--list-models"]:
         print(error, file=sys.stderr)
         sys.exit(1)
     print("Available models\\n\\n\\x1b[36mfixture-cursor\\x1b[0m - Fixture Cursor (default)\\n\\nTip: use --model.")
+    sys.exit()
+
+if name in ("cursor-agent", "agent") and arguments == ["acp"]:
+    request = json.loads(sys.stdin.readline())
+    assert request["method"] == "initialize" and request["jsonrpc"] == "2.0"
+    native = os.environ.get("FLEET_TEST_CURSOR_SESSIONS") == "1"
+    capabilities = {"sessionCapabilities": {"list": {}}} if native else {}
+    print(json.dumps({"id": request["id"], "result": {"agentCapabilities": capabilities}}), flush=True)
+    if not native:
+        sys.exit()
+    request = json.loads(sys.stdin.readline())
+    assert request["method"] == "session/list" and request["params"]["cwd"] == str(Path.cwd())
+    sessions = [
+        {"sessionId": "native-cursor", "title": "Native Cursor title", "cwd": str(Path.cwd()),
+         "updatedAt": "2025-10-29T14:22:15Z"},
+        {"sessionId": "other-cursor", "cwd": str(Path.cwd().parent)},
+    ]
+    print(json.dumps({"id": request["id"], "result": {"sessions": sessions}}), flush=True)
     sys.exit()
 
 if name == "codex":
@@ -77,7 +122,34 @@ if resumed:
     expected = "Follow up\\n\\nRepository-relative context paths:\\n- "
     assert prompt == expected + json.dumps("Sources and notes/Architecture Guide.md"), prompt
 else:
-    assert prompt == "logout", prompt
+    assert prompt in ("logout", "Markdown fixture"), prompt
+
+if prompt == "Markdown fixture":
+    opening = "Checking **bold** and `inline`."
+    final = "# Result\\n\\n- Finished with `literal()`\\n\\n```text\\n**this stays literal**\\n```"
+    if name == "codex":
+        emit("thread.started", thread_id=session)
+        emit("item.updated", item={"type": "agent_message", "id": "progress", "text": opening, "phase": "commentary"})
+        emit("item.completed", item={"type": "agent_message", "id": "progress"})
+        emit("item.completed", item={"type": "todo_list", "items": [{"text": "Do **work**"}]})
+        emit("item.completed", item={"type": "command_execution", "status": "completed", "exit_code": 0,
+                                     "aggregated_output": "**terminal text**"})
+        emit("item.completed", item={"type": "agent_message", "id": "final", "text": final, "phase": "final_answer"})
+        emit("item.completed", item={"type": "mcp_tool_call", "tool": "report", "status": "completed"})
+        emit("turn.completed")
+    else:
+        def assistant(text, **metadata):
+            emit("assistant", message={"content": [{"type": "text", "text": text}]}, **metadata)
+        emit("system", subtype="init", session_id=session)
+        assistant(opening[:11], timestamp_ms=1)
+        assistant(opening[11:], timestamp_ms=2)
+        assistant(opening, timestamp_ms=3, model_call_id="duplicate")
+        emit("tool_call", subtype="started", tool_call={"updateTodosToolCall": {"args": {"todos": [{"content": "Do **work**"}]}}})
+        assistant(final[:31], timestamp_ms=4)
+        assistant(final[31:], timestamp_ms=5)
+        assistant(final)
+        emit("result", subtype="success", result=opening + final, session_id=session)
+    sys.exit()
 
 outcome = f"{session} {'follow-up' if resumed else 'initial'} completed."
 if name == "codex":
@@ -209,7 +281,7 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertEqual(reply["files"], [self.guide.relative_to(self.repo).as_posix()])
         self.assertIs(reply["more"], False)
 
-    def finished_run(self, agent, *, prompt, tags=()):
+    def finished_run(self, agent, *, prompt, tags=(), expected_status="completed"):
         run_id = self.success(self.request(
             "submit", agent=agent, prompt=prompt, tags=list(tags), view="actions"
         ))["id"]
@@ -218,7 +290,7 @@ class DesktopBridgeTest(unittest.TestCase):
             detail = self.success(self.request("detail", id=run_id))
             row = detail["run"]
             if row is not None and row["status"] != "running":
-                self.assertEqual(row["status"], "completed", detail)
+                self.assertEqual(row["status"], expected_status, detail)
                 return row, detail["events"]
             if time.monotonic() >= deadline:
                 self.fail(f"Desktop run {run_id} did not finish: {detail!r}")
@@ -241,6 +313,19 @@ class DesktopBridgeTest(unittest.TestCase):
                 self.assertNotEqual(first["id"], follow_up["id"])
                 self.assertEqual(follow_up["session"], session)
                 self.assertEqual(follow_up["outcome"], f"{session} follow-up completed.")
+
+    def test_markdown_survives_both_adapter_transcripts_without_duplicate_deltas(self):
+        for agent in ("codex", "cursor"):
+            with self.subTest(agent=agent):
+                row, events = self.finished_run(agent, prompt="Markdown fixture")
+                opening = "Checking **bold** and `inline`."
+                final = "# Result\n\n- Finished with `literal()`\n\n```text\n**this stays literal**\n```"
+                self.assertEqual(row["outcome"], final)
+                self.assertEqual([event["text"] for event in events if event["kind"] == "result"], [final])
+                self.assertEqual([event["text"] for event in events if event["kind"] == "plan"], ["### Plan\n\n- Do **work**"])
+                self.assertEqual([event["text"] for event in events if event["kind"] == "info"], [opening])
+                if agent == "codex":
+                    self.assertIn("**terminal text**", [event["text"] for event in events if event["kind"] == "log"])
 
     def test_model_catalogs_and_workspace_settings(self):
         codex = self.success(self.request("models", agent="codex"))
@@ -289,6 +374,98 @@ class DesktopBridgeTest(unittest.TestCase):
             with self.subTest(error=error):
                 self.environment["FLEET_TEST_CATALOG_ERROR"] = error
                 self.assertIn(expected, self.request("models", agent="cursor")["error"])
+
+    def test_resume_native_codex_session_checks_workspace_and_lane(self):
+        self.assertEqual(self.success(self.request("list_sessions", agent="codex"))["sessions"], [{
+            "id": "native-codex", "title": "Native Codex title", "updated_at": 20, "source": "codex",
+        }])
+        foreign = self.request("resume_session", agent="codex", session="other-workspace", lane=2)
+        self.assertIn("this agent and workspace", foreign["error"])
+        self.assertEqual(self.success(self.request("resume_session", agent="codex", session="native-codex", lane=2)),
+                         {"session": "native-codex"})
+        duplicate = self.request("resume_session", agent="codex", session="native-codex", lane=1)
+        self.assertIn("already assigned", duplicate["error"])
+        cross_agent = self.request("resume_session", agent="cursor", session="native-codex", lane=2)
+        self.assertIn("this agent and workspace", cross_agent["error"])
+
+    def test_cursor_resume_lists_successful_fleet_sessions_after_reset(self):
+        self.finished_run("cursor", prompt="logout")
+        self.success(self.request("reset_session", agent="cursor"))
+        sessions = self.success(self.request("list_sessions", agent="cursor"))["sessions"]
+        self.assertEqual([(row["id"], row["title"], row["source"]) for row in sessions],
+                         [("cursor-fixture", "logout", "fleet")])
+        resume = self.success(self.request("resume_session", agent="cursor", session="cursor-fixture", lane=2))
+        self.assertEqual(resume, {"session": "cursor-fixture"})
+
+    def test_cursor_native_acp_sessions_are_filtered_by_workspace(self):
+        self.environment["FLEET_TEST_CURSOR_SESSIONS"] = "1"
+        sessions = self.success(self.request("list_sessions", agent="cursor"))["sessions"]
+        self.assertEqual([(row["id"], row["title"], row["source"]) for row in sessions],
+                         [("native-cursor", "Native Cursor title", "cursor")])
+        self.assertGreater(sessions[0]["updated_at"], 0)
+        wrong_workspace = self.request("resume_session", agent="cursor", session="other-cursor", lane=2)
+        self.assertIn("this agent and workspace", wrong_workspace["error"])
+        self.assertEqual(self.success(self.request("resume_session", agent="cursor", session="native-cursor", lane=2)),
+                         {"session": "native-cursor"})
+
+    def test_cursor_trust_is_confirmed_per_canonical_workspace_and_revocable(self):
+        self.assertEqual(self.success(self.request("cursor_trust_status")), {"trusted": False})
+        self.assertIn("error", self.request("set_cursor_trust", trusted="true"))
+        _, events = self.finished_run("cursor", prompt="Trust fixture", expected_status="failed")
+        self.assertTrue(any("Workspace Trust Required" in event["text"] for event in events), events)
+
+        alias = self.root / "alias"
+        alias.symlink_to(self.repo, target_is_directory=True)
+        self.assertEqual(self.success(self.bridge({
+            "host": {**self.host, "repo": str(alias)}, "request": {"op": "set_cursor_trust", "trusted": True},
+        })), {"trusted": True})
+        settings = self.success(self.request("workspace_settings", include_cursor_trust=True))
+        self.assertIs(settings["cursor"]["trusted"], True)
+        self.assertNotIn("trusted", settings["codex"])
+        self.assertEqual(self.success(self.request("cursor_trust_status")), {"trusted": True})
+        self.finished_run("cursor", prompt="Trust fixture")
+        self.finished_run("codex", prompt="logout")
+
+        other = self.root / "other"
+        other.mkdir()
+        self.assertEqual(self.success(self.bridge({
+            "host": {**self.host, "repo": str(other)}, "request": {"op": "cursor_trust_status"},
+        })), {"trusted": False})
+        self.assertEqual(self.success(self.request("set_cursor_trust", trusted=False)), {"trusted": False})
+        self.finished_run("cursor", prompt="Trust fixture", expected_status="failed")
+
+    def test_resume_blocks_active_lanes_and_rejects_stale_generation(self):
+        check = """
+from pathlib import Path
+import sys
+from fleet_jobs import begin_run, end_run
+from fleet_models import get, remember, workspace
+
+repo = Path(sys.argv[1])
+assert remember(repo, "cursor", "old", 0, 2)
+request = {"op": "resume_session", "agent": "cursor", "session": "old", "lane": 2}
+run = begin_run(repo, "cursor", "active", detached=True, session="old", known_session=True, lane=2)
+try:
+    workspace(repo, request)
+except ValueError as error:
+    assert "active task" in str(error), error
+else:
+    raise AssertionError("Resume changed an active lane")
+finally:
+    end_run(run, "completed", session="old")
+assert workspace(repo, request) == {"session": "old"}
+assert not remember(repo, "cursor", "late", 0, 2)
+assert not remember(repo, "cursor", "old", 0)
+assert get(repo, "cursor", 2)["session"] == "old"
+try:
+    begin_run(repo, "cursor", "stale", detached=True, session="old", known_session=True, lane=2)
+except ValueError as error:
+    assert "session changed" in str(error), error
+else:
+    raise AssertionError("Stale generation admitted")
+"""
+        subprocess.run([sys.executable, "-E", "-s", "-B", "-c", check, str(self.repo)],
+                       cwd=BRIDGE.parent, env=self.environment, check=True, timeout=10)
 
     def test_reset_keeps_finishing_old_session_from_returning(self):
         check = """

@@ -8,9 +8,13 @@ The file explorer, editor tabs, and agent controls share a native Mac window. Us
 
 Use **New Agent** to add Codex or Cursor sessions to a workspace. Each session keeps its own prompt, file attachments, and native CLI context. Up to four desktop tasks can run at once on each host. Click an agent beneath its workspace in the sidebar to view its progress or stop that run. Opening a finished run shows its Markdown response, including selectable code blocks.
 
+Type `/resume` in the composer to choose an existing session for this workspace, or use **Agent options → Resume Session…**. Fleet can resume a conversation started by the standalone CLI. Use `/new` for a fresh conversation in the current agent, `/status` to inspect it, and `/help` to see composer commands. The workspace header’s **New Agent** button adds an independent agent.
+
 The **Model** dropdown beside the provider and view controls lists models from the selected CLI on the workspace's machine. Choosing a model applies it to that workspace and harness, including scheduled tasks. **CLI default** follows the CLI's configuration. If the account rejects the configured default, choose one of the models returned by that machine. Each scheduled task starts a fresh conversation.
 
 Open **Activity**, **Schedules**, or **Risks** to monitor tasks across hosts. The sidebar shows running agents and paused schedules. For an SSH workspace, enter an OpenSSH alias, use **Test SSH** for interactive authentication, and browse to a project folder on the remote machine. The Intel Mac bundle includes Python, Git, tmux, both agent CLIs, and the local MobileBERT model. The remote machine supplies Python 3.10+, its agent CLIs and their login sessions.
+
+If Cursor needs authentication, select its agent and click **Sign In to Cursor** in the composer or agent options. Approve the browser page on this Mac. Cursor saves the login on the selected workspace machine, and Fleet verifies its model catalog. If Cursor requests workspace trust, **Trust Workspace for Cursor…** opens a confirmation for that folder. You can revoke Fleet’s trust setting in agent options.
 
 ### Running from a source checkout
 

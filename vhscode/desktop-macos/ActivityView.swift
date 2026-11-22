@@ -109,6 +109,7 @@ struct FleetOverview: View {
     @State private var runSelection: String?
     @State private var scheduleSelection: String?
     @State private var events: [FleetEvent] = []
+    @State private var eventsRunID: String?
     @State private var eventError: String?
     @State private var loadingEvents = false
     @State private var showEvents = false
@@ -165,7 +166,7 @@ struct FleetOverview: View {
                 await refresh()
             }
         }
-        .task(id: schedulesOnly ? nil : selectedRun?.id) {
+        .task(id: schedulesOnly ? nil : selectedRun.map { "\($0.id):\($0.status)" }) {
             await loadEvents()
         }
         .onChange(of: section) { showEvents = false }
@@ -326,6 +327,7 @@ struct FleetOverview: View {
                                     row.title,
                                     metadata: "\(row.host.label) · \(displayAgent(row.agent)) · \(row.started.formatted(.relative(presentation: .named)))",
                                     note: risksOnly ? (row.risk.isEmpty ? row.outcome : row.risk) : row.action,
+                                    markdownNote: true,
                                     status: row.status.capitalized,
                                     color: statusColor(row.status),
                                     active: selectedRun?.id == row.id
@@ -343,7 +345,7 @@ struct FleetOverview: View {
         .fleetPanel()
     }
 
-    private func rowButton(_ title: String, metadata: String, note: String, status: String, color: Color,
+    private func rowButton(_ title: String, metadata: String, note: String, markdownNote: Bool = false, status: String, color: Color,
                            active: Bool, select: @escaping () -> Void) -> some View {
         Button(action: select) {
             HStack(alignment: .top, spacing: 8) {
@@ -351,7 +353,8 @@ struct FleetOverview: View {
                     Text(title).font(.system(size: 13, weight: .medium)).lineLimit(1)
                     Text(metadata).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                     if !note.isEmpty {
-                        Text(note).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                        let noteText = markdownNote ? AgentMarkdownDocument.preview(note) : AttributedString(note)
+                        Text(noteText).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 4)
@@ -402,10 +405,20 @@ struct FleetOverview: View {
                     field("Repository", row.repository, monospaced: true)
                     field("Agent", displayAgent(row.agent))
                     field("Started", row.started.formatted(date: .abbreviated, time: .shortened))
-                    if !row.risk.isEmpty { field("Risk", row.risk, color: amber) }
-                    let outcome = row.outcome.isEmpty ? row.action : row.outcome
-                    if !outcome.isEmpty {
-                        field(row.status == "running" ? "Current action" : "Outcome", outcome, markdown: !row.outcome.isEmpty)
+                    let runEvents = eventsRunID == row.id ? events : []
+                    let riskEvent = runEvents.last { $0.kind == "risk" }
+                    let resultEvent = runEvents.last { $0.kind == "result" }
+                    let diagnostic = row.status == "failed" ? runEvents.last { $0.kind == "error" } : nil
+                    let planEvent = runEvents.last { $0.kind == "plan" && !row.action.isEmpty && $0.text.hasPrefix(row.action) }
+                    if !row.risk.isEmpty && !(showEvents && riskEvent != nil) {
+                        field("Risk", riskEvent?.text ?? row.risk, color: amber, markdown: true)
+                    }
+                    let outcomeEvent = diagnostic ?? resultEvent ?? planEvent
+                    let outcome = outcomeEvent?.text ?? (row.outcome.isEmpty ? row.action : row.outcome)
+                    if !outcome.isEmpty && !(showEvents && outcomeEvent != nil) {
+                        field(row.status == "running" ? "Current action" : "Outcome", outcome,
+                              color: diagnostic == nil ? .primary : amber,
+                              markdown: outcomeEvent != nil || !row.outcome.isEmpty || outcome.hasPrefix("### Plan\n"))
                     }
                     DisclosureGroup("Event log", isExpanded: $showEvents) {
                         eventList(row)
@@ -434,13 +447,13 @@ struct FleetOverview: View {
             } else if let eventError {
                 Text(eventError).foregroundStyle(amber)
                 Button("Retry") { Task { await loadEvents() } }
-            } else if events.isEmpty {
+            } else if eventsRunID != row.id || events.isEmpty {
                 Text("No events recorded.").foregroundStyle(.secondary)
             }
             if row.status == "running", !loadingEvents {
                 Button("Refresh Events") { Task { await loadEvents() } }
             }
-            ForEach(events) { event in
+            ForEach(eventsRunID == row.id ? events : []) { event in
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
                         Text(event.kind.capitalized)
@@ -450,7 +463,7 @@ struct FleetOverview: View {
                             Text(date.formatted(date: .omitted, time: .shortened)).foregroundStyle(.secondary)
                         }
                     }
-                    if event.kind == "result" {
+                    if AgentMarkdown.rendersEvent(event.kind) {
                         AgentMarkdown(source: event.text, font: .system(size: 12)).equatable()
                     } else {
                         Text(event.text)
@@ -509,7 +522,7 @@ struct FleetOverview: View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             if markdown {
-                AgentMarkdown(source: value, font: .system(size: 12)).equatable()
+                AgentMarkdown(source: value, font: .system(size: 12)).equatable().foregroundStyle(color)
             } else {
                 Text(value)
                     .font(.system(size: 12, design: monospaced ? .monospaced : .default))
@@ -602,12 +615,13 @@ struct FleetOverview: View {
 
     @MainActor private func loadEvents() async {
         guard !schedulesOnly, let row = selectedRun else { return }
-        events = []
+        if eventsRunID != row.id { events = [] }
         eventError = nil
         loadingEvents = true
         do {
             let value = try await FleetBridge.call(row.host, ["op": "detail", "id": row.key])
             guard !Task.isCancelled, selectedRun?.id == row.id else { return }
+            eventsRunID = row.id
             events = (value["events"] as? [[String: Any]] ?? []).enumerated().compactMap { index, item in
                 guard let kind = item["kind"] as? String, let text = item["text"] as? String else { return nil }
                 let date = (item["at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }

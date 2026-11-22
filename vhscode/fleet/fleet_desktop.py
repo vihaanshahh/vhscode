@@ -26,7 +26,8 @@ SEARCH_SECONDS = 2.0
 MANUAL_SLOTS = 4
 WORKSPACE_OPS = {
     "files", "find_files", "read_file", "save_file", "submit",
-    "workspace_settings", "workspace_agents", "set_model", "models", "reset_session",
+    "workspace_settings", "workspace_agents", "set_model", "models", "reset_session", "list_sessions", "resume_session",
+    "cursor_trust_status", "set_cursor_trust",
 }
 
 
@@ -487,6 +488,11 @@ def dispatch(message):
             raise ValueError("Choose a host to remove")
         fleet_hosts.remove_host(message["id"])
         return {"hosts": fleet_hosts.hosts()}
+    if op == "cursor_login":
+        from fleet_cursor_login import login
+        host = message.get("host")
+        _validate_host(host)
+        return login(host["ssh"])
     if op == "connect_host":
         from fleet_ssh import authenticate
 
