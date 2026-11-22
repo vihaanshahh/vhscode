@@ -17,6 +17,7 @@ from uuid import uuid4
 MAX_FINISHED = 100
 MAX_EVENTS = 80
 MAX_TEXT = 4096
+MAX_RESULT_TEXT = 64 * 1024
 MAX_SCHEDULES = 100
 SLOTS = 2
 POLL_SECONDS = 1
@@ -28,12 +29,12 @@ MANUAL_LOCKS = {}
 RUNTIME = str(Path(__file__).resolve())
 RUNS_VIEW = """
     WITH display AS (
-        SELECT id, agent, repo, status, started, ended, view, action, risk, title, session, detached,
+        SELECT id, agent, repo, status, started, ended, view, action, risk, title, session, detached, lane, generation,
                CASE WHEN status IN ('failed', 'cancelled')
                     THEN COALESCE(diagnostic, outcome) ELSE outcome END AS outcome
         FROM runs
     )
-    SELECT id, agent, repo, status, started, ended, view, outcome, session, detached,
+    SELECT id, agent, repo, status, started, ended, view, outcome, session, detached, lane, generation,
            CASE WHEN ended IS NULL THEN action ELSE COALESCE(outcome, action) END AS action,
            COALESCE(risk, '') AS risk, title
     FROM display
@@ -104,6 +105,7 @@ def _database(directory):
                     "view": "TEXT NOT NULL DEFAULT 'actions'", "risk": "TEXT",
                     "outcome": "TEXT", "diagnostic": "TEXT", "title": "TEXT NOT NULL DEFAULT ''",
                     "session": "TEXT", "detached": "INTEGER NOT NULL DEFAULT 0",
+                    "lane": "INTEGER NOT NULL DEFAULT 1", "generation": "INTEGER NOT NULL DEFAULT 0",
                 }),
             ):
                 existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
@@ -150,7 +152,8 @@ def _try_lock(name):
 
 
 def _record(db, run_id, kind, text):
-    text = text[:MAX_TEXT].encode("utf-8", errors="replace").decode("utf-8")
+    limit = MAX_RESULT_TEXT if kind == "result" else MAX_TEXT
+    text = text[:limit].encode("utf-8", errors="replace").decode("utf-8")
     db.execute(
         "INSERT INTO events(run_id, kind, text, at) VALUES (?, ?, ?, ?)",
         (run_id, kind[:40], text, time.time()),
@@ -194,7 +197,7 @@ def _finish(db, run_id, status, error=None, session=None):
     )
 
 
-def begin_run(repo, agent, prompt, view="actions", *, session=None, detached=False, known_session=False):
+def begin_run(repo, agent, prompt, view="actions", *, session=None, detached=False, known_session=False, lane=1, generation=0):
     if not isinstance(view, str) or view not in VIEWS:
         raise ValueError("Choose an actions, summary, or risks view")
     run_id = uuid4().hex
@@ -205,8 +208,8 @@ def begin_run(repo, agent, prompt, view="actions", *, session=None, detached=Fal
         with _connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if detached and db.execute(
-                "SELECT 1 FROM runs WHERE repo=? AND agent=? AND detached=1 AND status='running' LIMIT 1",
-                (str(repo), agent),
+                "SELECT 1 FROM runs WHERE repo=? AND agent=? AND lane=? AND detached=1 AND status='running' LIMIT 1",
+                (str(repo), agent, lane),
             ).fetchone():
                 raise ValueError("A task is already running for this workspace and agent")
             if session is not None:
@@ -219,9 +222,9 @@ def begin_run(repo, agent, prompt, view="actions", *, session=None, detached=Fal
                 if not known_session and not any(row["status"] == "completed" for row in previous):
                     raise ValueError("Choose a completed session from this agent and repository")
             db.execute(
-                """INSERT INTO runs(id, agent, repo, prompt, status, started, view, title, session, detached)
-                   VALUES (?, ?, ?, '', 'running', ?, ?, ?, ?, ?)""",
-                (run_id, agent, str(repo), time.time(), view, _title(prompt), session, detached),
+                """INSERT INTO runs(id, agent, repo, prompt, status, started, view, title, session, detached, lane, generation)
+                   VALUES (?, ?, ?, '', 'running', ?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, agent, str(repo), time.time(), view, _title(prompt), session, detached, lane, generation),
             )
             _record(db, run_id, "prompt", prompt)
     except BaseException:
@@ -276,9 +279,17 @@ def _reap_manual():
 
 def rpc(request):
     op = request.get("op")
-    if op in {"workspace_settings", "set_model", "models", "reset_session"}:
+    if op == "browse_folders":
+        from fleet_desktop import browse_folders
+
+        return browse_folders(request)
+    if op == "sidebar_agents":
+        from fleet_models import sidebar_agents
+        return sidebar_agents(request.get("repos"))
+    if op in {"workspace_settings", "workspace_agents", "set_model", "models", "reset_session"}:
         from fleet_models import workspace
-        return workspace(request["repo"], request)
+        from fleet_hosts import workspace_root
+        return workspace(workspace_root(request["repo"]), request)
     if op in {"files", "read_file", "save_file", "find_files", "submit"}:
         from fleet_desktop import workspace
 

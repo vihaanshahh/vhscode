@@ -404,7 +404,9 @@ struct FleetOverview: View {
                     field("Started", row.started.formatted(date: .abbreviated, time: .shortened))
                     if !row.risk.isEmpty { field("Risk", row.risk, color: amber) }
                     let outcome = row.outcome.isEmpty ? row.action : row.outcome
-                    if !outcome.isEmpty { field(row.status == "running" ? "Current action" : "Outcome", outcome) }
+                    if !outcome.isEmpty {
+                        field(row.status == "running" ? "Current action" : "Outcome", outcome, markdown: !row.outcome.isEmpty)
+                    }
                     DisclosureGroup("Event log", isExpanded: $showEvents) {
                         eventList(row)
                     }
@@ -448,11 +450,15 @@ struct FleetOverview: View {
                             Text(date.formatted(date: .omitted, time: .shortened)).foregroundStyle(.secondary)
                         }
                     }
-                    Text(event.text)
-                        .font(.system(size: 12))
-                        .fontWeight(.regular)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if event.kind == "result" {
+                        AgentMarkdown(source: event.text, font: .system(size: 12)).equatable()
+                    } else {
+                        Text(event.text)
+                            .font(.system(size: 12))
+                            .fontWeight(.regular)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
                 .padding(8)
                 .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 5))
@@ -499,14 +505,18 @@ struct FleetOverview: View {
         }
     }
 
-    private func field(_ label: String, _ value: String, monospaced: Bool = false, color: Color = .primary) -> some View {
+    private func field(_ label: String, _ value: String, monospaced: Bool = false, color: Color = .primary, markdown: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-            Text(value)
-                .font(.system(size: 12, design: monospaced ? .monospaced : .default))
-                .foregroundStyle(color)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
+            if markdown {
+                AgentMarkdown(source: value, font: .system(size: 12)).equatable()
+            } else {
+                Text(value)
+                    .font(.system(size: 12, design: monospaced ? .monospaced : .default))
+                    .foregroundStyle(color)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
         }
     }
 

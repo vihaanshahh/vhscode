@@ -26,7 +26,7 @@ SEARCH_SECONDS = 2.0
 MANUAL_SLOTS = 4
 WORKSPACE_OPS = {
     "files", "find_files", "read_file", "save_file", "submit",
-    "workspace_settings", "set_model", "models", "reset_session",
+    "workspace_settings", "workspace_agents", "set_model", "models", "reset_session",
 }
 
 
@@ -94,6 +94,45 @@ def _page(root, path, cursor, limit):
     ]
     cursor = f"{page[-1][0]}:{page[-1][2]}" if len(ordered) > limit else None
     return {"entries": results, "cursor": cursor}
+
+
+def browse_folders(request):
+    """List directories on the execution host before a workspace is selected."""
+    from fleet_hosts import workspace_root
+
+    directory = workspace_root(request.get("path", "~"))
+    cursor = request.get("cursor")
+    if cursor is not None and (
+        not isinstance(cursor, str) or not cursor or len(cursor) > 1024 or "/" in cursor
+        or cursor in (".", "..") or not cursor.isprintable()
+    ):
+        raise ValueError("Invalid folder page cursor")
+    after = ("", "") if cursor is None else (cursor.casefold(), cursor)
+    try:
+        with os.scandir(directory) as children:
+            def entries():
+                for child in children:
+                    key = (child.name.casefold(), child.name)
+                    if key <= after or not child.name.isprintable():
+                        continue
+                    try:
+                        if child.is_dir(follow_symlinks=True):
+                            yield key
+                    except OSError:
+                        continue
+
+            ordered = nsmallest(MAX_PAGE + 1, entries())
+    except OSError as error:
+        raise ValueError(f"Could not list folders in {directory}: {error.strerror}") from error
+    folders = [name for _, name in ordered[:MAX_PAGE]]
+    more = len(ordered) > MAX_PAGE
+    return {
+        "directory": str(directory),
+        "parent": str(directory.parent) if directory.parent != directory else None,
+        "folders": folders,
+        "more": more,
+        "cursor": folders[-1] if more else None,
+    }
 
 
 def _git_files(root):
@@ -299,12 +338,8 @@ def _save(root, parts, text, revision):
 
 
 def workspace(request):
-    repo = request.get("repo", ".")
-    if not isinstance(repo, str) or not repo.strip():
-        raise ValueError("Choose an existing workspace directory on this host")
-    root = Path(repo).expanduser().resolve(strict=True)
-    if not root.is_dir():
-        raise ValueError("Choose an existing workspace directory on this host")
+    from fleet_hosts import workspace_root
+    root = workspace_root(request.get("repo", "."))
     op = request.get("op")
     if op == "files":
         return _page(root, request.get("path", ""), request.get("cursor"), request.get("limit", 100))
@@ -345,8 +380,9 @@ def _submit(root, request):
             if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
                 raise ValueError(f"Choose context inside the repository: {tag}")
 
-    from fleet_models import get
-    settings = get(root, agent)
+    from fleet_models import agent_lane, get
+    lane = agent_lane(request.get("lane", 1))
+    settings = get(root, agent, lane)
     if session is None:
         session = settings["session"]
     _reap_manual()
@@ -356,14 +392,14 @@ def _submit(root, request):
         raise ValueError("This host already has four desktop runs in progress")
     try:
         run_id = begin_run(root, agent, prompt, view, session=session, detached=True,
-                           known_session=session == settings["session"])
+                           known_session=session == settings["session"], lane=lane, generation=settings["generation"])
         fd = MANUAL_LOCKS[run_id]
         try:
             with tempfile.TemporaryFile() as payload:
                 payload.write(json.dumps({
                     "repo": str(root), "agent": agent, "prompt": prompt, "view": view,
                     "session": session, "tags": tags, "filter": quiet,
-                    "model": settings["model"], "generation": settings["generation"],
+                    "model": settings["model"], "generation": settings["generation"], "lane": lane,
                 }).encode("ascii"))
                 payload.seek(0)
                 subprocess.Popen(
@@ -413,7 +449,7 @@ def _run(run_id, fd):
         )
         if session and status == "completed":
             from fleet_models import remember
-            remember(request["repo"], request["agent"], session, request["generation"])
+            remember(request["repo"], request["agent"], session, request["generation"], request["lane"])
     except HarnessError:
         pass
     except KeyboardInterrupt:

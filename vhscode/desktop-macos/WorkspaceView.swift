@@ -3,6 +3,9 @@ import SwiftUI
 
 struct WorkspaceView: View {
     let host: FleetHost
+    var selectedAgentLane: FleetAgentLaneSelection? = nil
+    var onAgentLanesChange: ([FleetAgentLane]) -> Void = { _ in }
+    var onActiveAgentLaneChange: (FleetAgentLane) -> Void = { _ in }
     @State private var workspaces: [WorkspaceScope: WorkspaceModel] = [:]
 
     private var scope: WorkspaceScope {
@@ -12,7 +15,8 @@ struct WorkspaceView: View {
     var body: some View {
         Group {
             if let model = workspaces[scope] {
-                WorkspacePane(host: host, model: model)
+                WorkspacePane(host: host, model: model, selectedAgentLane: selectedAgentLane,
+                              onAgentLanesChange: onAgentLanesChange, onActiveAgentLaneChange: onActiveAgentLaneChange)
             } else {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -94,7 +98,7 @@ private struct AgentEvent: Identifiable {
 
 private struct WorkspaceTurn: Identifiable {
     let id: String
-    let prompt: String
+    var prompt: String
     let reporting: String
     var status = "queued"
     var action = ""
@@ -102,6 +106,21 @@ private struct WorkspaceTurn: Identifiable {
     var outcome = ""
     var events: [AgentEvent] = []
     var isActive: Bool { ["queued", "running"].contains(status) }
+}
+
+private struct WorkspaceAgent: Hashable, Identifiable {
+    let harness: String
+    let lane: Int
+    var id: Self { self }
+    var label: String { "\(harness == "codex" ? "Codex" : "Cursor") \(lane)" }
+    var sidebarLane: FleetAgentLane { FleetAgentLane(agent: harness, lane: lane) }
+}
+
+private struct AgentDraft {
+    var text = ""
+    var tags = Set<String>()
+    var reporting = "actions"
+    var filterProgress = false
 }
 
 @MainActor
@@ -113,39 +132,83 @@ private final class WorkspaceModel: ObservableObject {
     @Published var selectedPath: String?
     @Published var loadingFiles = Set<String>()
     @Published var fileErrors: [String: String] = [:]
-    @Published var tagPaths = Set<String>()
-    @Published var agent = "codex"
-    @Published var reporting = "actions"
-    @Published var filterProgress = false
-    @Published var draft = ""
-    @Published var submitting = false
-    @Published var conversations: [String: [WorkspaceTurn]] = [:]
-    @Published var composerError: String?
-    @Published var streamErrors: [String: String] = [:]
+    @Published var selectedAgent = WorkspaceAgent(harness: "codex", lane: 1)
+    @Published private(set) var agents = [WorkspaceAgent(harness: "codex", lane: 1)]
+    @Published private var drafts: [WorkspaceAgent: AgentDraft] = [:]
+    @Published private var submitting = Set<WorkspaceAgent>()
+    @Published private var conversations: [WorkspaceAgent: [WorkspaceTurn]] = [:]
+    @Published private var composerErrors: [WorkspaceAgent: String] = [:]
+    @Published private var streamErrors: [WorkspaceAgent: String] = [:]
+    @Published private var pendingDetails = Set<String>()
+    @Published private(set) var loadError: String?
+    @Published private var settingsError: String?
+    @Published private(set) var agentsLoaded = false
     @Published var stopping = Set<String>()
     @Published var notice: String?
     @Published private(set) var workspaceModels: [String: String] = [:]
-    @Published private(set) var sessions: [String: String] = [:]
-    @Published private(set) var resetting = Set<String>()
+    @Published private(set) var savingModels = Set<String>()
+    @Published private(set) var modelErrors: [String: String] = [:]
+    @Published private(set) var sessions: [WorkspaceAgent: String] = [:]
+    @Published private var resetting = Set<WorkspaceAgent>()
+    @Published private(set) var modelCatalogs: [String: NativeModelCatalog] = [:]
     private var modelsChanged = Set<String>()
-    private var sessionsChanged = Set<String>()
     private var loadedSettings = false
     private var checkedWelcome = false
+    private var lastAgentSelection: UUID?
     private var lastDirty: Bool?
     private var folderLoads: [String: UUID] = [:]
 
     init(host: FleetHost) { self.host = host }
 
     var selectedBuffer: SourceBuffer? { buffers.first { $0.path == selectedPath } }
-    var turns: [WorkspaceTurn] { conversations[agent] ?? [] }
-    var canSend: Bool {
-        !submitting && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && activeRun(agent) == nil && !resetting.contains(agent)
+    var turns: [WorkspaceTurn] { conversations[selectedAgent] ?? [] }
+    var tagPaths: Set<String> { drafts[selectedAgent]?.tags ?? [] }
+    var composerError: String? { composerErrors[selectedAgent] ?? streamErrors[selectedAgent] ?? settingsError }
+    var canSend: Bool { canSend(from: selectedAgent) }
+    var canReset: Bool { canReset(selectedAgent) }
+
+    func draftBinding<Value>(for agent: WorkspaceAgent, _ keyPath: WritableKeyPath<AgentDraft, Value>) -> Binding<Value> {
+        Binding(get: { self.drafts[agent, default: AgentDraft()][keyPath: keyPath] },
+                set: { self.drafts[agent, default: AgentDraft()][keyPath: keyPath] = $0 })
     }
 
-    func activeRun(_ agent: String) -> String? {
+    private func canSend(from agent: WorkspaceAgent) -> Bool {
+        canReset(agent) && !savingModels.contains(agent.harness)
+            && drafts[agent]?.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private func canReset(_ agent: WorkspaceAgent) -> Bool {
+        agentsLoaded && !submitting.contains(agent) && activeRun(agent) == nil && !resetting.contains(agent)
+    }
+
+    func activeRun(_ agent: WorkspaceAgent) -> String? {
         guard let last = conversations[agent]?.last, last.isActive else { return nil }
         return last.id
+    }
+
+    func observedRun(_ agent: WorkspaceAgent) -> String? {
+        guard let last = conversations[agent]?.last,
+              last.isActive || (agent == selectedAgent && pendingDetails.contains(last.id)) else { return nil }
+        return last.id
+    }
+
+    func availableAgent(_ harness: String) -> WorkspaceAgent? {
+        (1...4).map { WorkspaceAgent(harness: harness, lane: $0) }.first { !agents.contains($0) }
+    }
+
+    func addAgent(_ harness: String) {
+        guard agentsLoaded, let agent = availableAgent(harness) else { return }
+        agents.append(agent)
+        selectedAgent = agent
+    }
+
+    func selectAgent(_ selection: FleetAgentLaneSelection?) {
+        guard let selection, selection.id != lastAgentSelection,
+              ["codex", "cursor"].contains(selection.agent), (1...4).contains(selection.lane) else { return }
+        lastAgentSelection = selection.id
+        let agent = WorkspaceAgent(harness: selection.agent, lane: selection.lane)
+        if !agents.contains(agent) { agents.append(agent) }
+        selectedAgent = agent
     }
 
     func loadFolder(_ directory: String, direction: FolderNavigation = .first) async {
@@ -341,94 +404,164 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func toggleTag(_ path: String) {
-        if tagPaths.remove(path) == nil { tagPaths.insert(path) }
+        if drafts[selectedAgent, default: AgentDraft()].tags.remove(path) == nil {
+            drafts[selectedAgent, default: AgentDraft()].tags.insert(path)
+        }
+    }
+
+    func loadAgents() async {
+        guard !agentsLoaded else { return }
+        loadError = nil
+        do {
+            let reply = try await FleetBridge.call(host, ["op": "workspace_agents"])
+            try Task.checkCancellation()
+            guard let instances = reply["instances"] as? [[String: Any]] else {
+                throw WorkspaceFailure("The workspace did not return its agents.")
+            }
+            for instance in instances {
+                guard let harness = instance["agent"] as? String, ["codex", "cursor"].contains(harness),
+                      let lane = instance["lane"] as? Int, (1...4).contains(lane) else { continue }
+                let agent = WorkspaceAgent(harness: harness, lane: lane)
+                if !agents.contains(agent) { agents.append(agent) }
+                sessions[agent] = instance["session"] as? String
+                guard let run = instance["run"] as? [String: Any], let id = run["id"] as? String else { continue }
+                var turn = WorkspaceTurn(id: id, prompt: run["title"] as? String ?? "", reporting: run["view"] as? String ?? "actions")
+                turn.status = run["status"] as? String ?? "queued"
+                turn.action = run["action"] as? String ?? ""
+                turn.risk = run["risk"] as? String ?? ""
+                turn.outcome = run["outcome"] as? String ?? ""
+                conversations[agent] = [turn]
+                pendingDetails.insert(id)
+            }
+            if lastAgentSelection == nil, turns.isEmpty, (drafts[selectedAgent]?.text ?? "").isEmpty, tagPaths.isEmpty,
+               let active = agents.first(where: { activeRun($0) != nil }) {
+                selectedAgent = active
+            }
+            agentsLoaded = true
+        } catch is CancellationError {
+            return
+        } catch {
+            loadError = "Could not load workspace agents. \(error.localizedDescription)"
+        }
     }
 
     func loadSettings() async {
         guard !loadedSettings else { return }
+        settingsError = nil
         do {
             let reply = try await FleetBridge.call(host, ["op": "workspace_settings"])
             try Task.checkCancellation()
             for agent in ["codex", "cursor"] {
                 guard let preferences = reply[agent] as? [String: Any] else { continue }
                 if !modelsChanged.contains(agent) { workspaceModels[agent] = preferences["model"] as? String }
-                if !sessionsChanged.contains(agent) { sessions[agent] = preferences["session"] as? String }
             }
             loadedSettings = true
         } catch is CancellationError {
             return
         } catch {
-            composerError = "Could not load agent settings. \(error.localizedDescription)"
+            settingsError = "Could not load agent settings. \(error.localizedDescription)"
         }
     }
 
-    func setModel(_ id: String, agent: String) async throws {
-        _ = try await FleetBridge.call(host, ["op": "set_model", "agent": agent, "model": id])
-        modelsChanged.insert(agent)
-        workspaceModels[agent] = id.isEmpty ? nil : id
+    func setModel(_ id: String, agent: String) async {
+        guard savingModels.insert(agent).inserted else { return }
+        defer { savingModels.remove(agent) }
+        modelErrors[agent] = nil
+        do {
+            _ = try await FleetBridge.call(host, ["op": "set_model", "agent": agent, "model": id])
+            modelsChanged.insert(agent)
+            workspaceModels[agent] = id.isEmpty ? nil : id
+        } catch {
+            modelErrors[agent] = "Could not save the model. \(error.localizedDescription)"
+        }
     }
 
-    func newConversation() async {
-        let agent = self.agent
-        guard activeRun(agent) == nil, !submitting, resetting.insert(agent).inserted else { return }
-        defer { resetting.remove(agent) }
-        composerError = nil
+    func loadModelOptions(for agent: String, refresh: Bool = false) async {
+        var catalog = modelCatalogs[agent] ?? NativeModelCatalog()
+        guard !catalog.loading else { return }
+        if !refresh, let loadedAt = catalog.loadedAt, loadedAt.duration(to: .now) < .seconds(60) { return }
+        catalog.loading = true
+        catalog.error = nil
+        modelCatalogs[agent] = catalog
         do {
-            _ = try await FleetBridge.call(host, ["op": "reset_session", "agent": agent])
-            sessionsChanged.insert(agent)
+            let reply = try await FleetBridge.call(host, ["op": "models", "agent": agent])
+            guard let listed = reply["models"] as? [[String: Any]] else {
+                throw WorkspaceFailure("The host returned an unreadable model list.")
+            }
+            var seen = Set<String>()
+            catalog.options = listed.compactMap { entry -> NativeModelOption? in
+                guard let id = entry["id"] as? String, !id.isEmpty, seen.insert(id).inserted else { return nil }
+                return NativeModelOption(id: id, label: entry["label"] as? String ?? id)
+            }
+            catalog.error = catalog.options.isEmpty ? "The CLI returned no models." : nil
+            catalog.loadedAt = catalog.options.isEmpty ? nil : .now
+        } catch {
+            catalog.error = "Could not load models. \(error.localizedDescription)"
+            catalog.loadedAt = nil
+        }
+        catalog.loading = false
+        modelCatalogs[agent] = catalog
+    }
+
+    func newConversation(_ agent: WorkspaceAgent) async {
+        guard canReset(agent), resetting.insert(agent).inserted else { return }
+        defer { resetting.remove(agent) }
+        composerErrors[agent] = nil
+        do {
+            _ = try await FleetBridge.call(host, ["op": "reset_session", "agent": agent.harness, "lane": agent.lane])
             sessions[agent] = nil
+            if let id = conversations[agent]?.last?.id { pendingDetails.remove(id) }
             conversations[agent] = []
             streamErrors[agent] = nil
         } catch {
-            composerError = error.localizedDescription
+            composerErrors[agent] = error.localizedDescription
         }
     }
 
-    func submit() async {
-        guard canSend else { return }
-        let input = draft
-        let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        let agent = self.agent
-        let reporting = self.reporting
+    func submit(from agent: WorkspaceAgent) async {
+        guard canSend(from: agent), let draft = drafts[agent] else { return }
+        let prompt = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let request: [String: Any] = [
-            "op": "submit", "agent": agent, "prompt": prompt,
-            "tags": tagPaths.sorted(), "view": reporting, "filter": filterProgress,
+            "op": "submit", "agent": agent.harness, "lane": agent.lane, "prompt": prompt,
+            "tags": draft.tags.sorted(), "view": draft.reporting, "filter": draft.filterProgress,
         ]
-        submitting = true
-        composerError = nil
+        submitting.insert(agent)
+        composerErrors[agent] = nil
         streamErrors[agent] = nil
-        defer { submitting = false }
+        defer { submitting.remove(agent) }
         do {
             let reply = try await FleetBridge.call(host, request)
             guard let id = reply["id"] as? String else {
                 throw WorkspaceFailure("The workspace did not return the new run.")
             }
-            conversations[agent, default: []].append(WorkspaceTurn(id: id, prompt: prompt, reporting: reporting))
+            if let previousID = conversations[agent]?.last?.id { pendingDetails.remove(previousID) }
+            conversations[agent, default: []].append(WorkspaceTurn(id: id, prompt: prompt, reporting: draft.reporting))
             let count = conversations[agent]?.count ?? 0
             if count > 24 { conversations[agent]?.removeFirst(count - 24) }
-            if draft == input { draft = "" }
+            if drafts[agent]?.text == draft.text { drafts[agent]?.text = "" }
         } catch {
-            composerError = error.localizedDescription
+            composerErrors[agent] = error.localizedDescription
         }
     }
 
-    func stop() async {
-        guard let id = activeRun(agent), stopping.insert(id).inserted else { return }
-        composerError = nil
+    func stop(_ id: String, agent: WorkspaceAgent) async {
+        guard activeRun(agent) == id, stopping.insert(id).inserted else { return }
+        composerErrors[agent] = nil
         do {
             _ = try await FleetBridge.call(host, ["op": "cancel", "id": id])
         } catch {
             stopping.remove(id)
-            composerError = error.localizedDescription
+            if activeRun(agent) == id { composerErrors[agent] = error.localizedDescription }
         }
     }
 
-    func monitor(_ id: String?, agent: String) async {
+    func monitor(_ id: String?, agent: WorkspaceAgent) async {
         guard let id else { return }
-        while !Task.isCancelled, activeRun(agent) == id {
+        while !Task.isCancelled, observedRun(agent) == id {
             do {
                 let reply = try await FleetBridge.call(host, ["op": "detail", "id": id])
                 try Task.checkCancellation()
+                guard observedRun(agent) == id else { return }
                 guard let run = reply["run"] as? [String: Any],
                       let status = run["status"] as? String,
                       let index = conversations[agent]?.firstIndex(where: { $0.id == id }),
@@ -444,16 +577,20 @@ private final class WorkspaceModel: ObservableObject {
                 case "risks": ["error", "risk"]
                 default: nil
                 }
-                turn.events = (reply["events"] as? [[String: Any]] ?? []).enumerated().compactMap { index, value in
+                let events = reply["events"] as? [[String: Any]] ?? []
+                if pendingDetails.contains(id), let prompt = events.first(where: { ($0["kind"] as? String) == "prompt" })?["text"] as? String {
+                    turn.prompt = prompt
+                }
+                turn.events = events.enumerated().compactMap { index, value in
                     guard let kind = value["kind"] as? String, let text = value["text"] as? String,
                           !["prompt", "status", "session"].contains(kind),
                           visibleKinds?.contains(kind) ?? true else { return nil }
                     return AgentEvent(id: index, kind: kind, text: text)
                 }
                 if let session = run["session"] as? String, !session.isEmpty {
-                    sessionsChanged.insert(agent)
                     sessions[agent] = session
                 }
+                pendingDetails.remove(id)
                 streamErrors[agent] = nil
                 conversations[agent]?[index] = turn
                 if !turn.isActive {
@@ -463,10 +600,11 @@ private final class WorkspaceModel: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
+                guard !Task.isCancelled, observedRun(agent) == id else { return }
                 streamErrors[agent] = error.localizedDescription
             }
             do {
-                try await Task.sleep(for: .seconds(streamErrors[agent] == nil ? 1 : 4))
+                try await Task.sleep(for: .seconds(streamErrors[agent] != nil ? 4 : selectedAgent == agent ? 1 : 3))
             } catch { return }
         }
     }
@@ -476,6 +614,9 @@ private final class WorkspaceModel: ObservableObject {
 private struct WorkspacePane: View {
     let host: FleetHost
     @ObservedObject var model: WorkspaceModel
+    let selectedAgentLane: FleetAgentLaneSelection?
+    let onAgentLanesChange: ([FleetAgentLane]) -> Void
+    let onActiveAgentLaneChange: (FleetAgentLane) -> Void
     @State private var closing: SourceBuffer?
     @State private var panel: WorkspacePanel?
     @AppStorage("FleetExplorerVisible") private var explorerVisible = true
@@ -496,6 +637,10 @@ private struct WorkspacePane: View {
             await model.openWelcomeFile()
         }
         .task { await model.loadSettings() }
+        .task { await model.loadAgents() }
+        .onChange(of: selectedAgentLane, initial: true) { _, selection in model.selectAgent(selection) }
+        .onChange(of: model.agents, initial: true) { _, agents in onAgentLanesChange(agents.map(\.sidebarLane)) }
+        .onChange(of: model.selectedAgent, initial: true) { _, agent in onActiveAgentLaneChange(agent.sidebarLane) }
         .onAppear { model.publishDirty(force: true) }
         .onDisappear { NotificationCenter.default.post(name: .init("FleetWorkspaceDirty"), object: false) }
         .onReceive(NotificationCenter.default.publisher(for: .init("FleetQuickOpen"))) { _ in
@@ -514,17 +659,17 @@ private struct WorkspacePane: View {
                     self.panel = nil
                     Task { await model.openFile(path) }
                 }
-            case let .model(agent):
-                AgentModelPanel(host: host, agent: agent, current: model.workspaceModels[agent]) { id in
-                    try await model.setModel(id, agent: agent)
-                }
             }
         }
-        .task(id: model.activeRun("codex")) {
-            await model.monitor(model.activeRun("codex"), agent: "codex")
-        }
-        .task(id: model.activeRun("cursor")) {
-            await model.monitor(model.activeRun("cursor"), agent: "cursor")
+        .background {
+            ZStack {
+                ForEach(model.agents) { agent in
+                    let run = model.observedRun(agent)
+                    Color.clear.task(id: run) { await model.monitor(run, agent: agent) }
+                }
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
         }
         .alert("Discard unsaved changes?", isPresented: Binding(
             get: { closing != nil }, set: { if !$0 { closing = nil } }
@@ -708,13 +853,16 @@ private struct WorkspacePane: View {
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let agent = model.selectedAgent
+        return VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Agent").font(.subheadline.weight(.semibold))
+                Text(agent.label).font(.subheadline.weight(.semibold))
+                let running = model.agents.filter { model.activeRun($0) != nil }.count
+                if running > 0 { Text("\(running) running").font(.caption).foregroundStyle(.secondary) }
                 Spacer()
-                if let id = model.activeRun(model.agent) {
+                if let id = model.activeRun(agent) {
                     Button {
-                        Task { await model.stop() }
+                        Task { await model.stop(id, agent: agent) }
                     } label: {
                         Label(model.stopping.contains(id) ? "Stopping…" : "Stop", systemImage: "stop.fill")
                     }
@@ -723,8 +871,10 @@ private struct WorkspacePane: View {
                     .help("Stop this task")
                 }
                 Menu {
-                    Button("Choose Model…") { panel = .model(model.agent) }
-                    Toggle("Filter routine progress", isOn: $model.filterProgress)
+                    Toggle("Filter routine progress", isOn: model.draftBinding(for: agent, \.filterProgress))
+                    Button("New Conversation") { Task { await model.newConversation(agent) } }
+                        .disabled(!model.canReset)
+                        .help(model.sessions[agent] == nil ? "New conversation" : "Start a fresh CLI session")
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
@@ -732,13 +882,6 @@ private struct WorkspacePane: View {
                 .fixedSize()
                 .help("Agent options")
                 .accessibilityLabel("Agent options")
-                Button { Task { await model.newConversation() } } label: {
-                    Image(systemName: "square.and.pencil").frame(width: 20, height: 20)
-                }
-                .buttonStyle(.plain)
-                .disabled(model.activeRun(model.agent) != nil || model.submitting || model.resetting.contains(model.agent))
-                .help(model.sessions[model.agent] == nil ? "New conversation" : "Start a fresh CLI session")
-                .accessibilityLabel("New conversation")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
@@ -757,6 +900,7 @@ private struct WorkspacePane: View {
                 .padding(12)
             }
             .defaultScrollAnchor(.bottom)
+            .id(agent)
             Divider()
             VStack(alignment: .leading, spacing: 10) {
                 if !model.tagPaths.isEmpty {
@@ -789,7 +933,8 @@ private struct WorkspacePane: View {
                         }
                     }
                 }
-                TextEditor(text: $model.draft)
+                TextEditor(text: model.draftBinding(for: agent, \.text))
+                    .id(agent)
                     .font(.system(.body))
                     .scrollContentBackground(.hidden)
                     .frame(minHeight: 64, idealHeight: 82, maxHeight: 100)
@@ -797,63 +942,103 @@ private struct WorkspacePane: View {
                     .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
                     .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary))
                     .accessibilityLabel("Agent prompt")
-                HStack(spacing: 6) {
-                    Picker("Agent", selection: $model.agent) {
-                        Text("Codex CLI").tag("codex")
-                        Text("Cursor Agent").tag("cursor")
-                    }
-                    .labelsHidden()
-                    .fixedSize()
-                    .accessibilityLabel("Agent")
-                    .disabled(model.submitting)
-                    Picker("Reporting", selection: $model.reporting) {
-                        Text("Actions").tag("actions")
-                        Text("Summary").tag("summary")
-                        Text("Risks").tag("risks")
-                    }
-                    .labelsHidden()
-                    .fixedSize()
-                    .accessibilityLabel("Reporting")
-                    Spacer(minLength: 2)
-                    Button {
-                        Task { await model.submit() }
-                    } label: {
-                        Label("Send", systemImage: "arrow.up").labelStyle(.iconOnly)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(accent)
-                    .disabled(!model.canSend)
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .help("Send prompt (⌘↩)")
-                    .accessibilityLabel("Send prompt")
+                composerControls(agent)
+                if let error = model.modelErrors[agent.harness] ?? model.modelCatalogs[agent.harness]?.error {
+                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
                 }
-                Button { panel = .model(model.agent) } label: {
-                    Label(model.workspaceModels[model.agent] ?? "CLI default", systemImage: "cpu")
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .foregroundStyle(.secondary)
+                if let error = model.loadError {
+                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    Button("Retry Loading Agents") { Task { await model.loadAgents() } }
                 }
-                .buttonStyle(.plain)
-                .help("Choose the model for this workspace")
-                if let error = model.composerError ?? model.streamErrors[model.agent] {
+                if let error = model.composerError {
                     Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
                 }
             }
             .padding(11)
         }
         .background(Color(nsColor: .controlBackgroundColor))
+        .task(id: agent.harness) { await model.loadModelOptions(for: agent.harness) }
     }
+
+    private func composerControls(_ agent: WorkspaceAgent) -> some View {
+        HStack(alignment: .bottom, spacing: 7) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 6) {
+                    providerControls
+                    AgentModelMenu(model: model, harness: agent.harness)
+                    viewControl(agent)
+                }.fixedSize(horizontal: true, vertical: false)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    providerControls
+                    HStack(alignment: .top, spacing: 6) {
+                        AgentModelMenu(model: model, harness: agent.harness)
+                        viewControl(agent)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+            Button {
+                Task { await model.submit(from: agent) }
+            } label: {
+                Label("Send", systemImage: "arrow.up").labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(accent)
+            .fixedSize()
+            .disabled(!model.canSend)
+            .keyboardShortcut(.return, modifiers: .command)
+            .help("Send prompt (⌘↩)")
+            .accessibilityLabel("Send prompt")
+        }
+    }
+
+    private var providerControls: some View {
+        HStack(spacing: 5) {
+            Text("Provider").font(.caption).foregroundStyle(.secondary)
+            Picker("Provider", selection: $model.selectedAgent) {
+                ForEach(model.agents) { instance in
+                    Text(instance.label).tag(instance)
+                }
+            }
+            .labelsHidden()
+            .accessibilityLabel("Provider and agent instance")
+            Menu {
+                Button("Codex CLI") { model.addAgent("codex") }
+                    .disabled(model.availableAgent("codex") == nil)
+                Button("Cursor Agent") { model.addAgent("cursor") }
+                    .disabled(model.availableAgent("cursor") == nil)
+            } label: {
+                Label("New Agent", systemImage: "plus").labelStyle(.iconOnly)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("New Agent")
+            .accessibilityLabel("New Agent")
+            .disabled(!model.agentsLoaded || (model.availableAgent("codex") == nil && model.availableAgent("cursor") == nil))
+        }
+    }
+
+    private func viewControl(_ agent: WorkspaceAgent) -> some View {
+        HStack(spacing: 4) {
+            Text("View").font(.caption).foregroundStyle(.secondary)
+            Picker("View", selection: model.draftBinding(for: agent, \.reporting)) {
+                Text("Actions").tag("actions")
+                Text("Summary").tag("summary")
+                Text("Risks").tag("risks")
+            }
+            .labelsHidden()
+        }.fixedSize(horizontal: true, vertical: false)
+    }
+
 }
 
 private enum WorkspacePanel: Identifiable {
     case quickOpen
-    case model(String)
 
     var id: String {
         switch self {
         case .quickOpen: "open"
-        case let .model(agent): "model-\(agent)"
         }
     }
 }
@@ -863,114 +1048,67 @@ private struct NativeModelOption: Identifiable {
     let label: String
 }
 
-@MainActor
-private struct AgentModelPanel: View {
-    let host: FleetHost
-    let agent: String
-    let save: (String) async throws -> Void
-    @Environment(\.dismiss) private var dismiss
-    @State private var value: String
-    @State private var models: [NativeModelOption] = []
-    @State private var listing = true
-    @State private var saving = false
-    @State private var listingError: String?
-    @State private var saveError: String?
+private struct NativeModelCatalog {
+    var options: [NativeModelOption] = []
+    var loading = false
+    var error: String?
+    var loadedAt: ContinuousClock.Instant?
+}
 
-    init(host: FleetHost, agent: String, current: String?, save: @escaping (String) async throws -> Void) {
-        self.host = host
-        self.agent = agent
-        self.save = save
-        _value = State(initialValue: current ?? "")
-    }
+@MainActor
+private struct AgentModelMenu: View {
+    @ObservedObject var model: WorkspaceModel
+    let harness: String
+
+    private var current: String? { model.workspaceModels[harness] }
+    private var saving: Bool { model.savingModels.contains(harness) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(agent == "codex" ? "Codex CLI Model" : "Cursor Agent Model").font(.headline)
-            TextField("Exact CLI model ID", text: $value)
-                .textFieldStyle(.roundedBorder)
-                .accessibilityLabel("Exact CLI model ID")
-                .disabled(saving)
-            if listing {
-                ProgressView("Loading available models…").controlSize(.small)
-            } else if let listingError {
-                Text(listingError).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            } else if models.isEmpty {
-                Text("Enter a model ID accepted by this CLI.").font(.caption).foregroundStyle(.secondary)
+        let catalog = model.modelCatalogs[harness] ?? NativeModelCatalog(loading: true)
+        Menu {
+            choice("CLI default", id: "")
+            if let current, !catalog.options.contains(where: { $0.id == current }) {
+                choice(current, id: current)
+            }
+            Divider()
+            ForEach(catalog.options) { option in
+                choice(option.label == option.id ? option.id : "\(option.label) · \(option.id)", id: option.id)
+            }
+            if !catalog.options.isEmpty { Divider() }
+            if catalog.loading {
+                Button("Loading models…") {}.disabled(true)
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(models) { item in
-                            Button {
-                                value = item.id
-                            } label: {
-                                HStack {
-                                    Text(item.label)
-                                    Spacer()
-                                    if value == item.id { Image(systemName: "checkmark") }
-                                }
-                                .padding(6)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .help(item.id)
-                        }
-                    }
+                Button(catalog.error == nil ? "Refresh Models" : "Retry Loading Models") {
+                    Task { await model.loadModelOptions(for: harness, refresh: true) }
                 }
-                .frame(maxHeight: 200)
-                .disabled(saving)
             }
-            if let saveError {
-                Text(saveError).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
-            }
-            HStack {
-                Button("Use CLI Default") { Task { await apply("") } }
-                    .disabled(saving)
-                Spacer()
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                    .disabled(saving)
-                Button("Save Model") {
-                    Task { await apply(value.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(saving || value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        } label: {
+            HStack(spacing: 6) {
+                Label("Model", systemImage: "cpu")
+                Text(saving ? "Saving…" : (current ?? "CLI default"))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 110, alignment: .leading)
             }
         }
-        .padding(18)
-        .frame(width: 450)
-        .interactiveDismissDisabled(saving)
-        .task { await load() }
+        .menuOrder(.fixed)
+        .menuStyle(.borderedButton)
+        .disabled(saving)
+        .accessibilityLabel("Model for \(harness == "codex" ? "Codex" : "Cursor")")
+        .accessibilityValue(current ?? "CLI default")
     }
 
-    private func load() async {
-        defer { listing = false }
-        do {
-            let reply = try await FleetBridge.call(host, ["op": "models", "agent": agent])
-            try Task.checkCancellation()
-            let listed = reply["models"] as? [[String: Any]] ?? []
-            var seen = Set<String>()
-            models = listed.compactMap { entry in
-                guard let id = entry["id"] as? String, !id.isEmpty, seen.insert(id).inserted else { return nil }
-                return NativeModelOption(id: id, label: entry["label"] as? String ?? id)
+    private func choice(_ title: String, id: String) -> some View {
+        Button {
+            guard id != (current ?? "") else { return }
+            Task { await model.setModel(id, agent: harness) }
+        } label: {
+            if id == (current ?? "") {
+                Label(title, systemImage: "checkmark")
+            } else {
+                Text(title)
             }
-            listingError = reply["error"] as? String
-        } catch is CancellationError {
-            return
-        } catch {
-            listingError = error.localizedDescription
-        }
-    }
-
-    private func apply(_ id: String) async {
-        guard !saving else { return }
-        saving = true
-        saveError = nil
-        defer { saving = false }
-        do {
-            try await save(id)
-            dismiss()
-        } catch {
-            saveError = error.localizedDescription
         }
     }
 }
@@ -1414,18 +1552,22 @@ private struct TurnCard: View {
                     .font(.callout).foregroundStyle(.orange).textSelection(.enabled)
             }
             if turn.reporting != "risks", !turn.outcome.isEmpty,
-               !turn.events.contains(where: { $0.text == turn.outcome }) {
-                Text(turn.outcome).font(.callout).textSelection(.enabled)
+               !turn.events.contains(where: { $0.kind == "result" || $0.text == turn.outcome }) {
+                AgentMarkdown(source: turn.outcome).equatable()
             }
             ForEach(turn.events) { event in
                 VStack(alignment: .leading, spacing: 3) {
                     if event.kind != "result" {
                         Text(event.kind.capitalized).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
                     }
-                    Text(event.text)
-                        .font(event.kind == "result" ? .callout : .caption)
-                        .foregroundStyle(event.kind == "error" ? .orange : .primary)
-                        .textSelection(.enabled)
+                    if event.kind == "result" {
+                        AgentMarkdown(source: event.text).equatable()
+                    } else {
+                        Text(event.text)
+                            .font(.caption)
+                            .foregroundStyle(event.kind == "error" ? .orange : .primary)
+                            .textSelection(.enabled)
+                    }
                 }
             }
         }

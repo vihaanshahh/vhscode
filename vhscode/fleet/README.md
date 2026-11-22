@@ -6,9 +6,11 @@ Open **Fleet Workbench** in Applications. Choose **File → Open Folder** (⌘O)
 
 The file explorer, editor tabs, and agent controls share a native Mac window. Use ⌘P to find files, ⌘S to save, ⌘B to toggle the explorer, and ⌘W to close the current editor tab. Attach files using the paperclip beside a path in the explorer.
 
-Choose **Codex CLI** or **Cursor Agent** in the task composer. Fleet runs the signed-in CLI in the selected folder and resumes its native session. The model defaults to the CLI's own settings. Choose a workspace model from the agent options to override it for that repository and agent, including its scheduled tasks. Starting a new conversation clears the workspace's saved session reference. Each scheduled task starts a fresh conversation.
+Use **New Agent** to add Codex or Cursor sessions to a workspace. Each session keeps its own prompt, file attachments, and native CLI context. Up to four desktop tasks can run at once on each host. Click an agent beneath its workspace in the sidebar to view its progress or stop that run. Opening a finished run shows its Markdown response, including selectable code blocks.
 
-Open **Activity**, **Schedules**, or **Risks** in the sidebar to monitor tasks across hosts. The plus menu adds SSH workspaces. Use **Test SSH** in workspace settings for interactive SSH authentication. The Intel Mac bundle includes Python, Git, tmux, both agent CLIs, and the local MobileBERT model. Remote tasks run with the credentials and CLIs available on the target host.
+The **Model** dropdown beside the provider and view controls lists models from the selected CLI on the workspace's machine. Choosing a model applies it to that workspace and harness, including scheduled tasks. **CLI default** follows the CLI's configuration. If the account rejects the configured default, choose one of the models returned by that machine. Each scheduled task starts a fresh conversation.
+
+Open **Activity**, **Schedules**, or **Risks** to monitor tasks across hosts. The sidebar shows running agents and paused schedules. For an SSH workspace, enter an OpenSSH alias, use **Test SSH** for interactive authentication, and browse to a project folder on the remote machine. The Intel Mac bundle includes Python, Git, tmux, both agent CLIs, and the local MobileBERT model. The remote machine supplies Python 3.10+, its agent CLIs and their login sessions.
 
 ### Running from a source checkout
 

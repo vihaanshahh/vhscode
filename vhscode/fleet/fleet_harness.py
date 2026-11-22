@@ -67,12 +67,13 @@ def run(
     status = "failed"
     failure = ""
     try:
-        executable = _find_harness(agent)
-        if executable is None:
+        harness = _find_harness(agent)
+        if harness is None:
             command = "codex" if agent == "codex" else "cursor-agent"
             failure = f"Fleet could not find {command} on PATH."
         else:
-            code = _run_process(root, agent, executable, prompt, tags, session, stream, model)
+            executable, environment = harness
+            code = _run_process(root, agent, executable, environment, prompt, tags, session, stream, model)
             if code:
                 failure = f"{agent} exited with status {code}."
             elif stream.failed:
@@ -96,8 +97,8 @@ def run(
     return stream.session
 
 
-def _run_process(root: Path, agent: str, executable: str, prompt: str, tags: set[str], session: str | None,
-                 stream: _Stream, model: str | None) -> int:
+def _run_process(root: Path, agent: str, executable: str, environment: dict[str, str],
+                 prompt: str, tags: set[str], session: str | None, stream: _Stream, model: str | None) -> int:
 
     if tags:
         paths = "\n".join(f"- {json.dumps(path, ensure_ascii=True)}" for path in sorted(tags))
@@ -123,7 +124,7 @@ def _run_process(root: Path, agent: str, executable: str, prompt: str, tags: set
             stdin.seek(0)
         process = subprocess.Popen(
             [executable, *args], cwd=root, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True,
+            env=environment, start_new_session=True,
         )
         try:
             stream.consume(process.stdout, process.stderr)
@@ -138,17 +139,18 @@ def _run_process(root: Path, agent: str, executable: str, prompt: str, tags: set
 
 def native(root: Path, agent: str, session: str | None) -> None:
     """Give the native TUI the terminal to handle interactive approvals."""
-    executable = _find_harness(agent)
-    if executable is None:
+    harness = _find_harness(agent)
+    if harness is None:
         command = "codex" if agent == "codex" else "cursor-agent"
         _print(f"Fleet could not find {command} on PATH.", error=True)
         return
 
+    executable, environment = harness
     args = []
     if session:
         args = ["resume", "--", session] if agent == "codex" else [f"--resume={session}"]
     try:
-        process = subprocess.Popen([executable, *args], cwd=root)
+        process = subprocess.Popen([executable, *args], cwd=root, env=environment)
     except OSError as error:
         _print(f"Fleet could not start {agent}: {error}", error=True)
         return
@@ -166,26 +168,70 @@ def native(root: Path, agent: str, session: str | None) -> None:
                 process.wait()
 
 
-def _find_harness(agent: str) -> str | None:
-    if agent == "codex":
-        return shutil.which("codex")
+def _find_harness(agent: str) -> tuple[str, dict[str, str]] | None:
+    if agent not in ("codex", "cursor"):
+        raise ValueError(f"Unknown harness: {agent}")
+    home = Path.home()
+    npm_prefix = os.environ.get("npm_config_prefix") or os.environ.get("NPM_CONFIG_PREFIX")
+    nvm = Path(os.environ.get("NVM_DIR") or home / ".nvm").expanduser()
+    nvm_bins = sorted(
+        (path for path in nvm.glob("versions/node/v*/bin") if re.fullmatch(r"v\d+(?:\.\d+)*", path.parent.name)),
+        key=lambda path: tuple(map(int, path.parent.name[1:].split("."))),
+        reverse=True,
+    )
+    # Noninteractive SSH and desktop launches can omit user bin directories.
+    # Use absolute PATH entries so lookup and the launched CLI agree after changing cwd.
+    inherited = [os.path.abspath(path) for path in os.get_exec_path() if path]
+    fallback = [
+        home / ".local/bin",
+        home / "bin",
+        *([Path(npm_prefix).expanduser() / "bin"] if npm_prefix else []),
+        home / ".npm-global/bin",
+        Path(os.environ.get("VOLTA_HOME") or home / ".volta").expanduser() / "bin",
+        Path(os.environ.get("BUN_INSTALL") or home / ".bun").expanduser() / "bin",
+        *nvm_bins,
+        Path("/opt/homebrew/bin"),
+        Path("/usr/local/bin"),
+        *map(Path, os.defpath.split(os.pathsep)),
+    ]
+    paths = list(dict.fromkeys([*inherited, *(str(path) for path in fallback if path.is_absolute())]))
+    search_path = os.pathsep.join(paths)
+    command = "codex" if agent == "codex" else "cursor-agent"
+    executable = shutil.which(command, path=search_path)
+    if executable is not None:
+        return executable, _harness_environment(executable, paths, inherited)
     if agent == "cursor":
-        return shutil.which("cursor-agent") or _cursor_agent_alias()
-    raise ValueError(f"Unknown harness: {agent}")
-
-
-def _cursor_agent_alias() -> str | None:
-    executable = shutil.which("agent")
-    if executable:
-        try:
-            result = subprocess.run(
-                [executable, "--help"], stdin=subprocess.DEVNULL, capture_output=True, timeout=5, check=False
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if result.returncode == 0 and b"Cursor Agent" in result.stdout and b"stream-json" in result.stdout:
-            return executable
+        deadline = monotonic() + 5
+        for directory in paths:
+            alias = shutil.which("agent", path=directory)
+            if alias is None:
+                continue
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            environment = _harness_environment(alias, paths, inherited)
+            if _is_cursor_alias(alias, environment, remaining):
+                return alias, environment
     return None
+
+
+def _harness_environment(executable: str, paths: list[str], inherited: list[str]) -> dict[str, str]:
+    # A fallback install can ship its interpreter and other tools in the same bin directory.
+    directory = os.path.dirname(executable)
+    if directory not in inherited:
+        paths = [directory, *(path for path in paths if path != directory)]
+    return dict(os.environ, PATH=os.pathsep.join(paths))
+
+
+def _is_cursor_alias(executable: str, environment: dict[str, str], timeout: float) -> bool:
+    try:
+        result = subprocess.run(
+            [executable, "--help"], stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and b"Cursor Agent" in result.stdout and b"stream-json" in result.stdout
 
 
 def _stop(process: subprocess.Popen) -> None:
@@ -330,7 +376,11 @@ class _Stream:
     def emit(self, kind: str, text: str, *, progress: bool = False, visible: bool = True) -> None:
         for credential in self.credentials:
             text = text.replace(credential, "[redacted]")
-        text = _preview(_clean(text).strip(), MAX_TOOL_PREVIEW)
+        limit = MAX_TOOL_PREVIEW
+        if kind == "result" and self.silent:
+            from fleet_jobs import MAX_RESULT_TEXT
+            limit = MAX_RESULT_TEXT
+        text = _preview(_clean(text).strip(), limit)
         if not text:
             return
         if self.silent:

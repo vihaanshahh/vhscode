@@ -29,6 +29,23 @@ HOSTS_SCHEMA = """
 """
 
 
+def workspace_root(raw):
+    if not isinstance(raw, str) or not raw.strip() or "\0" in raw:
+        raise ValueError("Choose a workspace folder on this machine.")
+    path = raw
+    for prefix in ("$HOME", "${HOME}"):
+        if path == prefix or path.startswith(prefix + "/"):
+            path = str(Path.home()) + path[len(prefix):]
+            break
+    try:
+        root = Path(path).expanduser().resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError, RuntimeError) as error:
+        raise ValueError(f"Workspace folder does not exist on this machine: {raw}. Choose an existing folder in workspace settings.") from error
+    if not root.is_dir():
+        raise ValueError(f"Choose a folder on this machine: {raw}")
+    return root
+
+
 def _state_dir():
     return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "vhscode/fleet"
 

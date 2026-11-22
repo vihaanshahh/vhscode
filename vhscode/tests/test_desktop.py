@@ -19,8 +19,11 @@ import sys
 import time
 
 name = Path(sys.argv[0]).name
-assert Path.cwd() == Path(os.environ["FLEET_TEST_REPO"])
 arguments = sys.argv[1:]
+if name == "agent" and arguments == ["--help"]:
+    print("Cursor Agent supports stream-json")
+    sys.exit()
+assert Path.cwd() == Path(os.environ["FLEET_TEST_REPO"])
 
 
 def emit(event_type, **fields):
@@ -48,7 +51,10 @@ if name == "codex" and arguments == ["app-server", "--listen", "stdio://"]:
     ], "nextCursor": None}}), flush=True)
     sys.exit()
 
-if name == "cursor-agent" and arguments == ["--list-models"]:
+if name in ("cursor-agent", "agent") and arguments == ["--list-models"]:
+    if error := os.environ.get("FLEET_TEST_CATALOG_ERROR"):
+        print(error, file=sys.stderr)
+        sys.exit(1)
     print("Available models\\n\\n\\x1b[36mfixture-cursor\\x1b[0m - Fixture Cursor (default)\\n\\nTip: use --model.")
     sys.exit()
 
@@ -58,7 +64,7 @@ if name == "codex":
     assert resumed or arguments == ["exec", "--json", "-"], arguments
     prompt = sys.stdin.read()
 else:
-    assert name == "cursor-agent", name
+    assert name in ("cursor-agent", "agent"), name
     session = "cursor-fixture"
     options = ["--print", "--output-format", "stream-json"]
     follow_up = ["--model=fixture-cursor", "--resume=" + session]
@@ -252,6 +258,37 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertEqual(settings, {"codex": {"model": "fixture-codex", "session": None}, "cursor": empty})
         self.success(self.request("set_model", agent="codex", model=None))
         self.assertEqual(self.success(self.request("workspace_settings"))["codex"], empty)
+
+    def test_user_bin_cli_and_child_interpreter_work_without_inherited_path_entries(self):
+        home = Path(self.environment["HOME"])
+        fixture_bin = self.root / "fixture bin"
+        npm_bin = home / ".npm-global/bin"
+        cursor_bin = home / ".local/bin"
+        node_bin = home / ".nvm/versions/node/v22.2.0/bin"
+        for directory in (npm_bin, cursor_bin, node_bin):
+            directory.mkdir(parents=True)
+        (fixture_bin / "codex").rename(npm_bin / "codex")
+        (fixture_bin / "cursor-agent").rename(cursor_bin / "agent")
+        (fixture_bin / "fleet-test-python").rename(node_bin / "fleet-test-python")
+        wrong_alias = fixture_bin / "agent"
+        wrong_alias.write_text("#!/bin/sh\necho 'Unrelated agent'\n", encoding="utf-8")
+        wrong_alias.chmod(0o700)
+
+        for agent in ("codex", "cursor"):
+            with self.subTest(agent=agent):
+                models = self.success(self.request("models", agent=agent))["models"]
+                self.assertEqual(models[0]["id"], f"fixture-{agent}")
+                row, _ = self.finished_run(agent, prompt="logout")
+                self.assertEqual(row["outcome"], f"{agent}-fixture initial completed.")
+
+    def test_cursor_catalog_reports_host_authentication_and_network_errors(self):
+        for error, expected in (
+            ("Error: Authentication required. Run 'agent login'.", "Sign in to Cursor on this host"),
+            ("Error: fetch failed (ENETUNREACH)", "could not reach its model catalog from this host"),
+        ):
+            with self.subTest(error=error):
+                self.environment["FLEET_TEST_CATALOG_ERROR"] = error
+                self.assertIn(expected, self.request("models", agent="cursor")["error"])
 
     def test_reset_keeps_finishing_old_session_from_returning(self):
         check = """

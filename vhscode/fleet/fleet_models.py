@@ -13,19 +13,38 @@ from time import monotonic
 
 
 AGENTS = ("codex", "cursor")
-OPERATIONS = {"workspace_settings", "set_model", "reset_session", "models"}
+OPERATIONS = {"workspace_settings", "workspace_agents", "set_model", "reset_session", "models"}
 CATALOG_TIMEOUT = 8
 MAX_CATALOG_BYTES = 1024 * 1024
 MAX_MODELS = 500
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CURSOR_MODEL = re.compile(r"(?P<id>[A-Za-z0-9][A-Za-z0-9_./:+@~\-]*)(?:\s+-\s+(?P<label>.+))?")
 CURSOR_STATUS = re.compile(r"\s+\((?:current|default)(?:, (?:current|default))?\)$")
+CURSOR_AUTH_ERROR = re.compile(r"authentication required|not authenticated|please log in|unauthorized", re.I)
+CURSOR_NETWORK_ERROR = re.compile(
+    r"ENETUNREACH|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|"
+    r"failed to (?:connect|fetch)|network (?:error|unavailable)",
+    re.I,
+)
 
 
 def _agent(agent):
     if agent not in AGENTS:
         raise ValueError("Choose Codex or Cursor")
     return agent
+
+
+def agent_lane(value):
+    if type(value) is not int or not 1 <= value <= 4:
+        raise ValueError("Choose an agent instance between 1 and 4.")
+    return value
+
+
+def _session_table(repo, agent, lane):
+    key = _key(repo, agent)
+    if agent_lane(lane) == 1:
+        return "workspace_settings", ("repo", "agent"), key
+    return "additional_sessions", ("repo", "agent", "lane"), (*key, lane)
 
 
 def _database():
@@ -47,6 +66,13 @@ def _database():
                  PRIMARY KEY(repo, agent)
                )"""
         )
+        database.execute(
+            """CREATE TABLE IF NOT EXISTS additional_sessions (
+                 repo TEXT NOT NULL, agent TEXT NOT NULL, lane INTEGER NOT NULL,
+                 session TEXT, generation INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(repo, agent, lane)
+               )"""
+        )
     except Exception:
         database.close()
         raise
@@ -57,37 +83,125 @@ def _key(repo, agent):
     return str(Path(repo).expanduser().resolve()), _agent(agent)
 
 
-def get(repo, agent):
+def get(repo, agent, lane=1):
     """Return preferences and the generation a run must present when remembering a session."""
     with closing(_database()) as database:
         row = database.execute(
             "SELECT model, session, generation FROM workspace_settings WHERE repo = ? AND agent = ?",
             _key(repo, agent),
         ).fetchone()
-    model, session, generation = row or (None, None, 0)
+        model, session, generation = row or (None, None, 0)
+        if agent_lane(lane) != 1:
+            session, generation = database.execute(
+                "SELECT session, generation FROM additional_sessions WHERE repo=? AND agent=? AND lane=?",
+                (*_key(repo, agent), lane),
+            ).fetchone() or (None, 0)
     return {"model": model, "session": session, "generation": generation}
 
 
-def remember(repo, agent, session, generation):
+def remember(repo, agent, session, generation, lane=1):
     """Remember a completed session only if no reset happened after its submission."""
     if not isinstance(session, str) or not 1 <= len(session) <= 512 or not session.isprintable():
         return False
-    key = _key(repo, agent)
+    table, columns, key = _session_table(repo, agent, lane)
+    names = ", ".join(columns)
     with closing(_database()) as database, database:
+        database.execute(f"INSERT OR IGNORE INTO {table}({names}) VALUES ({','.join('?' for _ in key)})", key)
         result = database.execute(
-            """INSERT INTO workspace_settings(repo, agent, session)
-               SELECT ?, ?, ? WHERE ? = 0 OR EXISTS (
-                 SELECT 1 FROM workspace_settings WHERE repo = ? AND agent = ?
-               )
-               ON CONFLICT(repo, agent) DO UPDATE SET session = excluded.session
-               WHERE workspace_settings.generation = ?""",
-            (*key, session, generation, *key, generation),
+            f"UPDATE {table} SET session=? WHERE " + " AND ".join(f"{name}=?" for name in columns) + " AND generation=?",
+            (session, *key, generation),
         )
         return result.rowcount == 1
 
 
+def _latest_instances(roots):
+    from fleet_jobs import RUNS_VIEW, _connect, _reap_manual
+
+    if not roots:
+        return {}
+    _reap_manual()
+    with _connect() as db:
+        records = db.execute(
+            RUNS_VIEW + f" WHERE detached=1 AND repo IN ({','.join('?' for _ in roots)}) ORDER BY started DESC, id DESC",
+            tuple(roots),
+        )
+        latest = {}
+        for row in records:
+            latest.setdefault((row["repo"], row["agent"], row["lane"]), dict(row))
+    return latest
+
+
+def sidebar_agents(repos):
+    from fleet_hosts import workspace_root
+
+    if not isinstance(repos, list) or len(repos) > 256 or not all(isinstance(path, str) for path in repos):
+        raise ValueError("Choose up to 256 workspace folders.")
+    mapped = {}
+    workspaces = {repo: [] for repo in repos}
+    for repo in workspaces:
+        try:
+            mapped[repo] = str(workspace_root(repo))
+        except (ValueError, OSError):
+            continue
+    roots = set(mapped.values())
+    if not roots:
+        return {"workspaces": workspaces}
+    latest = _latest_instances(roots)
+    placeholders = ','.join('?' for _ in roots)
+    with closing(_database()) as settings:
+        generations = {
+            (root, agent, lane): gen for root, agent, lane, gen in settings.execute(
+                f"SELECT repo, agent, 1, generation FROM workspace_settings WHERE repo IN ({placeholders}) "
+                f"UNION ALL SELECT repo, agent, lane, generation FROM additional_sessions WHERE repo IN ({placeholders})",
+                (*roots, *roots),
+            )
+        }
+    from fleet_jobs import _connect, _title
+    with _connect() as db:
+        schedules = db.execute(
+            f"""SELECT s.repo,s.id AS schedule,s.agent,s.prompt,s.enabled,
+                    EXISTS(SELECT 1 FROM runs WHERE schedule_id=s.id AND status='running') AS running
+                FROM schedules s WHERE repo IN ({','.join('?' for _ in roots)}) ORDER BY s.rowid""",
+            tuple(roots),
+        ).fetchall()
+    for repo, root in mapped.items():
+        rows = []
+        for key, run in sorted(latest.items()):
+            if key[0] != root:
+                continue
+            row = {field: run[field] for field in ("agent", "lane", "status", "title")}
+            if run["generation"] != generations.get(key, 0) and run["status"] != "running":
+                row.update(status="ready", title="")
+            rows.append(row)
+        rows.extend({
+            "agent": row["agent"], "lane": 0, "schedule": row["schedule"], "title": _title(row["prompt"]),
+            "status": "running" if row["running"] else ("scheduled" if row["enabled"] else "paused"),
+        } for row in schedules if row["repo"] == root)
+        workspaces[repo] = rows
+    return {"workspaces": workspaces}
+
+
+def _instances(repo):
+    root = str(repo)
+    latest = _latest_instances([root])
+    keys = {(agent, 1) for agent in AGENTS}
+    keys.update((agent, lane) for _, agent, lane in latest)
+    with closing(_database()) as db:
+        keys.update(db.execute("SELECT agent, lane FROM additional_sessions WHERE repo=?", (root,)))
+    instances = []
+    for agent, lane in sorted(keys):
+        settings = get(repo, agent, lane)
+        run = latest.get((root, agent, lane))
+        if run and run["generation"] != settings["generation"]:
+            run = None
+        instances.append({"agent": agent, "lane": lane, "session": settings["session"], "run": run})
+    return {"instances": instances}
+
+
 def workspace(repo, request):
     op = request.get("op")
+    if op == "workspace_agents":
+        return _instances(repo)
     if op == "workspace_settings":
         return {
             agent: {key: value for key, value in get(repo, agent).items() if key != "generation"}
@@ -113,10 +227,12 @@ def workspace(repo, request):
             )
         return {}
     if op == "reset_session":
+        table, columns, key = _session_table(repo, agent, request.get("lane", 1))
+        names = ", ".join(columns)
         with closing(_database()) as database, database:
             database.execute(
-                """INSERT INTO workspace_settings(repo, agent, generation) VALUES (?, ?, 1)
-                   ON CONFLICT(repo, agent) DO UPDATE SET session = NULL, generation = generation + 1""",
+                f"INSERT INTO {table}({names}, generation) VALUES ({','.join('?' for _ in key)}, 1) "
+                f"ON CONFLICT({names}) DO UPDATE SET session=NULL, generation=generation+1",
                 key,
             )
         return {}
@@ -124,15 +240,14 @@ def workspace(repo, request):
 
 
 @contextmanager
-def _agent_process(executable, arguments, repo, *, input_required):
-    environment = dict(os.environ, NO_COLOR="1", FORCE_COLOR="0")
+def _agent_process(executable, arguments, repo, environment, *, input_required):
     process = subprocess.Popen(
         [executable, *arguments],
         cwd=repo,
         stdin=subprocess.PIPE if input_required else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=environment,
+        stderr=subprocess.DEVNULL if input_required else subprocess.PIPE,
+        env=dict(environment, NO_COLOR="1", FORCE_COLOR="0"),
         bufsize=0,
         start_new_session=True,
     )
@@ -155,29 +270,37 @@ def _agent_process(executable, arguments, repo, *, input_required):
             pass
         process.wait()
         process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
-def _lines(stream, deadline):
+def _lines(process, deadline):
     total = 0
-    buffer = bytearray()
     with DefaultSelector() as selector:
-        selector.register(stream, EVENT_READ)
-        while True:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                selector.register(stream, EVENT_READ, bytearray())
+        while selector.get_map():
             remaining = deadline - monotonic()
-            if remaining <= 0 or not selector.select(remaining):
+            ready = selector.select(remaining) if remaining > 0 else []
+            if not ready:
                 raise TimeoutError("The model list did not respond in time.")
-            chunk = os.read(stream.fileno(), min(32 * 1024, MAX_CATALOG_BYTES + 1 - total))
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_CATALOG_BYTES:
-                raise ValueError("The model list exceeded Fleet's output limit.")
-            buffer.extend(chunk)
-            lines = buffer.split(b"\n")
-            buffer = lines.pop()
-            yield from lines
-        if buffer:
-            yield bytes(buffer)
+            for key, _ in ready:
+                diagnostic = key.fileobj is process.stderr
+                chunk = os.read(key.fd, min(32 * 1024, MAX_CATALOG_BYTES + 1 - total))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    if key.data:
+                        yield diagnostic, key.data
+                    continue
+                total += len(chunk)
+                if total > MAX_CATALOG_BYTES:
+                    raise ValueError("The model list exceeded Fleet's output limit.")
+                key.data.extend(chunk)
+                lines = key.data.split(b"\n")
+                key.data[:] = lines.pop()
+                for line in lines:
+                    yield diagnostic, line
 
 
 def _codex_models(process, output, deadline):
@@ -200,7 +323,7 @@ def _codex_models(process, output, deadline):
                     continue
 
     def response(identifier):
-        for line in output:
+        for _, line in output:
             try:
                 reply = json.loads(line)
             except (ValueError, RecursionError):
@@ -247,19 +370,28 @@ def _codex_models(process, output, deadline):
 def _cursor_models(process, output, deadline):
     models = []
     found_header = False
-    for raw in output:
+    authentication_error = network_error = False
+    for diagnostic, raw in output:
         line = ANSI.sub("", raw.decode("utf-8", errors="replace")).strip()
+        if diagnostic or line.lower().startswith("error:"):
+            authentication_error |= bool(CURSOR_AUTH_ERROR.search(line))
+            network_error |= bool(CURSOR_NETWORK_ERROR.search(line))
+            continue
         if line == "Available models":
             found_header = True
             continue
         if line.startswith("Tip:"):
-            break
+            found_header = False
         if not found_header:
             continue
         match = CURSOR_MODEL.fullmatch(CURSOR_STATUS.sub("", line))
         if match and len(models) < MAX_MODELS:
             models.append((match["id"], match["label"]))
     if process.wait(timeout=max(0.01, deadline - monotonic())) != 0:
+        if authentication_error:
+            raise ValueError("Sign in to Cursor on this host with `cursor-agent login` or `agent login` to list models.")
+        if network_error:
+            raise ValueError("Cursor could not reach its model catalog from this host.")
         raise ValueError("Cursor could not list available models.")
     return models
 
@@ -267,15 +399,16 @@ def _cursor_models(process, output, deadline):
 def _models(repo, agent):
     from fleet_harness import _find_harness
 
-    executable = _find_harness(agent)
-    if executable is None:
+    harness = _find_harness(agent)
+    if harness is None:
         raise ValueError(f"The {agent} CLI is unavailable on this host.")
+    executable, environment = harness
     codex = agent == "codex"
     arguments = ["app-server", "--listen", "stdio://"] if codex else ["--list-models"]
     deadline = monotonic() + CATALOG_TIMEOUT
     try:
-        with _agent_process(executable, arguments, repo, input_required=codex) as process:
-            output = _lines(process.stdout, deadline)
+        with _agent_process(executable, arguments, repo, environment, input_required=codex) as process:
+            output = _lines(process, deadline)
             try:
                 candidates = _codex_models(process, output, deadline) if codex else _cursor_models(process, output, deadline)
             finally:

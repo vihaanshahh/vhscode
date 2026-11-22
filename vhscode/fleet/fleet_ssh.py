@@ -128,7 +128,7 @@ def query(host, payload):
     args = [*ssh, "-T", "--", host, check + "; " + remote_command(["--rpc"])]
     body = json.dumps(payload, ensure_ascii=False).encode()
     for attempt in range(2):
-        result = subprocess.run(args, input=body, capture_output=True, timeout=10)
+        result = subprocess.run(args, input=body, capture_output=True, timeout=20 if payload.get("op") == "models" else 10)
         if result.returncode != 72 or attempt:
             break
         result = install(host, ssh, True)
