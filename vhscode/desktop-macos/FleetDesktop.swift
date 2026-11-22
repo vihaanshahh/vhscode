@@ -84,7 +84,15 @@ enum FleetBridge {
 
             """.write(to: script, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
-            _ = try await workspace.open([script], withApplicationAt: terminal, configuration: .init())
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                workspace.open([script], withApplicationAt: terminal, configuration: .init()) { _, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                        return
+                    }
+                    continuation.resume()
+                }
+            }
         } catch {
             try? FileManager.default.removeItem(at: directory)
             throw error
