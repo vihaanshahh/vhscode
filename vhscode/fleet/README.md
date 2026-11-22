@@ -1,5 +1,13 @@
 # Fleet workbench
 
+### Installed Mac app
+
+Open **Fleet Workbench** in Applications. Press **2** for Hosts, select the local Mac, then press **w** to open its repository. Type `/files` to browse and edit. Edit a host with **e** to choose a different repository directory.
+
+The Intel Mac app includes the Fleet runtime, Git, tmux, Codex, Cursor, and the local MobileBERT model. The offline classifier is ready when you enable it. Local agent turns use your own provider login. Remote agents execute on their respective SSH hosts.
+
+### Running from a source checkout
+
 Use the fork's launcher from this checkout. Fleet runs on macOS or Linux with Python 3.10+ and a terminal. Install and authenticate the Codex or Cursor CLI on each machine where you want that agent to work.
 
 ```sh

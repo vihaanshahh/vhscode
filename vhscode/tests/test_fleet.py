@@ -20,9 +20,10 @@ class FleetTest(unittest.TestCase):
         self.repo.mkdir()
         self.env = dict(os.environ, XDG_STATE_HOME=str(self.root / "state"),
                         PATH=f"{self.root}:{os.environ['PATH']}")
+        (self.root / "fleet-test-python").symlink_to(sys.executable)
         self.agent = self.root / "codex"
         self.agent.write_text(
-            f"#!{sys.executable}\n"
+            "#!/usr/bin/env fleet-test-python\n"
             "import json, sys\n"
             "prompt = sys.stdin.read()\n"
             "print(json.dumps(dict(type='thread.started', thread_id='conversation')))\n"
@@ -54,7 +55,7 @@ class FleetTest(unittest.TestCase):
 
     def test_risk_view_keeps_breakage_visible_after_a_successful_turn(self):
         self.agent.write_text(
-            f"#!{sys.executable}\n"
+            "#!/usr/bin/env fleet-test-python\n"
             "import json\n"
             "for text in ['The API has a breaking change.', 'Review complete.']:\n"
             "    print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':text}}))\n"

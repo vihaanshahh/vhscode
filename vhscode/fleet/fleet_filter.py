@@ -41,6 +41,11 @@ def cache_dir():
     return root / "opencode" / "fleet-filter" / MODEL_REVISION
 
 
+def _bundle_resources():
+    directory = Path(__file__).resolve().parent.parent
+    return directory if directory.name == "Resources" else None
+
+
 class ProgressFilter:
     """A True decision suppresses a caller-selected transient progress event."""
 
@@ -129,14 +134,19 @@ class _Worker:
     """Own the subprocess and its private byte stream from the supervisor thread."""
 
     def __init__(self):
-        cache = cache_dir()
-        if (cache / "ready").read_text(encoding="utf-8") != RUNTIME_VERSION:
-            raise ValueError("classifier setup is required")
+        bundle = _bundle_resources()
+        if bundle is not None:
+            python = bundle / "python" / "bin" / "python3"
+        else:
+            cache = cache_dir()
+            if (cache / "ready").read_text(encoding="utf-8") != RUNTIME_VERSION:
+                raise ValueError("classifier setup is required")
+            python = cache / "venv" / "bin" / "python"
         parent, child = socket.socketpair()
         try:
             with child:
                 self.process = subprocess.Popen(
-                    [str(cache / "venv" / "bin" / "python"), str(Path(__file__).resolve()), "worker"],
+                    [str(python), "-I", "-B", str(Path(__file__).resolve()), "worker"],
                     stdin=child,
                     stdout=child,
                     stderr=subprocess.DEVNULL,
@@ -184,7 +194,7 @@ def _load_model():
     import onnxruntime
     from tokenizers import Tokenizer
 
-    model = cache_dir() / "model"
+    model = (_bundle_resources() or cache_dir()) / "model"
     config = json.loads((model / "config.json").read_text(encoding="utf-8"))
     entailment = config["label2id"]["ENTAILMENT"]
     contradiction = config["label2id"]["CONTRADICTION"]
@@ -230,6 +240,15 @@ def _sha256(path):
 
 
 def _setup():
+    bundle = _bundle_resources()
+    if bundle is not None:
+        for name, expected_sha in MODEL_FILES.items():
+            path = bundle / "model" / name
+            if not path.is_file() or _sha256(path) != expected_sha:
+                raise SystemExit(f"The bundled classifier has a missing or damaged file: {name}")
+        _smoke()
+        return
+
     import fcntl
     from urllib.request import urlopen
 
