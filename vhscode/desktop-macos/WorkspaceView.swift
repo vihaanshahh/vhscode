@@ -844,7 +844,6 @@ private struct WorkspacePane: View {
     @State private var terminalError: String?
     @AppStorage("FleetExplorerVisible") private var explorerVisible = true
     @AppStorage("FleetCodexApprovalCards") private var codexApprovalCards = true
-    private let accent = Color(nsColor: .systemTeal)
 
     var body: some View {
         VStack(spacing: 0) {
@@ -977,22 +976,23 @@ private struct WorkspacePane: View {
     }
 
     private var header: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "point.3.connected.trianglepath.dotted")
-                .font(.system(size: 20, weight: .medium))
-                .foregroundStyle(accent)
-                .frame(width: 34, height: 34)
-                .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 9))
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(host.label).font(.headline)
+        HStack(spacing: 9) {
+            HStack(spacing: 7) {
+                Image(systemName: host.ssh.isEmpty ? "folder" : "server.rack")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(FleetPalette.accent)
+                    .accessibilityHidden(true)
+                Text(host.label)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
                 Text(host.repo)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            Spacer()
+            .help(host.repo)
+            Spacer(minLength: 0)
             if showsFiles {
                 Button { explorerVisible.toggle() } label: {
                     Image(systemName: explorerVisible ? "sidebar.left" : "sidebar.leading")
@@ -1007,7 +1007,7 @@ private struct WorkspacePane: View {
                 Button(action: onOpenFiles) { Label("Open Files", systemImage: "folder") }
             }
             Button { panel = .agentName(nil) } label: {
-                Label("New Agent", systemImage: "plus").font(.callout.weight(.semibold))
+                Label("New Agent", systemImage: "plus").font(.subheadline.weight(.semibold))
             }
             .buttonStyle(.bordered)
             .fixedSize()
@@ -1015,8 +1015,9 @@ private struct WorkspacePane: View {
             .accessibilityLabel("New Agent")
             .disabled(!model.agentsLoaded || model.changingAgents)
         }
-        .padding(.horizontal, 15)
-        .padding(.vertical, 10)
+        .controlSize(.small)
+        .frame(minHeight: 32)
+        .padding(.horizontal, 12)
     }
 
     private var browser: some View {
@@ -1083,7 +1084,7 @@ private struct WorkspacePane: View {
             if let notice = model.notice {
                 Divider()
                 HStack(alignment: .firstTextBaseline) {
-                    Text(notice).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    Text(notice).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
                     Spacer()
                     Button { model.notice = nil } label: { Image(systemName: "xmark") }
                         .buttonStyle(.plain)
@@ -1124,7 +1125,7 @@ private struct WorkspacePane: View {
             VStack(alignment: .leading, spacing: 13) {
                 Image(systemName: "folder.badge.gearshape")
                     .font(.system(size: 36, weight: .light))
-                    .foregroundStyle(accent)
+                    .foregroundStyle(FleetPalette.accent)
                 Text((host.repo as NSString).lastPathComponent.isEmpty ? host.label : (host.repo as NSString).lastPathComponent)
                     .font(.system(.largeTitle, design: .rounded).weight(.semibold))
                 Text("Open a file from the project tree or send a prompt from the agent panel.")
@@ -1267,7 +1268,7 @@ private struct WorkspacePane: View {
                 if agent.harness == "codex", yolo.wrappedValue {
                     Label("YOLO · Full access", systemImage: "exclamationmark.shield")
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(FleetPalette.warning)
                         .help("Codex can run commands on \(host.label) without sandboxing or approval prompts.")
                 }
                 if !model.tagPaths.isEmpty {
@@ -1296,7 +1297,7 @@ private struct WorkspacePane: View {
                                 }
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 4)
-                                .background(accent.opacity(0.12), in: Capsule())
+                                .background(FleetPalette.accent.opacity(0.12), in: Capsule())
                             }
                         }
                     }
@@ -1329,7 +1330,7 @@ private struct WorkspacePane: View {
                             .disabled(model.cursorSigningIn)
                             .help("Use the browser on this Mac to sign in on " + host.label)
                     } else {
-                        Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                        Text(error).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
                     }
                 }
                 if agent.harness == "cursor", let message = model.cursorLoginMessage {
@@ -1339,10 +1340,10 @@ private struct WorkspacePane: View {
                     }
                 }
                 if let error = model.composerError {
-                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    Text(error).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
                 }
                 if agent.harness == "cursor", let error = model.cursorTrustError {
-                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    Text(error).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
                 }
             }
             .padding(11)
@@ -1375,7 +1376,7 @@ private struct WorkspacePane: View {
                 Label("Send", systemImage: "arrow.up").labelStyle(.iconOnly)
             }
             .buttonStyle(.borderedProminent)
-            .tint(accent)
+            .tint(FleetPalette.accent)
             .fixedSize()
             .disabled(!model.canSend && !isCommand)
             .keyboardShortcut(.return, modifiers: .command)
@@ -1528,7 +1529,7 @@ private struct AgentNamePanel: View {
             TextField("Name", text: $name, prompt: Text(agent?.sidebarLane.defaultLabel ?? "Optional"))
                 .focused($nameFocused)
                 .disabled(saving)
-            if let error { Text(error).font(.caption).foregroundStyle(.orange) }
+            if let error { Text(error).font(.caption).foregroundStyle(FleetPalette.warning) }
             HStack {
                 if saving { ProgressView().controlSize(.small) }
                 Spacer()
@@ -1660,7 +1661,7 @@ private struct ResumeSessionPanel: View {
             if loading {
                 ProgressView("Loading sessions…").controlSize(.small)
             } else if let listError {
-                Text(listError).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                Text(listError).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
                 Button("Retry") { Task { await load() } }
                     .disabled(resuming)
             } else if options.isEmpty {
@@ -1698,7 +1699,7 @@ private struct ResumeSessionPanel: View {
                 .disabled(resuming)
             }
             if let resumeError {
-                Text(resumeError).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                Text(resumeError).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
             }
             HStack {
                 Spacer()
@@ -1925,7 +1926,7 @@ private struct QuickOpenPanel: View {
                                 .id(path)
                         }
                         if files.isEmpty {
-                            Text(message).font(.callout).foregroundStyle(response?.error != nil ? .orange : .secondary)
+                            Text(message).font(.callout).foregroundStyle(response?.error != nil ? FleetPalette.warning : .secondary)
                                 .padding(8)
                         }
                     }
@@ -2057,7 +2058,7 @@ private struct FileBranch: View {
                 ProgressView().controlSize(.small).padding(.leading, indent)
             } else if let error = page.error {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(error).font(.caption).foregroundStyle(.orange)
+                    Text(error).font(.caption).foregroundStyle(FleetPalette.warning)
                     Button("Retry") { Task { await model.loadFolder(directory, direction: page.retry) } }
                 }
                 .padding(.horizontal, 10).padding(.leading, indent)
@@ -2108,7 +2109,7 @@ private struct FileBranch: View {
                           ? (model.expanded.contains(entry.path) ? "chevron.down" : "chevron.right")
                           : "doc")
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(entry.isDirectory ? Color(nsColor: .systemTeal) : .secondary)
+                        .foregroundStyle(entry.isDirectory ? FleetPalette.accent : .secondary)
                         .frame(width: 12)
                     Text(entry.name).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 0)
@@ -2122,7 +2123,7 @@ private struct FileBranch: View {
                 Button { model.toggleTag(entry.path) } label: {
                     Image(systemName: tagged ? "paperclip.circle.fill" : "paperclip")
                         .font(.system(size: 11))
-                        .foregroundStyle(tagged ? Color(nsColor: .systemTeal) : .secondary)
+                        .foregroundStyle(tagged ? FleetPalette.accent : .secondary)
                         .frame(width: 20, height: 22)
                 }
                 .buttonStyle(.plain)
@@ -2132,7 +2133,7 @@ private struct FileBranch: View {
         }
         .padding(.leading, indent)
         .padding(.trailing, 4)
-        .background(selected ? Color(nsColor: .systemTeal).opacity(0.16) : .clear,
+        .background(selected ? FleetPalette.accent.opacity(0.16) : .clear,
                     in: RoundedRectangle(cornerRadius: 5))
         .padding(.horizontal, 4)
     }
@@ -2150,7 +2151,7 @@ private struct FileTab: View {
             Button(action: activate) {
                 HStack(spacing: 5) {
                     if buffer.isDirty {
-                        Circle().fill(Color(nsColor: .systemTeal)).frame(width: 5, height: 5)
+                        Circle().fill(FleetPalette.accent).frame(width: 5, height: 5)
                             .accessibilityHidden(true)
                     }
                     Text(buffer.name).font(.caption).lineLimit(1)
@@ -2168,7 +2169,7 @@ private struct FileTab: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
-        .background(selected ? Color(nsColor: .systemTeal).opacity(0.14) : .clear,
+        .background(selected ? FleetPalette.accent.opacity(0.14) : .clear,
                     in: RoundedRectangle(cornerRadius: 5))
     }
 }
@@ -2184,7 +2185,7 @@ private struct SourceEditor: View {
                 VStack(alignment: .leading, spacing: 7) {
                     Label("This file changed on disk. Your edits are intact.", systemImage: "exclamationmark.triangle")
                         .font(.caption)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(FleetPalette.warning)
                     HStack {
                         Button("Reload and Discard Edits") { Task { await model.reload(buffer) } }
                         Button("Save My Version") { Task { await model.save(buffer, replace: true) } }
@@ -2245,7 +2246,7 @@ private struct TurnCard: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(8)
-                .background(Color(nsColor: .systemTeal).opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
+                .background(FleetPalette.accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
             HStack(spacing: 6) {
                 if turn.isActive { ProgressView().controlSize(.small) }
                 Text(turn.status.capitalized).font(.caption.weight(.semibold))
@@ -2259,7 +2260,7 @@ private struct TurnCard: View {
                 HStack(alignment: .top) {
                     Image(systemName: "exclamationmark.triangle").accessibilityHidden(true)
                     AgentMarkdown(source: turn.risk).equatable()
-                }.foregroundStyle(.orange)
+                }.foregroundStyle(FleetPalette.warning)
             }
             if turn.reporting != "risks", !turn.outcome.isEmpty,
                !turn.events.contains(where: { $0.kind == "result" || $0.text == turn.outcome }) {
@@ -2272,11 +2273,11 @@ private struct TurnCard: View {
                     }
                     if AgentMarkdown.rendersEvent(event.kind) {
                         AgentMarkdown(source: event.text).equatable()
-                            .foregroundStyle(event.kind == "error" || event.kind == "risk" ? .orange : .primary)
+                            .foregroundStyle(event.kind == "error" || event.kind == "risk" ? FleetPalette.warning : .primary)
                     } else {
                         Text(event.text)
                             .font(.caption)
-                            .foregroundStyle(event.kind == "error" ? .orange : .primary)
+                            .foregroundStyle(event.kind == "error" ? FleetPalette.warning : .primary)
                             .textSelection(.enabled)
                     }
                 }
@@ -2302,8 +2303,8 @@ private struct TurnCard: View {
                 }
                 .padding(9)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.orange.opacity(0.35)))
+                .background(FleetPalette.warning.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(FleetPalette.warning.opacity(0.35)))
             }
             if let trustWorkspace {
                 Button("Trust Workspace for Cursor…", action: trustWorkspace)

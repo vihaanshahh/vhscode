@@ -2,8 +2,6 @@ import SwiftUI
 
 private let panel = Color(red: 0.105, green: 0.117, blue: 0.133)
 private let divider = Color.white.opacity(0.09)
-private let teal = Color(red: 0.43, green: 0.82, blue: 0.75)
-private let amber = Color(red: 0.91, green: 0.71, blue: 0.44)
 
 struct FleetActivityAgent: Identifiable {
     let host: FleetHost
@@ -262,15 +260,15 @@ struct FleetOverview: View {
     private var metrics: some View {
         HStack(spacing: 9) {
             if schedulesOnly {
-                metric("Enabled", schedules.filter(\.enabled).count, icon: "clock", color: teal)
+                metric("Enabled", schedules.filter(\.enabled).count, icon: "clock", color: FleetPalette.accent)
                 metric("Paused", schedules.filter { !$0.enabled }.count, icon: "pause", color: .secondary)
             } else if risksOnly {
-                metric("Flagged runs", runs.count, icon: "exclamationmark.triangle", color: amber)
-                metric("Failed", runs.filter { $0.status == "failed" }.count, icon: "xmark.circle", color: .red)
+                metric("Flagged runs", runs.count, icon: "exclamationmark.triangle", color: FleetPalette.warning)
+                metric("Failed", runs.filter { $0.status == "failed" }.count, icon: "xmark.circle", color: FleetPalette.failure)
             } else {
-                metric("Running", allRuns.filter { $0.status == "running" }.count, icon: "bolt", color: teal)
+                metric("Running", allRuns.filter { $0.status == "running" }.count, icon: "bolt", color: FleetPalette.accent)
                 metric("Completed", allRuns.filter { $0.status == "completed" }.count, icon: "checkmark.circle", color: .secondary)
-                metric("Flagged", allRuns.filter(\.hasRisk).count, icon: "exclamationmark.triangle", color: amber)
+                metric("Flagged", allRuns.filter(\.hasRisk).count, icon: "exclamationmark.triangle", color: FleetPalette.warning)
             }
         }
     }
@@ -305,7 +303,7 @@ struct FleetOverview: View {
                       systemImage: "wifi.exclamationmark")
             }
             .font(.system(size: 12))
-            .foregroundStyle(amber)
+            .foregroundStyle(FleetPalette.warning)
             .padding(10)
             .fleetPanel()
         }
@@ -336,7 +334,7 @@ struct FleetOverview: View {
                                     metadata: "\(row.host.label) · \(displayAgent(row.agent)) · every \(row.minutes) min",
                                     note: row.repository,
                                     status: row.enabled ? "Enabled" : "Paused",
-                                    color: row.enabled ? teal : .secondary,
+                                    color: row.enabled ? FleetPalette.accent : .secondary,
                                     active: selectedSchedule?.id == row.id
                                 ) { scheduleSelection = row.id }
                             }
@@ -404,7 +402,7 @@ struct FleetOverview: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 9)
-            .background(active ? teal.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
+            .background(active ? FleetPalette.accent.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -453,13 +451,13 @@ struct FleetOverview: View {
                     let diagnostic = row.status == "failed" ? runEvents.last { $0.kind == "error" } : nil
                     let planEvent = runEvents.last { $0.kind == "plan" && !row.action.isEmpty && $0.text.hasPrefix(row.action) }
                     if !row.risk.isEmpty && !(showEvents && riskEvent != nil) {
-                        field("Risk", riskEvent?.text ?? row.risk, color: amber, markdown: true)
+                        field("Risk", riskEvent?.text ?? row.risk, color: FleetPalette.warning, markdown: true)
                     }
                     let outcomeEvent = diagnostic ?? resultEvent ?? planEvent
                     let outcome = outcomeEvent?.text ?? (row.outcome.isEmpty ? row.action : row.outcome)
                     if !outcome.isEmpty && !(showEvents && outcomeEvent != nil) {
                         field(row.status == "running" ? "Current action" : "Outcome", outcome,
-                              color: diagnostic == nil ? .primary : amber,
+                              color: diagnostic == nil ? .primary : FleetPalette.warning,
                               markdown: outcomeEvent != nil || !row.outcome.isEmpty || outcome.hasPrefix("### Plan\n"))
                     }
                     DisclosureGroup("Event log", isExpanded: $showEvents) {
@@ -491,7 +489,7 @@ struct FleetOverview: View {
             if loadingEvents {
                 ProgressView().controlSize(.small).accessibilityLabel("Loading events")
             } else if let eventError {
-                Text(eventError).foregroundStyle(amber)
+                Text(eventError).foregroundStyle(FleetPalette.warning)
                 Button("Retry") { Task { await loadEvents() } }
             } else if eventsRunID != row.id || events.isEmpty {
                 Text("No events recorded.").foregroundStyle(.secondary)
@@ -503,7 +501,7 @@ struct FleetOverview: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
                         Text(event.kind.capitalized)
-                            .foregroundStyle(event.kind == "risk" || event.kind == "error" ? amber : teal)
+                            .foregroundStyle(event.kind == "risk" || event.kind == "error" ? FleetPalette.warning : FleetPalette.accent)
                         Spacer()
                         if let date = event.date {
                             Text(date.formatted(date: .omitted, time: .shortened)).foregroundStyle(.secondary)
@@ -532,7 +530,7 @@ struct FleetOverview: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 13) {
                     Text(row.title).font(.system(size: 15, weight: .semibold)).lineLimit(3)
-                    statusPill(row.enabled ? "Enabled" : "Paused", color: row.enabled ? teal : .secondary)
+                    statusPill(row.enabled ? "Enabled" : "Paused", color: row.enabled ? FleetPalette.accent : .secondary)
                     field("Host", row.host.label)
                     field("Repository", row.repository, monospaced: true)
                     field("Agent", displayAgent(row.agent))
@@ -581,7 +579,7 @@ struct FleetOverview: View {
 
     private func empty(_ title: String, _ description: String, icon: String) -> some View {
         VStack(spacing: 7) {
-            Image(systemName: icon).font(.system(size: 24)).foregroundStyle(teal.opacity(0.7))
+            Image(systemName: icon).font(.system(size: 24)).foregroundStyle(FleetPalette.accent.opacity(0.7))
             Text(title).font(.system(size: 13, weight: .semibold))
             if !description.isEmpty {
                 Text(description).font(.system(size: 12)).foregroundStyle(.secondary)
@@ -604,9 +602,9 @@ struct FleetOverview: View {
 
     private func statusColor(_ status: String) -> Color {
         switch status {
-        case "running": teal
-        case "failed": .red
-        case "cancelled": amber
+        case "running": FleetPalette.accent
+        case "failed": FleetPalette.failure
+        case "cancelled": FleetPalette.warning
         default: .secondary
         }
     }
@@ -780,7 +778,7 @@ private struct ScheduleEditor: View {
                             .accessibilityLabel("Interval in minutes")
                         Text("minutes").font(.system(size: 12)).foregroundStyle(.secondary)
                         if interval == nil {
-                            Text("Enter 1–525,600 minutes.").font(.system(size: 11)).foregroundStyle(amber)
+                            Text("Enter 1–525,600 minutes.").font(.system(size: 11)).foregroundStyle(FleetPalette.warning)
                         }
                     }
                 }
@@ -798,7 +796,7 @@ private struct ScheduleEditor: View {
             if let error {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .font(.system(size: 12))
-                    .foregroundStyle(amber)
+                    .foregroundStyle(FleetPalette.warning)
             }
             HStack(spacing: 10) {
                 Spacer()

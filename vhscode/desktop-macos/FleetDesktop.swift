@@ -223,7 +223,12 @@ private final class FleetAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-private let accent = Color(red: 0.43, green: 0.82, blue: 0.75)
+enum FleetPalette {
+    static let accent = Color(red: 0.47, green: 0.66, blue: 0.62)
+    static let success = Color(red: 0.55, green: 0.66, blue: 0.51)
+    static let warning = Color(red: 0.73, green: 0.62, blue: 0.47)
+    static let failure = Color(red: 0.75, green: 0.52, blue: 0.52)
+}
 
 @main
 struct FleetDesktop: App {
@@ -252,7 +257,7 @@ struct FleetDesktop: App {
     private func post(_ name: String) { NotificationCenter.default.post(name: .init(name), object: nil) }
     var body: some Scene {
         Window("Fleet Workbench", id: "fleet") {
-            FleetWindow().preferredColorScheme(.dark).tint(accent)
+            FleetWindow().preferredColorScheme(.dark).tint(FleetPalette.accent)
                 .onReceive(NotificationCenter.default.publisher(for: .init("FleetWorkspaceDirty"))) {
                     delegate.dirty = $0.object as? Bool ?? false
                 }
@@ -302,9 +307,9 @@ private struct FleetWindow: View {
         }
         var statusColor: Color {
             switch status {
-            case "running": .teal
-            case "completed": .green
-            case "failed": .orange
+            case "running": FleetPalette.accent
+            case "completed": FleetPalette.success
+            case "failed": FleetPalette.warning
             default: .secondary
             }
         }
@@ -357,13 +362,15 @@ private struct FleetWindow: View {
         let agents = section == "Activity" ? activityAgents : []
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 9) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 8).fill(accent.opacity(0.13))
-                        Image(systemName: "square.3.layers.3d").font(.system(size: 17, weight: .medium)).foregroundStyle(accent)
-                    }.frame(width: 30, height: 30)
-                    Text("Fleet").font(.system(size: 22, weight: .semibold, design: .rounded))
-                }.padding(.bottom, 17)
+                HStack(spacing: 6) {
+                    Image(systemName: "square.3.layers.3d")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(FleetPalette.accent)
+                        .accessibilityHidden(true)
+                    Text("Fleet").font(.system(size: 15, weight: .semibold, design: .rounded))
+                }
+                .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
+                .padding(.bottom, 6)
                 ForEach(sections, id: \.0) { item in
                     railButton(item.0, item.1, selected: section == item.0) { section = item.0 }
                 }
@@ -376,7 +383,7 @@ private struct FleetWindow: View {
                         Button("Add SSH Workspace…") { addSSH() }
                     } label: { Image(systemName: "plus") }
                         .menuStyle(.borderlessButton).frame(width: 28).help("Add or import a workspace")
-                }.padding(.top, 17).padding(.bottom, 6)
+                }.padding(.top, 11).padding(.bottom, 6)
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {
                         ForEach(hosts.filter { ($0.group ?? "").isEmpty }) { host in hostRow(host) }
@@ -402,7 +409,7 @@ private struct FleetWindow: View {
                     }.buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, 11).padding(.top, 42).padding(.bottom, 14)
+            .padding(.horizontal, 11).padding(.top, 29).padding(.bottom, 14)
             .frame(width: 164)
             .background(Color(red: 0.095, green: 0.103, blue: 0.117))
             Divider()
@@ -553,7 +560,7 @@ private struct FleetWindow: View {
                         }
                         .font(.system(size: 11, weight: focused ? .semibold : .regular))
                         .padding(.horizontal, 5).frame(height: 22)
-                        .background(focused ? accent.opacity(0.105) : .clear, in: RoundedRectangle(cornerRadius: 4))
+                        .background(focused ? FleetPalette.accent.opacity(0.105) : .clear, in: RoundedRectangle(cornerRadius: 4))
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -627,9 +634,9 @@ private struct FleetWindow: View {
                 Text(text).lineLimit(1)
                 Spacer()
             }.font(.system(size: 12, weight: selected ? .semibold : .regular))
-                .foregroundStyle(selected ? accent : Color.primary.opacity(0.76))
+                .foregroundStyle(selected ? FleetPalette.accent : Color.primary.opacity(0.76))
                 .padding(.horizontal, 6).frame(height: 28)
-                .background(selected ? accent.opacity(0.105) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .background(selected ? FleetPalette.accent.opacity(0.105) : .clear, in: RoundedRectangle(cornerRadius: 6))
                 .contentShape(Rectangle())
         }.buttonStyle(.plain)
     }
@@ -721,7 +728,7 @@ private struct HostForm: View {
                 }
             }.disabled(saving)
             if browsing { remoteFolders.disabled(saving) }
-            if !issue.isEmpty { Text(issue).font(.caption).foregroundStyle(.orange) }
+            if !issue.isEmpty { Text(issue).font(.caption).foregroundStyle(FleetPalette.warning) }
             HStack {
                 if remote {
                     Button(testing ? "Connecting…" : "Test SSH") { testSSH() }
@@ -735,7 +742,7 @@ private struct HostForm: View {
                             catch { issue = error.localizedDescription }
                         }
                     }.disabled(saving || destination.isEmpty)
-                    if connected { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
+                    if connected { Image(systemName: "checkmark.circle.fill").foregroundStyle(FleetPalette.success) }
                 }
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
@@ -782,7 +789,7 @@ private struct HostForm: View {
             }.disabled(testing || folderRequest != nil)
 
             if let folderIssue {
-                Text(folderIssue.message).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                Text(folderIssue.message).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
                 if !connected {
                     Text("Use Test SSH if the host needs authentication.")
                         .font(.caption).foregroundStyle(.secondary)
