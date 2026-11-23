@@ -10,9 +10,17 @@ from fleet_harness import _stop, prompt_with_tags
 from fleet_jobs import approval_decisions, claim_steer, expire_approval, request_approval, settle_steer
 
 
-def run_approval_turn(root, argv, environment, prompt, session, stream, model, run_id):
+YOLO_APPROVAL_POLICY = {"granular": {
+    "sandbox_approval": False, "rules": False, "mcp_elicitations": True,
+}}
+
+
+def run_desktop_turn(root, argv, environment, prompt, session, stream, model, run_id, *, yolo):
     thread_id = turn_id = status = None
-    steering = None
+    steering = follow_up = previous_turn = None
+    steer_deadline = 0
+    turn_ending = False
+    turn_settings = {}
     next_steer_poll = 0
     waiting = {}
     process = subprocess.Popen(
@@ -40,31 +48,53 @@ def run_approval_turn(root, argv, environment, prompt, session, stream, model, r
             result.update(content={} if choice == "accept" else None, _meta=None)
         send({"id": identifier, "result": result})
 
+    def start_turn(identifier, text):
+        send({"id": identifier, "method": "turn/start", "params": {
+            "threadId": thread_id, "input": [{"type": "text", "text": text, "text_elements": []}],
+            **turn_settings,
+        }})
+
     def poll():
-        nonlocal steering, next_steer_poll
-        if status is not None:
+        nonlocal steering, next_steer_poll, steer_deadline, follow_up, status, turn_id, previous_turn, turn_ending
+        if status is not None and status != "completed":
             return True
+        if steering is not None and monotonic() >= steer_deadline:
+            settle_steer(run_id, steering, "unconfirmed")
+            steering = None
+        if status == "completed":
+            if steering is not None or follow_up is not None:
+                return False
+            row = claim_steer(run_id, close_if_empty=True)
+            if row is None:
+                return True
+            for card in waiting:
+                expire_approval(run_id, card)
+            waiting.clear()
+            if outcome := stream.outcome or stream.assistant:
+                stream.emit("result", outcome)
+                stream.outcome = stream.assistant = ""
+            follow_up = row["id"]
+            previous_turn, turn_id, status, turn_ending = turn_id, None, None, False
+            start_turn(f"follow-up-{follow_up}", prompt_with_tags(row["prompt"], json.loads(row["tags"])))
+            return False
         if waiting:
             for identifier, decision in approval_decisions(run_id).items():
                 if decision in ("accept", "decline") and identifier in waiting:
                     request_id, response_key = waiting.pop(identifier)
                     reply(request_id, response_key, decision)
-        if turn_id and steering is None and monotonic() >= next_steer_poll:
+        if turn_id and steering is None and follow_up is None and not turn_ending and monotonic() >= next_steer_poll:
             next_steer_poll = monotonic() + 0.25
             if (row := claim_steer(run_id)) is not None:
                 steering = row["id"]
-                try:
-                    send({"id": f"steer-{steering}", "method": "turn/steer", "params": {
-                        "threadId": thread_id, "expectedTurnId": turn_id,
-                        "input": [{"type": "text", "text": prompt_with_tags(row["prompt"], json.loads(row["tags"]))}],
-                    }})
-                except BrokenPipeError:
-                    settle_steer(run_id, steering, False)
-                    steering = None
+                send({"id": f"steer-{steering}", "method": "turn/steer", "params": {
+                    "threadId": thread_id, "expectedTurnId": turn_id,
+                    "input": [{"type": "text", "text": prompt_with_tags(row["prompt"], json.loads(row["tags"]))}],
+                }})
+                steer_deadline = monotonic() + 10
         return False
 
     def on_line(line, *, error=False):
-        nonlocal thread_id, turn_id, status, steering
+        nonlocal thread_id, turn_id, status, steering, follow_up, turn_ending
         if error:
             stream.on_line(line, error=True)
             return
@@ -93,18 +123,44 @@ def run_approval_turn(root, argv, environment, prompt, session, stream, model, r
             return
         if steering is not None and identifier == f"steer-{steering}":
             result = message.get("result")
-            settle_steer(run_id, steering, isinstance(result, dict) and result.get("turnId") == turn_id)
+            error = message.get("error")
+            if isinstance(result, dict) and result.get("turnId") == turn_id:
+                settle_steer(run_id, steering, "sent")
+            elif isinstance(error, dict) and error.get("message") == "no active turn to steer":
+                settle_steer(run_id, steering, "queued")
+                turn_ending = True
+            else:
+                settle_steer(run_id, steering, "unsent" if isinstance(error, dict) else "unconfirmed")
             steering = None
+            return
+        if follow_up is not None and identifier == f"follow-up-{follow_up}":
+            result = message.get("result")
+            started = result.get("turn") if isinstance(result, dict) else None
+            started_id = started.get("id") if isinstance(started, dict) else None
+            if isinstance(started_id, str) and started_id:
+                turn_id = started_id
+                settle_steer(run_id, follow_up, "follow_up")
+            else:
+                error = message.get("error")
+                settle_steer(run_id, follow_up, "unsent" if isinstance(error, dict) else "unconfirmed")
+                stream.diagnostic(error, "Codex could not start the follow-up turn.")
+                status = "failed"
+            follow_up = None
             return
         if type(identifier) is int and identifier in (1, 2, 3):
             result = message.get("result")
             if not isinstance(result, dict):
-                stream.diagnostic(message.get("error"), "Codex could not start the approval-enabled turn.")
+                stream.diagnostic(message.get("error"), "Codex could not start the desktop turn.")
                 status = "failed"
                 return
             if identifier == 1:
                 send({"method": "initialized"})
-                options = {"cwd": str(root), "approvalPolicy": "on-request", "approvalsReviewer": "user"}
+                options = {
+                    "cwd": str(root), "approvalPolicy": YOLO_APPROVAL_POLICY if yolo else "on-request",
+                    "approvalsReviewer": "user",
+                }
+                if yolo:
+                    options["sandbox"] = "danger-full-access"
                 if model:
                     options["model"] = model
                 if session:
@@ -115,17 +171,16 @@ def run_approval_turn(root, argv, environment, prompt, session, stream, model, r
                 if not isinstance(thread_id, str) or not thread_id:
                     raise ValueError("Codex returned no thread ID.")
                 stream.session = thread_id
-                options = {
-                    "threadId": thread_id, "input": [{"type": "text", "text": prompt, "text_elements": []}],
-                }
                 sandbox = result.get("sandbox")
-                if session and isinstance(sandbox, dict) and sandbox.get("type") == "dangerFullAccess":
+                if yolo:
+                    turn_settings.update(approvalPolicy=YOLO_APPROVAL_POLICY, sandboxPolicy={"type": "dangerFullAccess"})
+                elif session and isinstance(sandbox, dict) and sandbox.get("type") == "dangerFullAccess":
                     # Codex can restore the previous turn's sandbox independently of approvalPolicy.
-                    options["sandboxPolicy"] = {
+                    turn_settings["sandboxPolicy"] = {
                         "type": "workspaceWrite", "writableRoots": [str(root)], "networkAccess": False,
                         "excludeTmpdirEnvVar": False, "excludeSlashTmp": False,
                     }
-                send({"id": 3, "method": "turn/start", "params": options})
+                start_turn(3, prompt)
             elif turn_id is None:
                 turn_id = result.get("turn", {}).get("id")
             return
@@ -139,7 +194,7 @@ def run_approval_turn(root, argv, environment, prompt, session, stream, model, r
             return
         if method in ("turn/started", "turn/completed"):
             turn = params.get("turn")
-            if not isinstance(turn, dict):
+            if not isinstance(turn, dict) or turn.get("id") == previous_turn:
                 return
             if turn_id is None:
                 turn_id = turn.get("id")
@@ -169,7 +224,7 @@ def run_approval_turn(root, argv, environment, prompt, session, stream, model, r
         }})
         stream.consume(process.stdout, process.stderr, on_line=on_line, poll=poll)
         if status is None:
-            raise ValueError("The Codex app-server closed before the turn finished. Check the CLI or turn off Approval Cards.")
+            raise ValueError("The Codex app-server closed before the turn finished. Check the CLI or use Open Agent in Terminal.")
         return 0 if status == "completed" else 1
     finally:
         try:

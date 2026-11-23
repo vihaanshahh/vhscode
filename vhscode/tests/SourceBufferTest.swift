@@ -26,6 +26,7 @@ struct SourceBufferTest {
         }
         guard let text = editor(in: host) else { fatalError("Native editor missing") }
         precondition(text.textStorage === buffer.storage)
+        precondition(text.enclosingScrollView?.verticalRulerView is SourceLineRuler)
         precondition(text.layoutManager?.allowsNonContiguousLayout == true)
         window.makeFirstResponder(text)
         text.setSelectedRange(NSRange(location: buffer.storage.length, length: 0))

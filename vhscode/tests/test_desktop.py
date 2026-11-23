@@ -76,9 +76,14 @@ if name == "codex" and arguments == ["app-server", "--listen", "stdio://"]:
         print(json.dumps({"id": request["id"], "result": result}), flush=True)
         sys.exit()
     if request["method"] in ("thread/start", "thread/resume"):
-        assert request["params"]["approvalPolicy"] == "on-request", request
+        yolo_policy = {"granular": {"sandbox_approval": False, "rules": False, "mcp_elicitations": True}}
+        policy = request["params"]["approvalPolicy"]
+        assert policy in ("on-request", yolo_policy), request
+        yolo = policy == yolo_policy
+        if yolo:
+            assert request["params"]["sandbox"] == "danger-full-access", request
         resumed = request["method"] == "thread/resume"
-        thread_id = "codex-fixture" if resumed else "approval-thread"
+        thread_id = "codex-fixture" if resumed or yolo else "approval-thread"
         result = {"thread": {"id": thread_id}}
         if resumed:
             assert request["params"]["threadId"] == thread_id, request
@@ -88,6 +93,54 @@ if name == "codex" and arguments == ["app-server", "--listen", "stdio://"]:
         assert request["method"] == "turn/start" and request["params"]["threadId"] == thread_id, request
         turn_id = "approval-turn"
         print(json.dumps({"id": request["id"], "result": {"turn": {"id": turn_id}}}), flush=True)
+        if yolo:
+            assert request["params"]["approvalPolicy"] == yolo_policy, request
+            assert request["params"]["sandboxPolicy"] == {"type": "dangerFullAccess"}, request
+            prompt = request["params"]["input"][0]["text"]
+
+            def finish(turn, answer):
+                context = {"threadId": thread_id, "turnId": turn}
+                print(json.dumps({"method": "item/completed", "params": {**context, "item": {
+                    "type": "agentMessage", "id": turn, "phase": "final_answer", "text": answer,
+                }}}), flush=True)
+                print(json.dumps({"method": "turn/completed", "params": {
+                    "threadId": thread_id, "turn": {"id": turn, "status": "completed"},
+                }}), flush=True)
+
+            if not resumed:
+                assert prompt == "Initial YOLO prompt", prompt
+                finish(turn_id, "YOLO started with full access.")
+                sys.exit()
+            assert prompt == "Resumed YOLO prompt", prompt
+            context = {"threadId": thread_id, "turnId": turn_id}
+            for identifier in ("github-first", "github-second"):
+                print(json.dumps({
+                    "id": identifier, "method": "mcpServer/elicitation/request",
+                    "params": {**context, "mode": "form", "serverName": "GitHub",
+                               "message": "Review issue 123", "requestedSchema": {"type": "object"}},
+                }), flush=True)
+            for identifier, choice in (("github-first", "accept"), ("github-second", "decline")):
+                assert json.loads(sys.stdin.readline()) == {"id": identifier, "result": {
+                    "action": choice, "content": {} if choice == "accept" else None, "_meta": None,
+                }}
+            steer = json.loads(sys.stdin.readline())
+            assert steer["method"] == "turn/steer" and steer["params"]["expectedTurnId"] == turn_id, steer
+            text = "Late steer\\n\\nRepository-relative context paths:\\n- " + json.dumps("Sources and notes/Architecture Guide.md")
+            assert steer["params"]["input"][0]["text"] == text, steer
+            finish(turn_id, "YOLO first turn completed.")
+            time.sleep(0.3)
+            print(json.dumps({
+                "id": steer["id"], "error": {"code": -32600, "message": "no active turn to steer"},
+            }), flush=True)
+            next_turn = json.loads(sys.stdin.readline())
+            assert next_turn["method"] == "turn/start", next_turn
+            assert next_turn["params"]["threadId"] == thread_id, next_turn
+            assert next_turn["params"]["input"][0]["text"] == text, next_turn
+            assert next_turn["params"]["sandboxPolicy"] == {"type": "dangerFullAccess"}, next_turn
+            assert next_turn["params"]["approvalPolicy"] == yolo_policy, next_turn
+            print(json.dumps({"id": next_turn["id"], "result": {"turn": {"id": "follow-up-turn"}}}), flush=True)
+            finish("follow-up-turn", "YOLO follow-up completed.")
+            sys.exit()
         if resumed:
             assert request["params"]["sandboxPolicy"] == {
                 "type": "workspaceWrite", "writableRoots": [str(Path.cwd())], "networkAccess": False,
@@ -175,9 +228,6 @@ if name == "codex":
     session = "codex-fixture"
     prompt = sys.stdin.read()
     options = ["--json"]
-    if prompt.startswith("YOLO "):
-        options.append("--dangerously-bypass-approvals-and-sandbox")
-        prompt = prompt.removeprefix("YOLO ")
     resumed = arguments == ["exec", "resume", *options, "--model=fixture-codex", "--", session, "-"]
     assert resumed or arguments == ["exec", *options, "-"], arguments
 else:
@@ -391,9 +441,7 @@ class DesktopBridgeTest(unittest.TestCase):
     def test_desktop_submits_and_resumes_both_cli_adapters(self):
         for agent, marker in (("codex", "git status"), ("cursor", "Architecture Guide.md")):
             with self.subTest(agent=agent):
-                yolo = agent == "codex"
-                prefix = "YOLO " if yolo else ""
-                first, events = self.finished_run(agent, prompt=prefix + "logout", yolo=yolo)
+                first, events = self.finished_run(agent, prompt="logout")
                 session = agent + "-fixture"
                 self.assertEqual((first["agent"], first["repo"], first["session"]), (agent, str(self.repo), session))
                 self.assertEqual(first["outcome"], f"{session} initial completed.")
@@ -402,13 +450,10 @@ class DesktopBridgeTest(unittest.TestCase):
 
                 self.success(self.request("set_model", agent=agent, model=f"fixture-{agent}"))
                 tags = [self.guide.relative_to(self.repo).as_posix()]
-                follow_up, _ = self.finished_run(agent, prompt=prefix + "Follow up", tags=tags, yolo=yolo)
+                follow_up, _ = self.finished_run(agent, prompt="Follow up", tags=tags)
                 self.assertNotEqual(first["id"], follow_up["id"])
                 self.assertEqual(follow_up["session"], session)
                 self.assertEqual(follow_up["outcome"], f"{session} follow-up completed.")
-                if yolo:
-                    ordinary, _ = self.finished_run(agent, prompt="Follow up", tags=tags)
-                    self.assertEqual(ordinary["session"], session)
 
     def test_markdown_survives_both_adapter_transcripts_without_duplicate_deltas(self):
         for agent in ("codex", "cursor"):
@@ -535,9 +580,10 @@ class DesktopBridgeTest(unittest.TestCase):
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 detail = self.success(self.request("detail", id=run_id, revision=""))
-                self.assertEqual(detail["run"]["status"], "running", detail)
+                self.assertIn(detail["run"]["status"], ("running", "needs_attention"), detail)
                 cards = detail.get("approvals", [])
                 if len(cards) == count:
+                    self.assertEqual(detail["run"]["status"], "needs_attention", detail)
                     return detail, cards[-1]
                 time.sleep(0.1)
             self.fail(f"Approval {count} did not arrive")
@@ -588,9 +634,47 @@ class DesktopBridgeTest(unittest.TestCase):
         self.fail("Codex did not resume after the approval decision")
 
     def test_approval_cards_restore_workspace_sandbox_after_yolo(self):
-        full_access, _ = self.finished_run("codex", prompt="YOLO logout", yolo=True)
+        full_access, _ = self.finished_run("codex", prompt="Initial YOLO prompt", yolo=True)
         reviewed, _ = self.finished_run("codex", prompt="Approval fixture", approval_cards=True)
         self.assertEqual(reviewed["session"], full_access["session"])
+
+    def test_yolo_approval_status_and_late_steer_continue_in_same_thread(self):
+        first, _ = self.finished_run("codex", prompt="Initial YOLO prompt", yolo=True)
+        run_id = self.success(self.request("submit", agent="codex", prompt="Resumed YOLO prompt", yolo=True))["id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            detail = self.success(self.request("detail", id=run_id))
+            if len(cards := detail.get("approvals", [])) == 2:
+                break
+            time.sleep(0.1)
+        self.assertEqual(len(cards), 2, detail)
+        self.assertEqual(detail["run"]["status"], "needs_attention")
+        self.assertTrue(detail["run"]["steerable"])
+        roster = self.success(self.request("workspace_agents"))["instances"]
+        self.assertEqual(roster[0]["run"]["status"], "needs_attention")
+        sidebar = self.success(self.request("sidebar_agents", repos=[str(self.repo)]))["workspaces"]
+        self.assertEqual(sidebar[str(self.repo)][0]["status"], "needs_attention")
+        snapshot = self.success(self.request("snapshot"))["runs"]
+        self.assertEqual(next(run for run in snapshot if run["id"] == run_id)["status"], "needs_attention")
+
+        self.success(self.request("decide_approval", id=run_id, approval=cards[0]["id"], decision="accept"))
+        self.assertEqual(self.success(self.request("detail", id=run_id))["run"]["status"], "needs_attention")
+        self.success(self.request("decide_approval", id=run_id, approval=cards[1]["id"], decision="decline"))
+        self.assertEqual(self.success(self.request("detail", id=run_id))["run"]["status"], "running")
+        tags = [self.guide.relative_to(self.repo).as_posix()]
+        steer = self.success(self.request("steer", id=run_id, prompt="Late steer", tags=tags))
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            detail = self.success(self.request("detail", id=run_id))
+            if detail["run"]["status"] != "running":
+                break
+            time.sleep(0.1)
+        self.assertEqual(detail["run"]["status"], "completed", detail)
+        self.assertEqual(detail["run"]["session"], first["session"])
+        self.assertEqual(detail["steers"], [{"id": steer["id"], "prompt": "Late steer", "state": "follow_up"}])
+        self.assertEqual([event["text"] for event in detail["events"] if event["kind"] == "result"],
+                         ["YOLO first turn completed.", "YOLO follow-up completed."])
 
     def test_yolo_rejects_invalid_desktop_run_options(self):
         for options in ({"agent": "cursor", "yolo": True},

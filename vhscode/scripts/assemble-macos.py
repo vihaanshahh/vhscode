@@ -53,7 +53,7 @@ def main():
                                check=True, stdout=subprocess.DEVNULL)
         subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(resources / "Fleet.icns")], check=True)
 
-    script(resources / "bin/vhscode-fleet", """#!/bin/sh
+    script(resources / "bin/fleet-workspace", """#!/bin/sh
 set -eu
 self=$0
 while [ -L "$self" ]; do
@@ -75,6 +75,9 @@ if [ "$#" -eq 0 ]; then
 fi
 exec "$resources/python/bin/python3" "$resources/fleet/fleet.py" "$@"
 """)
+    legacy_launcher = resources / "bin/vhscode-fleet"
+    legacy_launcher.unlink(missing_ok=True)
+    legacy_launcher.symlink_to("fleet-workspace")
     script(resources / "bin/fleet-askpass", """#!/bin/sh
 set -eu
 bin=$(cd "$(/usr/bin/dirname "$0")" && pwd -P)
@@ -94,9 +97,9 @@ exec "$bin/../../MacOS/FleetWorkbench" --ssh-askpass "$@"
                     "-O", "-whole-module-optimization", "-parse-as-library",
                     *map(str, sorted(sources.glob("*.swift"))),
                     "-o", str(contents / "MacOS/FleetWorkbench")], check=True)
-    info = dict(CFBundleExecutable="FleetWorkbench", CFBundleName="Fleet Workbench",
-                CFBundleDisplayName="Fleet Workbench", CFBundleIdentifier="io.vhscode.fleet-workbench",
-                CFBundleVersion="9", CFBundleShortVersionString="0.9", CFBundlePackageType="APPL",
+    info = dict(CFBundleExecutable="FleetWorkbench", CFBundleName="Fleet Workspace",
+                CFBundleDisplayName="Fleet Workspace", CFBundleIdentifier="io.vhscode.fleet-workbench",
+                CFBundleVersion="10", CFBundleShortVersionString="0.10", CFBundlePackageType="APPL",
                 CFBundleIconFile="Fleet.icns", NSHighResolutionCapable=True, LSMinimumSystemVersion="14.0")
     info["CFBundleDocumentTypes"] = [dict(CFBundleTypeName="VS Code Workspace",
                                           CFBundleTypeRole="Editor", LSHandlerRank="Alternate",

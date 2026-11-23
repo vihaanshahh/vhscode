@@ -4,8 +4,7 @@ import SwiftUI
 struct WorkspaceView: View {
     let host: FleetHost
     var monitorRuns = true
-    var showsFiles = true
-    var onOpenFiles: () -> Void = {}
+    var isVisible = true
     var selectedAgentLane: FleetAgentLaneSelection? = nil
     var onAgentLabelsChange: ([FleetAgentLane: String]?) -> Void = { _ in }
     var onActiveAgentLaneChange: (FleetAgentLane?) -> Void = { _ in }
@@ -18,8 +17,8 @@ struct WorkspaceView: View {
     var body: some View {
         Group {
             if let model = workspaces[scope] {
-                WorkspacePane(host: host, monitorRuns: monitorRuns, showsFiles: showsFiles, onOpenFiles: onOpenFiles,
-                              model: model, selectedAgentLane: selectedAgentLane,
+                WorkspacePane(host: host, monitorRuns: monitorRuns, isVisible: isVisible,
+                              model: model, git: model.git, selectedAgentLane: selectedAgentLane,
                               onAgentLabelsChange: onAgentLabelsChange, onActiveAgentLaneChange: onActiveAgentLaneChange)
             } else {
                 ProgressView()
@@ -96,6 +95,7 @@ private struct MidTurnMessage: Identifiable {
         case "queued": "Queued"
         case "sending": "Sending"
         case "sent": "Sent to Codex"
+        case "follow_up": "Sent as a follow-up"
         case "unsent": "Not sent"
         default: "Delivery unconfirmed"
         }
@@ -114,7 +114,9 @@ private struct WorkspaceTurn: Identifiable {
     var events: [AgentEvent] = []
     var approvals: [AgentApproval] = []
     var steers: [MidTurnMessage] = []
-    var isActive: Bool { ["queued", "running"].contains(status) }
+    var isActive: Bool { status == "queued" || FleetRunStatus.isActive(status) }
+    var needsAttention: Bool { status == FleetRunStatus.needsAttention }
+    var statusLabel: String { FleetRunStatus.label(status) }
     var requiresCursorTrust: Bool {
         events.contains { ["error", "risk"].contains($0.kind) && $0.text.localizedCaseInsensitiveContains("Workspace Trust Required") }
             || risk.localizedCaseInsensitiveContains("Workspace Trust Required")
@@ -184,8 +186,9 @@ private struct NativeSessionOption: Identifiable {
 @MainActor
 private final class WorkspaceModel: ObservableObject {
     let host: FleetHost
+    let git: WorkspaceGit
     @Published var folders: [String: DirectoryPage] = [:]
-    @Published var expanded = Set<String>()
+    @Published private(set) var expanded: Set<String>
     @Published var buffers: [SourceBuffer] = []
     @Published var selectedPath: String?
     @Published var loadingFiles = Set<String>()
@@ -226,8 +229,16 @@ private final class WorkspaceModel: ObservableObject {
     private var lastDirty: Bool?
     private var folderLoads: [String: UUID] = [:]
     private var catalogLoads: [String: UUID] = [:]
+    private let folderExpansionKey: String
 
-    init(host: FleetHost) { self.host = host }
+    init(host: FleetHost) {
+        self.host = host
+        git = WorkspaceGit(host: host)
+        let workspace = [host.id, host.ssh, host.repo].joined(separator: "\u{0}")
+        let key = "FleetExpandedFolders." + Data(workspace.utf8).base64EncodedString()
+        folderExpansionKey = key
+        expanded = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    }
 
     var selectedBuffer: SourceBuffer? { buffers.first { $0.path == selectedPath } }
     var turns: [WorkspaceTurn] { selectedAgent.flatMap { conversations[$0] } ?? [] }
@@ -267,8 +278,12 @@ private final class WorkspaceModel: ObservableObject {
     func status(for agent: WorkspaceAgent) -> String {
         let state = if resetting.contains(agent) { "Switching session" }
         else if submitting.contains(agent) { "Starting" }
-        else { conversations[agent]?.last?.status.capitalized ?? "Idle" }
+        else { conversations[agent]?.last?.statusLabel ?? "Idle" }
         return "\(label(for: agent)) · \(state)\nModel: \(workspaceModels[agent.harness] ?? "CLI default")\nSession: \(sessions[agent] ?? "None")"
+    }
+
+    func needsAttention(_ agent: WorkspaceAgent) -> Bool {
+        conversations[agent]?.last?.needsAttention == true
     }
 
     private func canReset(_ agent: WorkspaceAgent) -> Bool {
@@ -395,8 +410,9 @@ private final class WorkspaceModel: ObservableObject {
             let newEntries = entries.compactMap(ProjectEntry.init).filter {
                 paths.insert($0.path).inserted
             }
-            for entry in page.entries where entry.isDirectory && !paths.contains(entry.path) {
-                if expanded.contains(entry.path) { collapseFolder(entry.path) }
+            for entry in page.entries where entry.isDirectory && !paths.contains(entry.path)
+                && folders[entry.path] != nil {
+                discardFolderPages(entry.path)
             }
             page.entries = newEntries
             switch direction {
@@ -416,18 +432,17 @@ private final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func toggleFolder(_ path: String) async {
-        if expanded.contains(path) {
-            collapseFolder(path)
-            return
+    func toggleFolder(_ path: String) {
+        if expanded.remove(path) != nil {
+            discardFolderPages(path)
+        } else {
+            expanded.insert(path)
         }
-        expanded.insert(path)
-        if folders[path] == nil { await loadFolder(path) }
+        UserDefaults.standard.set(expanded.sorted(), forKey: folderExpansionKey)
     }
 
-    private func collapseFolder(_ path: String) {
+    private func discardFolderPages(_ path: String) {
         let prefix = path + "/"
-        expanded = expanded.filter { $0 != path && !$0.hasPrefix(prefix) }
         folders = folders.filter { $0.key != path && !$0.key.hasPrefix(prefix) }
         folderLoads = folderLoads.filter { $0.key != path && !$0.key.hasPrefix(prefix) }
     }
@@ -733,7 +748,8 @@ private final class WorkspaceModel: ObservableObject {
         composerErrors[agent] = nil
     }
 
-    func submit(from agent: WorkspaceAgent, approvalCards: Bool, steer: String?) async {
+    func submit(from agent: WorkspaceAgent, approvalCards: Bool) async {
+        let steer = steeringRun(agent)
         guard canSend(from: agent), steer != nil || canReset(agent), let draft = drafts[agent] else { return }
         let prompt = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard ComposerCommand.parse(prompt) == nil else { return }
@@ -759,7 +775,7 @@ private final class WorkspaceModel: ObservableObject {
             }
             if let previousID = conversations[agent]?.last?.id { pendingDetails.remove(previousID) }
             conversations[agent, default: []].append(WorkspaceTurn(id: id, prompt: prompt, reporting: draft.reporting,
-                                                                    steerable: showsApprovals))
+                                                                    steerable: showsApprovals || yolo))
             let count = conversations[agent]?.count ?? 0
             if count > 24 { conversations[agent]?.removeFirst(count - 24) }
             if drafts[agent]?.text == draft.text { drafts[agent]?.text = "" }
@@ -789,10 +805,15 @@ private final class WorkspaceModel: ObservableObject {
                 "decision": accept ? "accept" : "decline",
             ])
             if let index = conversations[agent]?.firstIndex(where: { $0.id == run }),
-               let card = conversations[agent]?[index].approvals.firstIndex(where: { $0.id == approval.id }) {
-                conversations[agent]?[index].approvals[card] = AgentApproval(
+               var turn = conversations[agent]?[index],
+               let card = turn.approvals.firstIndex(where: { $0.id == approval.id }) {
+                turn.approvals[card] = AgentApproval(
                     id: approval.id, title: approval.title, detail: approval.detail, decision: accept ? "accept" : "decline"
                 )
+                if turn.needsAttention && turn.approvals.allSatisfy({ $0.decision != nil }) {
+                    turn.status = "running"
+                }
+                conversations[agent]?[index] = turn
             }
         } catch {
             composerErrors[agent] = error.localizedDescription
@@ -829,6 +850,10 @@ private final class WorkspaceModel: ObservableObject {
                         guard let id = row["id"] as? String, let title = row["title"] as? String,
                               let detail = row["detail"] as? String else { return nil }
                         return AgentApproval(id: id, title: title, detail: detail, decision: row["decision"] as? String)
+                    }
+                    if turn.status == "running", !stopping.contains(id),
+                       turn.approvals.contains(where: { $0.decision == nil }) {
+                        turn.status = FleetRunStatus.needsAttention
                     }
                     let visibleKinds: Set<String>? = switch turn.reporting {
                     case "summary": ["result", "error", "risk"]
@@ -871,80 +896,38 @@ private final class WorkspaceModel: ObservableObject {
 
 @MainActor
 private struct WorkspacePane: View {
+    private enum WorkspaceTool {
+        case files, code
+    }
+
     @Environment(\.workbenchPalette) private var palette
     let host: FleetHost
     var monitorRuns: Bool
-    let showsFiles: Bool
-    let onOpenFiles: () -> Void
+    let isVisible: Bool
     @ObservedObject var model: WorkspaceModel
+    @ObservedObject var git: WorkspaceGit
     let selectedAgentLane: FleetAgentLaneSelection?
     let onAgentLabelsChange: ([FleetAgentLane: String]?) -> Void
     let onActiveAgentLaneChange: (FleetAgentLane?) -> Void
     @State private var closing: SourceBuffer?
     @State private var panel: WorkspacePanel?
+    @State private var workspaceTool: WorkspaceTool?
+    @State private var diff: WorkspaceGitChange?
     @State private var showingCommands: WorkspaceAgent?
     @State private var showingStatus: WorkspaceAgent?
     @State private var deletingAgent: WorkspaceAgent?
     @State private var confirmingCursorTrust = false
     @State private var terminalError: String?
-    @AppStorage("FleetExplorerVisible") private var explorerVisible = true
     @AppStorage("FleetCodexApprovalCards") private var codexApprovalCards = true
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            palette.separator.frame(height: 1)
-            if showsFiles {
-                HSplitView {
-                    if explorerVisible {
-                        WorkspaceExplorer(host: host, model: model, active: monitorRuns)
-                            .frame(minWidth: 152, idealWidth: 212)
-                    }
-                    editor.frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
-                    agentPane.frame(minWidth: 255, idealWidth: 342)
-                }
-            } else {
-                agentPane
-            }
-        }
-        .task(id: showsFiles) {
-            guard showsFiles else { return }
-            if model.folders[""] == nil { await model.loadFolder("") }
-            await model.openWelcomeFile()
-        }
-        .task { await model.loadSettings() }
-        .task { await model.loadAgents() }
-        .task(id: selectedAgentLane?.id) {
-            guard model.agentsLoaded, let selection = selectedAgentLane else { return }
-            if selection.action == .rename || !model.agents.contains(WorkspaceAgent(harness: selection.agent, lane: selection.lane)) {
-                await model.loadAgents(refresh: true)
-            }
-            if !Task.isCancelled { applyAgentSelection() }
-        }
-        .onChange(of: model.agentsLoaded) { _, loaded in
-            if loaded { applyAgentSelection() }
-        }
-        .onChange(of: model.sidebarAgentLabels, initial: true) { _, labels in
-            onAgentLabelsChange(labels)
-        }
-        .onChange(of: model.selectedAgent, initial: true) { _, agent in onActiveAgentLaneChange(agent?.sidebarLane) }
-        .onAppear { model.publishDirty(force: true) }
-        .onDisappear { NotificationCenter.default.post(name: .init("FleetWorkspaceDirty"), object: false) }
-        .onReceive(NotificationCenter.default.publisher(for: .init("FleetQuickOpen"))) { _ in
-            panel = .quickOpen
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .init("FleetToggleExplorer"))) { _ in
-            if showsFiles { explorerVisible.toggle() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .init("FleetCloseTab"))) { _ in
-            if showsFiles, let buffer = model.selectedBuffer { requestClose(buffer) }
-        }
+        workspaceContent
         .sheet(item: $panel) { panel in
             switch panel {
             case .quickOpen:
                 QuickOpenPanel(host: host, openFiles: model.buffers.map(\.path).reversed()) { path in
                     self.panel = nil
-                    Task { await model.openFile(path) }
+                    openFile(path)
                 }
             case let .resume(agent, session):
                 ResumeSessionPanel(model: model, agent: agent, session: session)
@@ -956,6 +939,7 @@ private struct WorkspacePane: View {
                 AgentNamePanel(model: model, agent: agent)
             }
         }
+        .sheet(item: $diff, content: diffSheet)
         .background {
             ZStack {
                 ForEach(model.agents) { agent in
@@ -1013,6 +997,102 @@ private struct WorkspacePane: View {
         }
     }
 
+    private var workspaceContent: some View {
+        workspaceLayout
+        .task(id: isVisible) {
+            guard isVisible else { return }
+            if model.folders[""] == nil { await model.loadFolder("") }
+            await model.openWelcomeFile()
+        }
+        .task { await model.loadSettings() }
+        .task { await model.loadAgents() }
+        .task(id: monitorRuns && workspaceTool != nil, priority: .utility) {
+            if monitorRuns && workspaceTool != nil { await git.monitor() }
+        }
+        .onChange(of: git.status) { previous, current in
+            refreshFoldersForGitChanges(previous: previous, current: current)
+        }
+        .task(id: selectedAgentLane?.id) {
+            guard model.agentsLoaded, let selection = selectedAgentLane else { return }
+            if selection.action == .rename || !model.agents.contains(WorkspaceAgent(harness: selection.agent, lane: selection.lane)) {
+                await model.loadAgents(refresh: true)
+            }
+            if !Task.isCancelled { applyAgentSelection() }
+        }
+        .onChange(of: model.agentsLoaded) { _, loaded in
+            if loaded { applyAgentSelection() }
+        }
+        .onChange(of: model.sidebarAgentLabels, initial: true) { _, labels in
+            onAgentLabelsChange(labels)
+        }
+        .onChange(of: model.selectedAgent, initial: true) { _, agent in onActiveAgentLaneChange(agent?.sidebarLane) }
+        .onAppear { model.publishDirty(force: true) }
+        .onDisappear { NotificationCenter.default.post(name: .init("FleetWorkspaceDirty"), object: false) }
+        .onReceive(NotificationCenter.default.publisher(for: .init("FleetQuickOpen"))) { _ in
+            panel = .quickOpen
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .init("FleetToggleExplorer"))) { _ in
+            if isVisible { toggleTool(.files) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .init("FleetCloseTab"))) { _ in
+            if isVisible, workspaceTool == .code, let buffer = model.selectedBuffer { requestClose(buffer) }
+        }
+    }
+
+    private var workspaceLayout: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            GeometryReader { geometry in
+                let compact = geometry.size.width < (workspaceTool == .code ? 710 : 560)
+                HSplitView {
+                    agentPane.frame(minWidth: 310, maxWidth: .infinity, maxHeight: .infinity)
+                        .layoutPriority(1)
+                    if let workspaceTool, !compact {
+                        toolPane(workspaceTool)
+                    }
+                }
+                .overlay(alignment: .trailing) {
+                    if let workspaceTool, compact {
+                        toolPane(workspaceTool)
+                            .frame(width: min(geometry.size.width, workspaceTool == .files ? 270 : 410))
+                            .overlay(alignment: .leading) {
+                                Rectangle().fill(palette.separator).frame(width: 1)
+                            }
+                            .shadow(color: .black.opacity(0.12), radius: 12, x: -4)
+                    }
+                }
+                .clipped()
+            }
+        }
+    }
+
+    private func refreshFoldersForGitChanges(previous: WorkspaceGitStatus?, current: WorkspaceGitStatus?) {
+        guard let current else { return }
+        let headChanged = previous.map { $0.head != current.head } ?? false
+        let changes = Set(previous?.changes ?? []).symmetricDifference(current.changes).filter(\.affectsFileTree)
+        guard headChanged || !changes.isEmpty else { return }
+        let directories = headChanged ? model.expanded.union([""])
+            : changes.reduce(into: Set([""])) { $0.formUnion($1.parentFolders) }
+        Task {
+            for directory in directories.sorted() where model.folders[directory] != nil
+                && (directory.isEmpty || model.expanded.contains(directory)) {
+                await model.loadFolder(directory, direction: .refresh)
+            }
+        }
+    }
+
+    private func diffSheet(_ change: WorkspaceGitChange) -> WorkspaceGitDiff {
+        let hasUnsavedEdits = model.buffers.contains { $0.path == change.path && $0.isDirty }
+        let openFromDiff: ((String) -> Void)?
+        if workspaceTool == .files {
+            openFromDiff = { path in openFile(path) }
+        } else {
+            openFromDiff = nil
+        }
+        return WorkspaceGitDiff(host: host, change: change, hasUnsavedEdits: hasUnsavedEdits, openFile: openFromDiff)
+    }
+
     private func openTerminal(agent: WorkspaceAgent? = nil) {
         Task {
             do {
@@ -1045,50 +1125,96 @@ private struct WorkspacePane: View {
         }
     }
 
+    private func toggleTool(_ tool: WorkspaceTool) {
+        workspaceTool = workspaceTool == tool ? nil : tool
+    }
+
+    private func openFile(_ path: String) {
+        workspaceTool = .code
+        Task { await model.openFile(path) }
+    }
+
     private var header: some View {
-        HStack(spacing: 9) {
-            HStack(spacing: 7) {
-                Image(systemName: host.ssh.isEmpty ? "folder" : "server.rack")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(palette.tint)
-                    .accessibilityHidden(true)
+        HStack(spacing: 8) {
+            Image(systemName: host.ssh.isEmpty ? "folder" : "network")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(palette.tint)
+                .frame(width: 28, height: 28)
+                .background(palette.selection, in: RoundedRectangle(cornerRadius: 7))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
                 Text(host.label)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
-                Text(host.repo)
-                    .font(.system(.caption, design: .monospaced))
+                    .accessibilityAddTraits(.isHeader)
+                if let agent = model.selectedAgent {
+                    let running = model.activeRun(agent) != nil
+                    HStack(spacing: 4) {
+                        Text(model.label(for: agent)).lineLimit(1)
+                        if model.needsAttention(agent) {
+                            Text("· Needs Attention").foregroundStyle(palette.caution).fixedSize()
+                        } else if running {
+                            Text("· Working").fixedSize()
+                        }
+                    }
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                }
             }
             .help(host.repo)
-            Spacer(minLength: 0)
-            if showsFiles {
-                Button { explorerVisible.toggle() } label: {
-                    Image(systemName: explorerVisible ? "sidebar.left" : "sidebar.leading")
-                }
-                .help(explorerVisible ? "Hide Explorer (⌘B)" : "Show Explorer (⌘B)")
-                .accessibilityLabel(explorerVisible ? "Hide Explorer" : "Show Explorer")
-                Button { panel = .quickOpen } label: {
-                    Label("Quick Open", systemImage: "magnifyingglass")
-                }
-                .help("Find a file by name or path (⌘P)")
-            } else {
-                Button(action: onOpenFiles) { Label("Open Files", systemImage: "folder") }
-            }
+            Spacer(minLength: 2)
+            if let agent = model.selectedAgent { agentActions(agent) }
             Button { panel = .agentName(nil) } label: {
-                Label("New Agent", systemImage: "plus").font(.subheadline.weight(.semibold))
+                ViewThatFits(in: .horizontal) {
+                    Label("New Agent", systemImage: "plus").fixedSize()
+                    Image(systemName: "plus").frame(width: 15)
+                }
+                .font(.subheadline)
+                .padding(.horizontal, 7).frame(height: 26)
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.bordered)
-            .fixedSize()
+            .buttonStyle(.plain)
             .help("Create an agent in \(host.label)")
             .accessibilityLabel("New Agent")
             .disabled(!model.agentsLoaded || model.changingAgents)
+            Rectangle().fill(palette.separator).frame(width: 1, height: 16)
+            HStack(spacing: 2) {
+                toolButton(.files, title: "Files", icon: "folder", hint: "Browse workspace files (⌘B)")
+                toolButton(.code, title: "Code", icon: "chevron.left.forwardslash.chevron.right", hint: "Show the code editor")
+            }
+            .padding(2)
+            .background(palette.navigation, in: RoundedRectangle(cornerRadius: 8))
         }
-        .controlSize(.small)
-        .frame(minHeight: 38)
-        .padding(.horizontal, 16)
-        .background(palette.surface)
+        .frame(height: 44)
+        .padding(.horizontal, 14)
+    }
+
+    private func toolButton(_ tool: WorkspaceTool, title: String, icon: String, hint: String) -> some View {
+        let selected = workspaceTool == tool
+        return Button { toggleTool(tool) } label: {
+            Label(title, systemImage: icon)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(selected ? palette.tint : Color.primary)
+                .fixedSize()
+                .padding(.horizontal, 9)
+                .frame(height: 24)
+                .background(selected ? palette.selection : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(hint)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    @ViewBuilder private func toolPane(_ tool: WorkspaceTool) -> some View {
+        switch tool {
+        case .files:
+            WorkspaceExplorer(model: model, git: git, onOpenFile: openFile,
+                              onQuickOpen: { panel = .quickOpen }, onOpenDiff: { diff = $0 })
+                .frame(minWidth: 215, idealWidth: 270, maxWidth: 360, maxHeight: .infinity)
+        case .code:
+            editor.frame(minWidth: 390, idealWidth: 440, maxHeight: .infinity)
+        }
     }
 
     private var editor: some View {
@@ -1110,7 +1236,23 @@ private struct WorkspacePane: View {
                 .background(palette.navigation)
                 palette.separator.frame(height: 1)
             }
-            if let path = model.selectedPath { breadcrumbs(path) }
+            if let path = model.selectedPath {
+                HStack(spacing: 8) {
+                    breadcrumbs(path)
+                    if let change = git.files[path] {
+                        Button { diff = change } label: {
+                            Label(change.isUntracked ? "New file" : "View diff", systemImage: "arrow.triangle.branch")
+                        }
+                        .controlSize(.small)
+                        .fixedSize()
+                        .help(change.summary)
+                        .padding(.trailing, 9)
+                    }
+                }
+                .frame(minHeight: 34)
+                .background(palette.surface)
+                Divider()
+            }
             if let buffer = model.selectedBuffer {
                 SourceEditor(model: model, buffer: buffer)
                     .id(buffer.path)
@@ -1175,14 +1317,17 @@ private struct WorkspacePane: View {
                     .foregroundStyle(palette.tint)
                 Text((host.repo as NSString).lastPathComponent.isEmpty ? host.label : (host.repo as NSString).lastPathComponent)
                     .font(.system(.largeTitle, design: .rounded).weight(.semibold))
-                Text("Open a file from the project tree or send a prompt from the agent panel.")
+                Text("Choose a file to view or edit its contents.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                Button { workspaceTool = .files } label: {
+                    Label("Browse Files", systemImage: "folder")
+                }
                 if !entries.isEmpty {
                     Divider().padding(.vertical, 3)
                     ForEach(entries) { entry in
                         Button {
-                            Task { await model.openFile(entry.path) }
+                            openFile(entry.path)
                         } label: {
                             Label(entry.name, systemImage: "doc")
                                 .font(.system(.callout, design: .monospaced))
@@ -1213,7 +1358,7 @@ private struct WorkspacePane: View {
                 }
             } else if model.agentsLoaded && !model.changingAgents {
                 ContentUnavailableView {
-                    Label("No agents", systemImage: "bubble.left")
+                    Text("No agents")
                 } description: {
                     Text("Choose New Agent to add Codex or Cursor.")
                 } actions: {
@@ -1223,114 +1368,123 @@ private struct WorkspacePane: View {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .background(palette.surface)
+        .background(palette.editor)
+    }
+
+    private func agentActions(_ agent: WorkspaceAgent) -> some View {
+        let yolo = model.draftBinding(for: agent, \.yolo)
+        return HStack(spacing: 6) {
+            if let id = model.activeRun(agent) {
+                let stopping = model.stopping.contains(id)
+                Button {
+                    Task { await model.stop(id, agent: agent) }
+                } label: {
+                    Image(systemName: "stop.fill")
+                }
+                .controlSize(.small)
+                .disabled(stopping)
+                .help(stopping ? "Stopping…" : "Stop this task")
+                .accessibilityLabel(stopping ? "Stopping…" : "Stop")
+            }
+            Button { panel = .agentName(agent) } label: {
+                Image(systemName: "pencil").frame(width: 22, height: 22).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(model.changingAgents)
+            .help("Rename Agent")
+            .accessibilityLabel("Rename Agent")
+            Button(role: .destructive) { deletingAgent = agent } label: {
+                Image(systemName: "trash").frame(width: 22, height: 22).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!model.canDelete(agent))
+            .help(model.activeRun(agent) == nil ? "Delete Agent" : "Stop this agent before deleting it")
+            .accessibilityLabel("Delete Agent")
+            Menu {
+                Button("Rename Agent…") { panel = .agentName(agent) }
+                    .disabled(model.changingAgents)
+                Button("Edit Agent Command…") { panel = .command(agent) }
+                Button("Open Agent in Terminal") { openTerminal(agent: agent) }
+                    .disabled(!model.canReset)
+                Button("Open Workspace Shell") { openTerminal() }
+                Divider()
+                if agent.harness == "codex" {
+                    Toggle("Approval Cards", isOn: $codexApprovalCards)
+                        .disabled(yolo.wrappedValue)
+                    Toggle("YOLO Mode (Full Access)", isOn: yolo)
+                        .disabled(!model.canReset)
+                }
+                if agent.harness == "cursor" {
+                    Button("Sign In to Cursor…") { Task { await model.signInToCursor() } }
+                        .disabled(model.cursorSigningIn)
+                    if model.cursorTrusted {
+                        Button("Revoke Cursor Workspace Trust") { Task { await model.setCursorTrust(false) } }
+                            .disabled(model.savingCursorTrust)
+                    } else {
+                        Button("Trust Workspace for Cursor…") { confirmingCursorTrust = true }
+                            .disabled(model.savingCursorTrust)
+                    }
+                }
+                Toggle("Filter routine progress", isOn: model.draftBinding(for: agent, \.filterProgress))
+                Button("Resume Session…") { panel = .resume(agent, "") }
+                    .disabled(!model.canReset)
+                Button("New Conversation") { Task { await model.newConversation(agent) } }
+                    .disabled(!model.canReset)
+                    .help(model.sessions[agent] == nil ? "New conversation" : "Start a fresh CLI session")
+                Button("Composer Commands") { showingCommands = agent }
+                Divider()
+                Button("Delete Agent…", role: .destructive) { deletingAgent = agent }
+                    .disabled(!model.canDelete(agent))
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 23, height: 28)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Agent options")
+            .accessibilityLabel("Agent options")
+        }
     }
 
     private func composer(_ agent: WorkspaceAgent) -> some View {
         let yolo = model.draftBinding(for: agent, \.yolo)
-        return VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(model.label(for: agent)).font(.subheadline.weight(.semibold)).lineLimit(1)
-                let running = model.agents.filter { model.activeRun($0) != nil }.count
-                if running > 0 { Text("\(running) running").font(.caption).foregroundStyle(.secondary) }
-                Spacer()
-                if let id = model.activeRun(agent) {
-                    Button {
-                        Task { await model.stop(id, agent: agent) }
-                    } label: {
-                        Label(model.stopping.contains(id) ? "Stopping…" : "Stop", systemImage: "stop.fill")
-                    }
-                    .controlSize(.small)
-                    .disabled(model.stopping.contains(id))
-                    .help("Stop this task")
+        return VStack(spacing: 0) {
+            if model.turns.isEmpty {
+                VStack(spacing: 9) {
+                    Text("Start a conversation")
+                        .font(.system(size: 24, weight: .semibold))
+                        .accessibilityAddTraits(.isHeader)
+                    Text("Attach files from your workspace with the paperclip in Files.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
-                Button { panel = .agentName(agent) } label: {
-                    Image(systemName: "pencil").frame(width: 22, height: 22).contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(model.changingAgents)
-                .help("Rename Agent")
-                .accessibilityLabel("Rename Agent")
-                Button(role: .destructive) { deletingAgent = agent } label: {
-                    Image(systemName: "trash").frame(width: 22, height: 22).contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(!model.canDelete(agent))
-                .help(model.activeRun(agent) == nil ? "Delete Agent" : "Stop this agent before deleting it")
-                .accessibilityLabel("Delete Agent")
-                Menu {
-                    Button("Rename Agent…") { panel = .agentName(agent) }
-                        .disabled(model.changingAgents)
-                    Button("Edit Agent Command…") { panel = .command(agent) }
-                    Button("Open Agent in Terminal") { openTerminal(agent: agent) }
-                        .disabled(!model.canReset)
-                    Button("Open Workspace Shell") { openTerminal() }
-                    Divider()
-                    if agent.harness == "codex" {
-                        Toggle("Approval Cards", isOn: $codexApprovalCards)
-                            .disabled(yolo.wrappedValue)
-                        Toggle("YOLO Mode (Full Access)", isOn: yolo)
-                            .disabled(!model.canReset)
-                    }
-                    if agent.harness == "cursor" {
-                        Button("Sign In to Cursor…") { Task { await model.signInToCursor() } }
-                            .disabled(model.cursorSigningIn)
-                        if model.cursorTrusted {
-                            Button("Revoke Cursor Workspace Trust") { Task { await model.setCursorTrust(false) } }
-                                .disabled(model.savingCursorTrust)
-                        } else {
-                            Button("Trust Workspace for Cursor…") { confirmingCursorTrust = true }
-                                .disabled(model.savingCursorTrust)
+                .multilineTextAlignment(.center)
+                .padding(20)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 26) {
+                        ForEach(model.turns) { turn in
+                            let offerTrust = agent.harness == "cursor" && !model.cursorTrusted && turn.requiresCursorTrust
+                            TurnCard(turn: turn, trustWorkspace: offerTrust ? { confirmingCursorTrust = true } : nil,
+                                     openTerminal: turn.status == "failed" && model.canReset ? { openTerminal(agent: agent) } : nil,
+                                     answering: model.answeringApprovals) { approval, accept in
+                                Task { await model.answerApproval(approval, run: turn.id, agent: agent, accept: accept) }
+                            }
                         }
                     }
-                    Toggle("Filter routine progress", isOn: model.draftBinding(for: agent, \.filterProgress))
-                    Button("Resume Session…") { panel = .resume(agent, "") }
-                        .disabled(!model.canReset)
-                    Button("New Conversation") { Task { await model.newConversation(agent) } }
-                        .disabled(!model.canReset)
-                        .help(model.sessions[agent] == nil ? "New conversation" : "Start a fresh CLI session")
-                    Button("Composer Commands") { showingCommands = agent }
-                    Divider()
-                    Button("Delete Agent…", role: .destructive) { deletingAgent = agent }
-                        .disabled(!model.canDelete(agent))
-                } label: {
-                    Image(systemName: "ellipsis.circle")
+                    .frame(maxWidth: 680)
+                    .padding(22)
+                    .frame(maxWidth: .infinity)
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Agent options")
-                .accessibilityLabel("Agent options")
+                .defaultScrollAnchor(.bottom)
+                .id(agent)
             }
-            .padding(.horizontal, 14)
-            .frame(minHeight: 39)
-            palette.separator.frame(height: 1)
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
-                    if model.turns.isEmpty {
-                        Text("Send a prompt or attach files from the tree.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(model.turns) { turn in
-                        let offerTrust = agent.harness == "cursor" && !model.cursorTrusted && turn.requiresCursorTrust
-                        TurnCard(turn: turn, trustWorkspace: offerTrust ? { confirmingCursorTrust = true } : nil,
-                                 openTerminal: turn.status == "failed" && model.canReset ? { openTerminal(agent: agent) } : nil,
-                                 answering: model.answeringApprovals) { approval, accept in
-                            Task { await model.answerApproval(approval, run: turn.id, agent: agent, accept: accept) }
-                        }
-                    }
-                }
-                .padding(16)
-            }
-            .defaultScrollAnchor(.bottom)
-            .id(agent)
-            palette.separator.frame(height: 1)
             VStack(alignment: .leading, spacing: 10) {
                 if agent.harness == "codex", yolo.wrappedValue {
                     Label("YOLO · Full access", systemImage: "exclamationmark.shield")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(palette.caution)
-                        .help("Codex can run commands on \(host.label) without sandboxing or approval prompts.")
+                        .help("Codex can run commands on \(host.label) with full filesystem and network access.")
                 }
                 if !model.tagPaths.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -1338,8 +1492,7 @@ private struct WorkspacePane: View {
                             ForEach(model.tagPaths.sorted(), id: \.self) { path in
                                 HStack(spacing: 5) {
                                     Button {
-                                        if !showsFiles { onOpenFiles() }
-                                        Task { await model.openFile(path) }
+                                        openFile(path)
                                     } label: {
                                         Text((path as NSString).lastPathComponent)
                                             .font(.caption)
@@ -1367,15 +1520,12 @@ private struct WorkspacePane: View {
                     .id(agent)
                     .font(.system(.body))
                     .scrollContentBackground(.hidden)
-                    .frame(minHeight: 64, idealHeight: 82, maxHeight: 100)
-                    .padding(8)
-                    .background(palette.editor, in: RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(palette.separator).allowsHitTesting(false))
+                    .frame(minHeight: 60, idealHeight: 76, maxHeight: 100)
                     .overlay(alignment: .topLeading) {
                         if model.input(for: agent).isEmpty {
-                            Text(model.steeringRun(agent) == nil ? "Type a prompt or / for commands" : "Send a follow-up to the active turn")
-                                .foregroundStyle(.tertiary)
-                                .padding(.leading, 13).padding(.top, 9)
+                            Text(model.steeringRun(agent) == nil ? "Message \(model.label(for: agent))" : "Send a follow-up to the active turn")
+                                .foregroundStyle(.secondary)
+                                .padding(.leading, 5).padding(.top, 1)
                                 .allowsHitTesting(false).accessibilityHidden(true)
                         }
                     }
@@ -1407,7 +1557,15 @@ private struct WorkspacePane: View {
                     Text(error).font(.caption).foregroundStyle(palette.caution).textSelection(.enabled)
                 }
             }
-            .padding(14)
+            .padding(12)
+            .background(palette.surface, in: RoundedRectangle(cornerRadius: 16))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16).strokeBorder(palette.separator)
+                    .allowsHitTesting(false)
+            }
+            .frame(maxWidth: 680)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 18)
         }
         .task(id: agent.harness, priority: .utility) { await model.loadModelOptions(for: agent.harness) }
     }
@@ -1479,8 +1637,7 @@ private struct WorkspacePane: View {
         showingCommands = nil
         showingStatus = nil
         guard let invocation = ComposerCommand.parse(input) else {
-            let steer = model.steeringRun(agent)
-            Task { await model.submit(from: agent, approvalCards: codexApprovalCards, steer: steer) }
+            Task { await model.submit(from: agent, approvalCards: codexApprovalCards) }
             return
         }
         if invocation.command != .resume, !invocation.argument.isEmpty {
@@ -2110,21 +2267,22 @@ private struct QuickOpenInput: NSViewRepresentable {
 private struct WorkspaceExplorer: View {
     @Environment(\.workbenchPalette) private var palette
     @ObservedObject var model: WorkspaceModel
-    let active: Bool
-    @StateObject private var git: WorkspaceGit
-    @State private var diff: WorkspaceGitChange?
-
-    init(host: FleetHost, model: WorkspaceModel, active: Bool) {
-        self.model = model
-        self.active = active
-        _git = StateObject(wrappedValue: WorkspaceGit(host: host))
-    }
+    @ObservedObject var git: WorkspaceGit
+    let onOpenFile: (String) -> Void
+    let onQuickOpen: () -> Void
+    let onOpenDiff: (WorkspaceGitChange) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Explorer").font(.subheadline.weight(.semibold))
+                Text("Workspace files").font(.subheadline.weight(.semibold))
                 Spacer()
+                Button(action: onQuickOpen) {
+                    Image(systemName: "magnifyingglass").frame(width: 20, height: 20)
+                }
+                .buttonStyle(.plain)
+                .help("Find a file by name or path (⌘P)")
+                .accessibilityLabel("Quick Open")
                 Button {
                     Task { await model.loadFolder("", direction: .refresh) }
                     Task { await git.refresh() }
@@ -2140,35 +2298,13 @@ private struct WorkspaceExplorer: View {
             palette.separator.frame(height: 1)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
-                    WorkspaceGitChanges(git: git) { diff = $0 }
-                    FileBranch(model: model, git: git, directory: "", depth: 0)
+                    WorkspaceGitChanges(git: git, openDiff: onOpenDiff)
+                    FileBranch(model: model, git: git, directory: "", depth: 0, onOpenFile: onOpenFile)
                 }
                 .padding(.vertical, 6)
             }
         }
-        .background(palette.navigation)
-        .task(id: active, priority: .utility) {
-            if active { await git.monitor() }
-        }
-        .onChange(of: git.status) { previous, current in
-            guard let current else { return }
-            let headChanged = previous.map { $0.head != current.head } ?? false
-            let changes = Set(previous?.changes ?? []).symmetricDifference(current.changes).filter(\.affectsFileTree)
-            guard headChanged || !changes.isEmpty else { return }
-            let directories = headChanged ? model.expanded.union([""])
-                : changes.reduce(into: Set([""])) { $0.formUnion($1.parentFolders) }
-            Task {
-                for directory in directories.sorted() where model.folders[directory] != nil
-                    && (directory.isEmpty || model.expanded.contains(directory)) {
-                    await model.loadFolder(directory, direction: .refresh)
-                }
-            }
-        }
-        .sheet(item: $diff) { change in
-            WorkspaceGitDiff(host: git.host, change: change) { path in
-                Task { await model.openFile(path) }
-            }
-        }
+        .background(palette.surface)
     }
 }
 
@@ -2179,13 +2315,20 @@ private struct FileBranch: View {
     @ObservedObject var git: WorkspaceGit
     let directory: String
     let depth: Int
+    let onOpenFile: (String) -> Void
 
     var body: some View {
         if let page = model.folders[directory] {
             ForEach(page.entries) { entry in
+                let isExpanded = entry.isDirectory && model.expanded.contains(entry.path)
                 entryRow(entry)
-                if entry.isDirectory, model.expanded.contains(entry.path) {
-                    FileBranch(model: model, git: git, directory: entry.path, depth: depth + 1)
+                    .onChange(of: isExpanded, initial: true) { _, expanded in
+                        if expanded, model.folders[entry.path] == nil {
+                            Task { await model.loadFolder(entry.path) }
+                        }
+                    }
+                if isExpanded {
+                    FileBranch(model: model, git: git, directory: entry.path, depth: depth + 1, onOpenFile: onOpenFile)
                 }
             }
             if page.isLoading {
@@ -2230,12 +2373,10 @@ private struct FileBranch: View {
         let selected = model.selectedPath == entry.path
         return HStack(spacing: 3) {
             Button {
-                Task {
-                    if entry.isDirectory {
-                        await model.toggleFolder(entry.path)
-                    } else {
-                        await model.openFile(entry.path)
-                    }
+                if entry.isDirectory {
+                    model.toggleFolder(entry.path)
+                } else {
+                    onOpenFile(entry.path)
                 }
             } label: {
                 HStack(spacing: 5) {
@@ -2366,14 +2507,16 @@ private struct SourceEditor: View {
             }
             palette.separator.frame(height: 1)
             HStack {
-                Text(buffer.path)
-                    .font(.system(.caption, design: .monospaced))
+                Text(SourceLanguage(path: buffer.path)?.name ?? "Plain text")
+                    .font(.caption)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .foregroundStyle(.secondary)
                 Spacer()
                 if buffer.isSaving { ProgressView().controlSize(.small) }
-                else if buffer.isDirty { Text("Unsaved").font(.caption).foregroundStyle(.secondary) }
+                else if buffer.isDirty {
+                    Text("Unsaved edits").font(.caption).foregroundStyle(palette.caution)
+                }
                 if model.selectedAgent != nil {
                     Button {
                         model.toggleTag(buffer.path)
@@ -2407,30 +2550,30 @@ private struct TurnCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(turn.prompt)
-                .font(.callout.weight(.medium))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-                .background(palette.tint.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
+            promptBubble {
+                Text(turn.prompt).font(.body).textSelection(.enabled)
+            }
             ForEach(turn.steers) { message in
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(message.status).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Text(message.prompt).font(.callout).textSelection(.enabled)
+                promptBubble {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(message.status).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        Text(message.prompt).font(.body).textSelection(.enabled)
+                    }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-                .background(palette.tint.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
             }
             HStack(spacing: 6) {
-                if turn.isActive { ProgressView().controlSize(.small) }
-                Text(turn.status.capitalized).font(.caption.weight(.semibold))
-                if turn.isActive, turn.reporting == "actions", !turn.action.isEmpty {
+                if turn.needsAttention {
+                    Image(systemName: "hand.raised.fill").accessibilityHidden(true)
+                } else if turn.isActive {
+                    ProgressView().controlSize(.small)
+                }
+                Text(turn.statusLabel).font(.caption.weight(.semibold))
+                if turn.isActive, !turn.needsAttention, turn.reporting == "actions", !turn.action.isEmpty {
                     let isPlan = turn.events.contains { $0.kind == "plan" && $0.text.hasPrefix(turn.action) }
                     if !isPlan { Text(turn.action).font(.caption).lineLimit(2) }
                 }
             }
-            .foregroundStyle(.secondary)
+            .foregroundStyle(turn.needsAttention ? palette.caution : .secondary)
             if !turn.risk.isEmpty, !turn.events.contains(where: { $0.kind == "risk" }) {
                 HStack(alignment: .top) {
                     Image(systemName: "exclamationmark.triangle").accessibilityHidden(true)
@@ -2489,5 +2632,14 @@ private struct TurnCard: View {
                 Button("Open Agent in Terminal", action: openTerminal)
             }
         }
+    }
+
+    private func promptBubble<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(.horizontal, 13)
+            .padding(.vertical, 9)
+            .background(palette.selection, in: RoundedRectangle(cornerRadius: 14))
+            .padding(.leading, 24)
+            .frame(maxWidth: .infinity, alignment: .trailing)
     }
 }

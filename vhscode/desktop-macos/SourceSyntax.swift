@@ -10,13 +10,26 @@ enum SourceLanguage: CaseIterable, Sendable {
         case "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx": self = .javascript
         case "py", "pyi": self = .python
         case "c", "h", "cpp", "hpp", "cc", "cxx", "cs", "go", "java", "kt", "rs": self = .cStyle
-        case "sh", "bash", "zsh", "fish": self = .shell
-        case "json", "jsonc", "toml", "yaml", "yml", "ini": self = .configuration
+        case "sh", "bash", "zsh", "fish", "command": self = .shell
+        case "json", "jsonc", "code-workspace", "toml", "yaml", "yml", "ini": self = .configuration
         case "md", "markdown": self = .markdown
         case "html", "htm", "xml", "svg": self = .markup
         default:
             guard [".bashrc", ".zshrc", ".profile"].contains(name) else { return nil }
             self = .shell
+        }
+    }
+
+    var name: String {
+        switch self {
+        case .swift: "Swift"
+        case .javascript: "JavaScript / TypeScript"
+        case .python: "Python"
+        case .cStyle: "Source code"
+        case .shell: "Shell"
+        case .configuration: "Configuration"
+        case .markdown: "Markdown"
+        case .markup: "Markup"
         }
     }
 

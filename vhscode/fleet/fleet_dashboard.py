@@ -342,11 +342,11 @@ class Dashboard:
             candidates = [(host_id, run) for host_id, run in candidates if reported_risk(run)]
             candidates.sort(key=lambda row: row[1].get("started") or 0, reverse=True)
         else:
-            running = [(host_id, run) for host_id, run in candidates if run["status"] == "running"]
-            completed = [(host_id, run) for host_id, run in candidates if run["status"] != "running"]
-            running.sort(key=lambda row: row[1].get("started") or 0, reverse=True)
+            active = [(host_id, run) for host_id, run in candidates if run["status"] in ("running", "needs_attention")]
+            completed = [(host_id, run) for host_id, run in candidates if run["status"] not in ("running", "needs_attention")]
+            active.sort(key=lambda row: row[1].get("started") or 0, reverse=True)
             completed.sort(key=lambda row: row[1].get("ended") or row[1].get("started") or 0, reverse=True)
-            candidates = running + completed[:RECENT_COMPLETIONS]
+            candidates = active + completed[:RECENT_COMPLETIONS]
         rows = []
         for host_id, run in candidates:
             label = abbreviate(self.hosts[host_id]["label"], 16)
@@ -364,7 +364,7 @@ class Dashboard:
             prefix += "  unavailable"
         if runs:
             latest = runs[0]
-            return (f"{prefix}  {latest['agent']} {latest['status']}  "
+            return (f"{prefix}  {latest['agent']} {run_status_label(latest)}  "
                     f"{len(runs)} runs  {when(latest.get('started'))}  {run_feedback(latest)}")
         if host_id in self.errors:
             return f"{prefix}  {self.errors[host_id]}"
@@ -791,10 +791,14 @@ def run_feedback(run, view=None):
     return outcome
 
 
+def run_status_label(run):
+    return "Needs Attention" if run["status"] == "needs_attention" else run["status"]
+
+
 def run_summary(run, view=None):
     title = abbreviate(run.get("title") or run["repo"], 28)
     ended = f"  Ended {when(run['ended'])}" if run.get("ended") is not None else ""
-    return (f"{title}  {run['agent']} {run['status']}  {run_feedback(run, view)}  "
+    return (f"{title}  {run['agent']} {run_status_label(run)}  {run_feedback(run, view)}  "
             f"{when(run.get('started'))}{ended}")
 
 

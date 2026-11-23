@@ -2,11 +2,11 @@
 
 ### Installed Mac app
 
-Open **Fleet Workbench** in Applications. Choose **File → Open Folder** (⌘O) or **File → Open Workspace from File** (⇧⌘O) to import a VS Code `.code-workspace` project. You can also drop folders or workspace files onto the window. Imported roots appear in the sidebar and persist between launches.
+Open **Fleet Workspace** in Applications. Choose **File → Open Folder** (⌘O) or **File → Open Workspace from File** (⇧⌘O) to import a VS Code `.code-workspace` project. You can also drop folders or workspace files onto the window. Imported roots appear in the sidebar and persist between launches.
 
-The file explorer, editor tabs, and agent controls share a native Mac window. Use ⌘P to find files, ⌘S to save, ⌘B to toggle the explorer, and ⌘W to close the current editor tab. Attach files using the paperclip beside a path in the explorer.
+The conversation stays in the main workspace. Choose **Files** or **Code** in the toolbar to open the file browser or editor alongside it. Use ⌘P to find files, ⌘S to save, ⌘B to toggle workspace files, and ⌘W to close the current editor tab. Attach files using the paperclip beside a path in the explorer.
 
-Open **Appearance** in the sidebar or **Fleet Workbench → Settings** (⌘,) to choose Midnight, Graphite, or Daylight. Set the code font and size for the editor, diff previews, and agent code blocks. The editor highlights syntax for common source and configuration files.
+Open **Appearance** in the sidebar or **Fleet Workspace → Settings** (⌘,) to choose a theme and set the code font and size. The editor shows line numbers and highlights syntax for common source and configuration files.
 
 In a Git workspace, the Explorer marks changed files and folders. Expand **Git Changes** to see staged, unstaged, deleted, and untracked files. Select a file there to preview its changes. The working tree refreshes while the Explorer is open, including on SSH workspaces. For branches with an upstream, **Fetch Git updates** refreshes the ahead and behind counts from the configured remote. Fetch updates the remote-tracking branch and leaves your working files intact.
 
@@ -14,7 +14,7 @@ New workspaces open with no agents, and you can edit files immediately. Use **Ne
 
 Each agent keeps its own prompt, file attachments, and native CLI session. You can add more agents and run them in parallel. Click an agent in the sidebar to view its progress or stop its run.
 
-**Activity** shows working agents first, with their current tasks and latest reported actions across connected workspaces. Select an agent to open its conversation alongside the dashboard. Choose **Runs** to browse run history, or **Open Files** in a conversation to return to the workspace editor.
+**Activity** shows working agents first, with current tasks and recent output across connected workspaces. Select a card to open the conversation alongside the dashboard. Choose **Runs** for history and expandable action groups.
 
 Use the pencil or trash button on an agent’s card or in its conversation header to rename or delete it. You can also right-click the agent in the workspace sidebar. Stop any active run before deleting an agent. Its finished runs remain in run history, and you can resume its native session from another agent.
 
@@ -30,11 +30,11 @@ Choose **Agent options → Edit Agent Command…** or type `/command` in the com
 
 Choose **Open Agent in Terminal** or type `/native` to use the CLI interactively in the workspace and resume the current session when available. Use this to respond to Codex or Cursor trust and approval prompts. **Open Workspace Shell** or `/shell` opens a login shell for checking the installation, signing in manually, or running a CLI command directly. For SSH workspaces, Terminal connects to the workspace machine using your OpenSSH settings. You can also launch a shell from the SSH workspace settings while troubleshooting a connection.
 
-Codex desktop runs show approval cards for shell commands and supported GitHub or other MCP confirmations when Codex requests a decision. Review the command or confirmation and choose **Approve Once** or **Decline** in the conversation. **Agent options → Approval Cards** controls this behavior for new desktop runs. Use **Open Agent in Terminal** for other interactive requests.
+Codex desktop runs show approval cards for shell commands and supported GitHub or other MCP confirmations when Codex requests a decision. The run shows **Needs Attention** while an approval is pending. Review the command or confirmation and choose **Approve Once** or **Decline** in the conversation. **Agent options → Approval Cards** controls this behavior for new desktop runs. Use **Open Agent in Terminal** for other interactive requests.
 
-During a Codex run started with **Approval Cards**, use the composer to send follow-up messages to the active turn. Fleet queues them in order and shows their delivery status in the conversation. If the turn ends before a message can be sent, you can copy it from the conversation and send it yourself.
+During a Codex run started with **Approval Cards** or **YOLO Mode**, use the composer to send follow-up messages to the active turn. Fleet queues them in order and shows their delivery status in the conversation. Messages still queued when a turn completes continue in the same conversation as follow-up turns. You can copy messages marked **Not sent** and send them again.
 
-Choose **Agent options → YOLO Mode (Full Access)** to run desktop Codex prompts without the Codex command sandbox or approval prompts. The setting applies to fresh and resumed turns for the selected agent, on the machine that hosts its workspace. Turn it off to return to your Approval Cards setting. When Approval Cards resumes a full-access conversation, Fleet restores the workspace sandbox. Fleet starts with YOLO off when you reopen the app.
+Choose **Agent options → YOLO Mode (Full Access)** to give desktop Codex commands full filesystem and network access without command approval prompts. The setting applies to fresh and resumed turns for the selected agent, on the machine that hosts its workspace. Supported MCP confirmations still appear in the conversation. YOLO runs can continue past the 30-minute desktop time limit and can be interrupted with **Stop**. Turn it off to return to your Approval Cards setting. When Approval Cards resumes a full-access conversation, Fleet restores the workspace sandbox. Fleet starts with YOLO off when you reopen the app.
 
 ### Running from a source checkout
 

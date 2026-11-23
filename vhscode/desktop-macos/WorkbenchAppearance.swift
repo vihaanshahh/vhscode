@@ -4,9 +4,11 @@ enum WorkbenchTheme: String, CaseIterable, Identifiable {
     case midnight = "Midnight"
     case graphite = "Graphite"
     case daylight = "Daylight"
+    case evergreen = "Evergreen"
+    case parchment = "Parchment"
 
     var id: Self { self }
-    var scheme: ColorScheme { self == .daylight ? .light : .dark }
+    var scheme: ColorScheme { self == .daylight || self == .parchment ? .light : .dark }
 
     var palette: WorkbenchPalette {
         switch self {
@@ -22,6 +24,14 @@ enum WorkbenchTheme: String, CaseIterable, Identifiable {
             WorkbenchPalette(canvas: 0xFCFAF5, sidebar: 0xEFECE3, panel: 0xF5F2EA, border: 0xD9D3C7,
                              ink: 0x282A33, accent: 0x245AA0, success: 0x226541, warning: 0x86521C,
                              failure: 0xA92D46, keyword: 0x6D369A, literal: 0x913819, comment: 0x5E6A73)
+        case .evergreen:
+            WorkbenchPalette(canvas: 0x201F1D, sidebar: 0x292825, panel: 0x2D2C29, border: 0x484540,
+                             ink: 0xEDE9E1, accent: 0xA5C5AC, success: 0xADC19F, warning: 0xDCB77F,
+                             failure: 0xE1A2A0, keyword: 0xC7A6F5, literal: 0x9ECC99, comment: 0xA6A49E)
+        case .parchment:
+            WorkbenchPalette(canvas: 0xFBFAF7, sidebar: 0xF0EEE8, panel: 0xFFFFFF, border: 0xDCD8CE,
+                             ink: 0x292825, accent: 0x38634D, success: 0x3E6A3C, warning: 0x855716,
+                             failure: 0xA24744, keyword: 0x633D99, literal: 0x2E5E3B, comment: 0x626861)
         }
     }
 }

@@ -254,7 +254,7 @@ struct FleetDesktop: App {
     }
     private func post(_ name: String) { NotificationCenter.default.post(name: .init(name), object: nil) }
     var body: some Scene {
-        Window("Fleet Workbench", id: "fleet") {
+        Window("Fleet Workspace", id: "fleet") {
             FleetWindow()
                 .environment(\.workbenchPalette, theme.palette)
                 .environment(\.workbenchTypography, WorkbenchTypography(family: family, size: size))
@@ -283,6 +283,18 @@ struct FleetDesktop: App {
     }
 }
 
+enum FleetRunStatus {
+    static let needsAttention = "needs_attention"
+
+    static func label(_ status: String) -> String {
+        status == needsAttention ? "Needs Attention" : status.capitalized
+    }
+
+    static func isActive(_ status: String) -> Bool {
+        status == "running" || status == needsAttention
+    }
+}
+
 private struct FleetWindow: View {
     private struct SidebarAgent: Decodable, Identifiable, Equatable {
         let agent: String
@@ -290,6 +302,8 @@ private struct FleetWindow: View {
         let status: String
         let title: String?
         let action: String?
+        let runID: String?
+        let output: [FleetActivityEvent]?
         let schedule: String?
         let name: String?
         var id: String { schedule.map { "schedule-\($0)" } ?? "\(agent)-\(lane)" }
@@ -300,6 +314,7 @@ private struct FleetWindow: View {
         var statusLabel: String {
             switch status {
             case "running": "Running"
+            case FleetRunStatus.needsAttention: FleetRunStatus.label(status)
             case "completed": "Done"
             case "failed": "Failed"
             case "cancelled": "Stopped"
@@ -312,6 +327,7 @@ private struct FleetWindow: View {
         func statusColor(_ palette: WorkbenchPalette) -> Color {
             switch status {
             case "running": palette.tint
+            case FleetRunStatus.needsAttention: palette.caution
             case "completed": palette.positive
             case "failed": palette.caution
             default: .secondary
@@ -340,7 +356,7 @@ private struct FleetWindow: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var hosts: [FleetHost] = []
     @AppStorage("FleetLastWorkspace") private var selectedHost = "local"
-    @State private var collapsedGroups = Set<String>()
+    @State private var collapsedGroups = Set(UserDefaults.standard.stringArray(forKey: "FleetCollapsedGroups") ?? [])
     @State private var openedRepo: String?
     @State private var section = "Workspace"
     @State private var activityAgentOpen = false
@@ -350,7 +366,7 @@ private struct FleetWindow: View {
     @State private var error = ""
     @State private var confirmingRemoval = false
     @State private var dirty = false
-    @State private var expandedAgents: [String: Bool] = [:]
+    @State private var expandedAgents = UserDefaults.standard.dictionary(forKey: "FleetExpandedWorkspaces") as? [String: Bool] ?? [:]
     @State private var sidebarAgents: [FleetHost: [SidebarAgent]] = [:]
     @State private var liveRuns: [String: [FleetLiveRun]] = [:]
     @State private var reachable: [String: Bool] = [:]
@@ -372,7 +388,8 @@ private struct FleetWindow: View {
                 guard agent.schedule == nil else { return nil }
                 return FleetActivityAgent(host: host, lane: FleetAgentLane(agent: agent.agent, lane: agent.lane),
                                           label: agent.label, status: agent.status, statusLabel: agent.statusLabel,
-                                          title: agent.title, action: agent.action, reachable: reachable[host.ssh] != false)
+                                          title: agent.title, action: agent.action, runID: agent.runID,
+                                          output: agent.output ?? [], reachable: reachable[host.ssh] != false)
             }
         }
     }
@@ -395,7 +412,7 @@ private struct FleetWindow: View {
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(palette.tint)
                         .accessibilityHidden(true)
-                    Text("Fleet").font(.system(size: 15, weight: .semibold, design: .rounded))
+                    Text("Fleet Workspace").font(.system(size: 14, weight: .semibold, design: .rounded)).lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
                 .padding(.bottom, 6)
@@ -463,8 +480,8 @@ private struct FleetWindow: View {
             }
             ZStack {
                 if let host = current {
-                    WorkspaceView(host: host, monitorRuns: showsWorkspace && scenePhase == .active, showsFiles: showsFiles,
-                                  onOpenFiles: { openWorkspace(host) }, selectedAgentLane: laneSelection, onAgentLabelsChange: { labels in
+                    WorkspaceView(host: host, monitorRuns: showsWorkspace && scenePhase == .active, isVisible: showsWorkspace,
+                                  selectedAgentLane: laneSelection, onAgentLabelsChange: { labels in
                         if labels != nil { rosterRevision = UUID() }
                     }, onActiveAgentLaneChange: { lane in
                         if activeAgentLane[host] != lane { activeAgentLane[host] = lane }
@@ -482,6 +499,12 @@ private struct FleetWindow: View {
         .background(palette.editor)
         .frame(minWidth: 960, minHeight: 620)
         .task { await loadHosts() }
+        .onChange(of: collapsedGroups) { _, groups in
+            UserDefaults.standard.set(groups.sorted(), forKey: "FleetCollapsedGroups")
+        }
+        .onChange(of: expandedAgents) { _, workspaces in
+            UserDefaults.standard.set(workspaces, forKey: "FleetExpandedWorkspaces")
+        }
         .task(id: sidebarQuery) { await monitorSidebar(sidebarQuery) }
         .onReceive(NotificationCenter.default.publisher(for: .init("FleetOpenFolder"))) { _ in chooseWorkspace(file: false) }
         .onReceive(NotificationCenter.default.publisher(for: .init("FleetOpenWorkspace"))) { _ in chooseWorkspace(file: true) }
@@ -558,7 +581,10 @@ private struct FleetWindow: View {
                                  loading: endpoints.contains { reachable[$0.ssh] == nil },
                                  selectedAgentID: activeAgent?.id, onOpenAgent: { agent, action in
             openWorkspace(agent.host, lane: agent.lane, inActivity: true, action: action)
-        }, onOpenRun: { showRuns($0) }, onShowRuns: { showRuns(nil) },
+        }, onOpenRun: { host, run in
+            let endpoint = endpoints.first { $0.ssh == host.ssh } ?? host
+            showRuns(endpoint.id + "/" + run)
+        }, onShowRuns: { showRuns(nil) },
            onCloseAgent: showsAgent ? { activityAgentOpen = false } : nil)
     }
 
@@ -636,7 +662,7 @@ private struct FleetWindow: View {
                             Button("Delete Agent…", role: .destructive) {
                                 openWorkspace(workspace, lane: lane, inActivity: section == "Activity", action: .delete)
                             }
-                            .disabled(agent.status == "running")
+                            .disabled(FleetRunStatus.isActive(agent.status))
                         }
                     }
                 }
@@ -674,7 +700,8 @@ private struct FleetWindow: View {
         while !Task.isCancelled {
             let roster: SidebarRoster?
             do {
-                let reply = try await FleetBridge.call(target, ["op": "sidebar_agents", "repos": repos, "live": query.dashboard])
+                let reply = try await FleetBridge.call(target, ["op": "sidebar_agents", "repos": repos, "live": query.dashboard,
+                                                                       "include_output": query.dashboard])
                 roster = try JSONDecoder().decode(SidebarRoster.self, from: JSONSerialization.data(withJSONObject: reply))
             } catch {
                 roster = nil
@@ -689,7 +716,7 @@ private struct FleetWindow: View {
                 if sidebarAgents != updated { sidebarAgents = updated }
                 if let runs = roster.liveRuns, liveRuns[target.ssh] != runs { liveRuns[target.ssh] = runs }
             }
-            let running = roster?.workspaces.values.contains { $0.contains { $0.status == "running" } } == true
+            let running = roster?.workspaces.values.contains { $0.contains { FleetRunStatus.isActive($0.status) } } == true
             do { try await Task.sleep(for: .seconds(query.dashboard ? 2 : running ? 3 : 8)) } catch { return }
         }
     }

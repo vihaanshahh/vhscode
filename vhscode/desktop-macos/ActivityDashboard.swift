@@ -10,10 +10,12 @@ struct FleetActivityAgent: Identifiable {
     let statusLabel: String
     let title: String?
     let action: String?
+    let runID: String?
+    let output: [FleetActivityEvent]
     let reachable: Bool
 
     var id: String { "\(host.id)/\(lane.agent)/\(lane.lane)" }
-    var working: Bool { reachable && status == "running" }
+    var working: Bool { reachable && FleetRunStatus.isActive(status) }
 }
 
 struct FleetLiveRun: Decodable, Identifiable, Equatable {
@@ -23,6 +25,7 @@ struct FleetLiveRun: Decodable, Identifiable, Equatable {
     let title: String
     let action: String?
     let schedule: String?
+    let output: [FleetActivityEvent]?
 }
 
 struct ActivityDashboard: View {
@@ -32,7 +35,7 @@ struct ActivityDashboard: View {
     let loading: Bool
     let selectedAgentID: String?
     let onOpenAgent: (FleetActivityAgent, FleetAgentAction?) -> Void
-    let onOpenRun: (String) -> Void
+    let onOpenRun: (FleetHost, String) -> Void
     let onShowRuns: () -> Void
     let onCloseAgent: (() -> Void)?
 
@@ -81,13 +84,13 @@ struct ActivityDashboard: View {
                                     ForEach(working) { agent in agentCard(agent) }
                                     ForEach(runs, id: \.run.id) { item in
                                         Button {
-                                            onOpenRun(item.host.id + "/" + item.run.id)
+                                            onOpenRun(item.host, item.run.id)
                                         } label: {
                                             VStack(alignment: .leading, spacing: 8) {
                                                 cardHeader(item.run.schedule == nil ? provider(item.run.agent) : "\(provider(item.run.agent)) schedule",
                                                            status: "Running", color: palette.tint)
                                                 metadata(item.host, repo: item.run.repo)
-                                                currentWork(item.run.title, action: item.run.action)
+                                                currentWork(item.run.title, action: item.run.action, output: item.run.output ?? [])
                                             }
                                             .padding(12)
                                             .contentShape(Rectangle())
@@ -133,6 +136,7 @@ struct ActivityDashboard: View {
                 VStack(alignment: .leading, spacing: 8) {
                     let color = switch agent.status {
                     case "running": palette.tint
+                    case FleetRunStatus.needsAttention: palette.caution
                     case "completed": palette.positive
                     case "failed": palette.negative
                     case "cancelled": palette.caution
@@ -141,7 +145,9 @@ struct ActivityDashboard: View {
                     cardHeader(agent.label, status: agent.reachable ? agent.statusLabel : "Offline",
                                color: agent.reachable ? color : palette.caution)
                     metadata(agent.host, repo: agent.host.repo, providerName: provider(agent.lane.agent))
-                    if agent.working { currentWork(agent.title, action: agent.action) }
+                    if agent.reachable && (agent.working || !agent.output.isEmpty) {
+                        currentWork(agent.title, action: agent.action, output: agent.output)
+                    }
                 }
                 .padding(12)
                 .contentShape(Rectangle())
@@ -151,6 +157,13 @@ struct ActivityDashboard: View {
             .accessibilityAddTraits(selectedAgentID == agent.id ? .isSelected : [])
             HStack(spacing: 3) {
                 Spacer(minLength: 0)
+                if let runID = agent.runID {
+                    Button { onOpenRun(agent.host, runID) } label: {
+                        Image(systemName: "clock").frame(width: 25, height: 23).contentShape(Rectangle())
+                    }
+                    .help("View \(agent.label)’s latest run")
+                    .accessibilityLabel("View \(agent.label)’s latest run")
+                }
                 Button { onOpenAgent(agent, .rename) } label: {
                     Image(systemName: "pencil").frame(width: 25, height: 23).contentShape(Rectangle())
                 }
@@ -159,8 +172,8 @@ struct ActivityDashboard: View {
                 Button(role: .destructive) { onOpenAgent(agent, .delete) } label: {
                     Image(systemName: "trash").frame(width: 25, height: 23).contentShape(Rectangle())
                 }
-                .disabled(agent.status == "running")
-                .help(agent.status == "running" ? "Stop this agent before deleting it" : "Delete \(agent.label)")
+                .disabled(FleetRunStatus.isActive(agent.status))
+                .help(FleetRunStatus.isActive(agent.status) ? "Stop this agent before deleting it" : "Delete \(agent.label)")
                 .accessibilityLabel("Delete \(agent.label)")
             }
             .buttonStyle(.plain)
@@ -196,12 +209,20 @@ struct ActivityDashboard: View {
             .help(repo)
     }
 
-    @ViewBuilder private func currentWork(_ title: String?, action: String?) -> some View {
+    @ViewBuilder private func currentWork(_ title: String?, action: String?, output: [FleetActivityEvent]) -> some View {
         if let title, !title.isEmpty {
             Text(title).font(.callout).lineLimit(1)
         }
-        if let action, !action.isEmpty, action != title {
+        if let action, !action.isEmpty, action != title, action != output.last?.text {
             Text(AgentMarkdownDocument.preview(action)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+        }
+        if let latest = output.last {
+            let kind = FleetActivityStep.Kind(event: latest)
+            Label(kind.label, systemImage: kind.symbol)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(kind.color(palette))
+            Text(AgentMarkdownDocument.preview(latest.text, blockLimit: 2))
+                .font(.caption).foregroundStyle(.secondary).lineLimit(3)
         }
     }
 

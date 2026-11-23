@@ -230,9 +230,58 @@ struct WorkspaceGitDiff: View {
         var id: String { title }
     }
 
+    private struct Preview: Identifiable {
+        let section: Section
+        var id: String { section.id }
+        let body: AttributedString
+        let added: Int
+        let removed: Int
+
+        init(_ section: Section, untracked: Bool, palette: WorkbenchPalette) {
+            self.section = section
+            var body = AttributedString()
+            var added = 0
+            var removed = 0
+            var prefixWidth = 0
+            let text = section.text
+            text.enumerateSubstrings(in: text.startIndex..<text.endIndex, options: [.byLines]) { line, _, range, _ in
+                guard let line else { return }
+                var rendered = AttributedString(text[range])
+                if untracked {
+                    added += 1
+                    rendered.foregroundColor = palette.positive
+                } else if line.hasPrefix("@@") {
+                    prefixWidth = line.prefix(while: { $0 == "@" }).count - 1
+                    rendered.foregroundColor = palette.tint
+                } else if line.hasPrefix("diff --") {
+                    prefixWidth = 0
+                    rendered.foregroundColor = .secondary
+                } else {
+                    switch line.prefix(prefixWidth).first(where: { $0 == "+" || $0 == "-" }) {
+                    case "+":
+                        added += 1
+                        rendered.foregroundColor = palette.positive
+                        rendered.backgroundColor = palette.positive.opacity(0.11)
+                    case "-":
+                        removed += 1
+                        rendered.foregroundColor = palette.negative
+                        rendered.backgroundColor = palette.negative.opacity(0.11)
+                    default:
+                        if prefixWidth == 0 || line.hasPrefix("\\") { rendered.foregroundColor = .secondary }
+                    }
+                }
+                body.append(rendered)
+            }
+            self.body = body
+            self.added = added
+            self.removed = removed
+        }
+    }
+
     let host: FleetHost
     let change: WorkspaceGitChange
-    let openFile: (String) -> Void
+    var hasUnsavedEdits = false
+    let openFile: ((String) -> Void)?
     @Environment(\.dismiss) private var dismiss
     @Environment(\.workbenchTypography) private var typography
     @State private var sections: [Section]?
@@ -240,26 +289,45 @@ struct WorkspaceGitDiff: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(change.original.map { "\($0) → \(change.path)" } ?? change.path)
-                    .font(.headline).textSelection(.enabled)
-                Spacer()
-                WorkspaceGitBadge(change: change)
+                    .font(.headline).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                Text(change.summary).font(.caption).foregroundStyle(change.color(palette))
+            }
+            if hasUnsavedEdits {
+                Label("Save your edits to include them in this diff.", systemImage: "info.circle")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Divider()
             if let sections, !sections.isEmpty {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
-                        ForEach(sections) { section in
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text(section.title).font(.subheadline.weight(.semibold))
+                        ForEach(sections.map { Preview($0, untracked: change.isUntracked, palette: palette) }) { preview in
+                            VStack(alignment: .leading, spacing: 7) {
+                                HStack(spacing: 10) {
+                                    Text(preview.section.title).font(.subheadline.weight(.semibold))
+                                    Spacer()
+                                    if preview.added > 0 {
+                                        Text("+\(preview.added) added").foregroundStyle(palette.positive)
+                                    }
+                                    if preview.removed > 0 {
+                                        Text("−\(preview.removed) removed").foregroundStyle(palette.negative)
+                                    }
+                                }
+                                .font(.caption.monospacedDigit())
                                 ScrollView(.horizontal) {
-                                    Text(verbatim: section.text)
+                                    Text(preview.body.characters.isEmpty ? AttributedString("Empty file") : preview.body)
                                         .font(typography.code)
                                         .textSelection(.enabled)
                                         .fixedSize(horizontal: true, vertical: false)
+                                        .padding(9)
                                 }
-                                if section.truncated {
+                                .background(palette.editor, in: RoundedRectangle(cornerRadius: 7))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 7).strokeBorder(palette.separator)
+                                        .allowsHitTesting(false)
+                                }
+                                if preview.section.truncated {
                                     Text("Diff preview truncated").font(.caption).foregroundStyle(.secondary)
                                 }
                             }
@@ -276,7 +344,7 @@ struct WorkspaceGitDiff: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             HStack {
-                if !change.isDeleted {
+                if let openFile, !change.isDeleted {
                     Button("Open File") {
                         dismiss()
                         openFile(change.path)
@@ -288,6 +356,7 @@ struct WorkspaceGitDiff: View {
         }
         .padding(16)
         .frame(minWidth: 540, idealWidth: 660, minHeight: 320, idealHeight: 420)
+        .background(palette.surface)
         .task {
             var request: [String: Any] = ["op": "git_diff", "path": change.path, "untracked": change.isUntracked]
             if let original = change.original { request["original"] = original }
@@ -297,7 +366,8 @@ struct WorkspaceGitDiff: View {
                 guard let rawSections = reply["sections"] else {
                     throw FleetError(message: "The workspace did not return a diff.")
                 }
-                sections = try JSONDecoder().decode([Section].self, from: JSONSerialization.data(withJSONObject: rawSections))
+                let decoded = try JSONDecoder().decode([Section].self, from: JSONSerialization.data(withJSONObject: rawSections))
+                sections = decoded
             } catch {
                 if !Task.isCancelled { self.error = error.localizedDescription }
             }

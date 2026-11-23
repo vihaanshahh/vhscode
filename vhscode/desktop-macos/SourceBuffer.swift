@@ -93,6 +93,11 @@ struct PlainSourceView: NSViewRepresentable {
         editor.setAccessibilityLabel("Editor for \(buffer.path)")
         editor.save = save
         scroll.documentView = editor
+        let ruler = SourceLineRuler(scrollView: scroll, editor: editor)
+        scroll.verticalRulerView = ruler
+        scroll.hasVerticalRuler = true
+        scroll.rulersVisible = true
+        context.coordinator.ruler = ruler
         context.coordinator.editor = editor
         buffer.storage.delegate = context.coordinator
         return scroll
@@ -120,6 +125,7 @@ struct PlainSourceView: NSViewRepresentable {
         private let language: SourceLanguage?
         var edited: () -> Void
         weak var editor: SourceTextView?
+        weak var ruler: SourceLineRuler?
         var highlightTask: Task<Void, Never>?
         private var palette: WorkbenchPalette?
         private var typography: WorkbenchTypography?
@@ -136,6 +142,7 @@ struct PlainSourceView: NSViewRepresentable {
             let themeChanged = self.palette != palette
             self.palette = palette
             self.typography = typography
+            ruler?.palette = palette
 
             let ink = WorkbenchPalette.color(palette.ink)
             let canvas = WorkbenchPalette.color(palette.canvas)
@@ -172,11 +179,14 @@ struct PlainSourceView: NSViewRepresentable {
         }
 
         private func refreshHighlighting() {
-            guard let language, let palette, let layout = editor?.layoutManager else { return }
+            guard let palette, let layout = editor?.layoutManager else { return }
             highlightTask?.cancel()
             let buffer = self.buffer
-            highlightTask = Task { [weak layout] in
+            let language = self.language
+            highlightTask = Task { [weak layout, weak ruler] in
                 guard (try? await Task.sleep(for: .milliseconds(120))) != nil else { return }
+                ruler?.updateLines()
+                guard let language else { return }
                 let tokens = await language.tokens(in: buffer.text)
                 guard !Task.isCancelled, let layout else { return }
                 // Layout-only color keeps syntax out of undo, clipboard contents, and saves.

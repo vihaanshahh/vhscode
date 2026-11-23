@@ -30,7 +30,10 @@ MANUAL_LOCKS = {}
 RUNTIME = str(Path(__file__).resolve())
 RUNS_VIEW = """
     WITH display AS (
-        SELECT id, agent, repo, status, started, ended, view, action, risk, title, session, detached, lane, generation, steerable,
+        SELECT id, agent, repo, started, ended, view, action, risk, title, session, detached, lane, generation, steerable,
+               CASE WHEN status = 'running' AND cancel_requested = 0 AND EXISTS (
+                   SELECT 1 FROM approvals WHERE run_id = runs.id AND decision IS NULL
+               ) THEN 'needs_attention' ELSE status END AS status,
                CASE WHEN status IN ('failed', 'cancelled')
                     THEN COALESCE(diagnostic, outcome) ELSE outcome END AS outcome
         FROM runs
@@ -307,11 +310,15 @@ def queue_steer(repo, run_id, prompt, tags):
         return {"id": row.lastrowid}
 
 
-def claim_steer(run_id):
+def claim_steer(run_id, *, close_if_empty=False):
     with _connect() as db:
+        if close_if_empty:
+            db.execute("BEGIN IMMEDIATE")
         row = db.execute("""
             SELECT id, prompt, tags FROM run_steers WHERE run_id=? AND state='queued' ORDER BY id LIMIT 1
         """, (run_id,)).fetchone()
+        if row is None and close_if_empty:
+            db.execute("UPDATE runs SET steerable=0 WHERE id=?", (run_id,))
         if row is not None and db.execute("""
             UPDATE run_steers SET state='sending' WHERE id=? AND state='queued'
             AND EXISTS (SELECT 1 FROM runs WHERE id=? AND status='running' AND cancel_requested=0)
@@ -319,10 +326,10 @@ def claim_steer(run_id):
             return row
 
 
-def settle_steer(run_id, identifier, accepted):
+def settle_steer(run_id, identifier, state):
     with _connect() as db:
         db.execute("UPDATE run_steers SET state=? WHERE run_id=? AND id=? AND state='sending'",
-                   ("sent" if accepted else "unsent", run_id, identifier))
+                   (state, run_id, identifier))
 
 
 def end_run(run_id, status, *, error=None, session=None):
@@ -361,6 +368,37 @@ def _reap_manual():
             _unlock_manual(run_id, fd)
 
 
+def activity_output(db, run_ids):
+    if not run_ids:
+        return {}
+    placeholders = ",".join("?" for _ in run_ids)
+    rows = db.execute(f"""
+        WITH entries AS (
+            SELECT run_id, seq, kind, substr(text, 1, 1200) AS text, at,
+                   CASE WHEN kind IN ('info', 'plan') THEN 'progress'
+                        WHEN kind IN ('risk', 'error') THEN 'issue'
+                        ELSE kind END AS category
+            FROM events
+            WHERE run_id IN ({placeholders}) AND kind IN ('info', 'plan', 'risk', 'error', 'result')
+                  AND NOT (kind='info' AND text LIKE 'CLI token usage for this turn:%')
+        ), ranked AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY run_id, category ORDER BY seq DESC) AS position
+            FROM entries
+        )
+        SELECT run_id, seq, kind, text, at FROM ranked
+        WHERE position <= CASE WHEN category='progress' THEN 2 ELSE 1 END
+        ORDER BY seq
+    """, tuple(run_ids))
+    output = {}
+    for row in rows:
+        run_id = row["run_id"]
+        entries = output.setdefault(run_id, [])
+        entry = dict(row)
+        del entry["run_id"]
+        entries.append(entry)
+    return output
+
+
 def rpc(request):
     op = request.get("op")
     if op == "browse_folders":
@@ -369,7 +407,8 @@ def rpc(request):
         return browse_folders(request)
     if op == "sidebar_agents":
         from fleet_models import sidebar_agents
-        return sidebar_agents(request.get("repos"), live=request.get("live") is True)
+        return sidebar_agents(request.get("repos"), live=request.get("live") is True,
+                              include_output=request.get("include_output") is True)
     if op in {"cursor_trust_status", "set_cursor_trust"}:
         from fleet_cursor_trust import workspace_trust
         from fleet_hosts import workspace_root
@@ -389,11 +428,16 @@ def rpc(request):
         with _connect() as db:
             db.execute("BEGIN")
             runs = db.execute(RUNS_VIEW + " ORDER BY started DESC, id").fetchall()
+            output = activity_output(db, {
+                row["id"] for row in runs if row["status"] in ("running", "needs_attention")
+            }) if request.get("include_output") is True else {}
             schedules = db.execute(
                 """SELECT id, agent, repo, substr(prompt, 1, 256) AS prompt, minutes, enabled, next_run, view
                    FROM schedules ORDER BY rowid DESC"""
             ).fetchall()
-        return {"runs": [dict(row, detached=bool(row["detached"])) for row in runs], "schedules": [
+        return {"runs": [dict(row, detached=bool(row["detached"]), **(
+            {"output": output[row["id"]]} if row["id"] in output else {}
+        )) for row in runs], "schedules": [
             dict(row, enabled=bool(row["enabled"])) for row in schedules
         ]}
     if op == "detail":
@@ -411,12 +455,13 @@ def rpc(request):
             revision = None
             if "revision" in request and run is not None:
                 sequence = db.execute("SELECT MAX(seq) FROM events WHERE run_id=?", (run_id,)).fetchone()[0]
-                revision = f"{run['status']}:{sequence}:{len(approvals)}:{sum(row['decision'] is not None for row in approvals)}"
+                decisions = sum(row["decision"] is not None for row in approvals)
+                revision = f"{run['status']}:{run['steerable']}:{sequence}:{len(approvals)}:{decisions}"
                 revision += ":" + ",".join(row["state"] for row in steers)
                 if revision == request["revision"]:
                     return {"unchanged": True}
             rows = db.execute(
-                "SELECT kind, text, at FROM events WHERE run_id = ? ORDER BY seq", (run_id,)
+                "SELECT seq, kind, text, at FROM events WHERE run_id = ? ORDER BY seq", (run_id,)
             ).fetchall()
         metadata = dict(run, detached=bool(run["detached"])) if run is not None else None
         reply = {"events": [dict(row) for row in rows], "run": metadata}
@@ -652,8 +697,8 @@ def _daemon(fd, startup):
         time.sleep(POLL_SECONDS)
 
 
-def _watch_run(run_id, done, interrupted):
-    deadline = time.monotonic() + RUN_TIMEOUT
+def _watch_run(run_id, done, interrupted, *, timeout=RUN_TIMEOUT):
+    deadline = time.monotonic() + timeout if timeout is not None else None
     while not done.wait(POLL_SECONDS):
         cancelled = False
         try:
@@ -662,7 +707,7 @@ def _watch_run(run_id, done, interrupted):
             cancelled = row is None or row["cancel_requested"]
         except sqlite3.OperationalError:
             pass
-        if not cancelled and time.monotonic() < deadline:
+        if not cancelled and (deadline is None or time.monotonic() < deadline):
             continue
         if done.is_set():
             return

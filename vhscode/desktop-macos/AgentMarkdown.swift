@@ -163,14 +163,19 @@ enum AgentMarkdownDocument {
         return blocks
     }
 
-    static func preview(_ source: String) -> AttributedString {
+    static func preview(_ source: String, blockLimit: Int = 1) -> AttributedString {
+        var preview = AttributedString()
+        var remaining = blockLimit
         for block in parse(source) {
             var content = block.rows.first?.first ?? block.content
             if !content.characters.isEmpty {
                 content.link = nil
-                return content
+                if !preview.characters.isEmpty { preview.append(AttributedString("\n")) }
+                preview.append(content)
+                remaining -= 1
+                if remaining == 0 { break }
             }
         }
-        return AttributedString()
+        return preview
     }
 }

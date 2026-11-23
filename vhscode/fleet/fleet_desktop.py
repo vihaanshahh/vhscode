@@ -538,7 +538,7 @@ def _submit(root, request):
     _reap_manual()
     run_id = begin_run(root, agent, prompt, view, session=session, detached=True,
                        known_session=session == settings["session"], lane=lane, generation=settings["generation"],
-                       steerable=approval_cards)
+                       steerable=approval_cards or yolo)
     fd = MANUAL_LOCKS[run_id]
     try:
         with tempfile.TemporaryFile() as payload:
@@ -563,12 +563,11 @@ def _submit(root, request):
 
 def _run(run_id, fd):
     from fleet_harness import HarnessError, run
-    from fleet_jobs import MANUAL_LOCKS, TERMINAL, _connect, _watch_run, end_run, event
+    from fleet_jobs import MANUAL_LOCKS, RUN_TIMEOUT, TERMINAL, _connect, _watch_run, end_run, event
 
     MANUAL_LOCKS[run_id] = fd
     done = threading.Event()
     interrupted = []
-    watcher = threading.Thread(target=_watch_run, args=(run_id, done, interrupted), daemon=True)
     status, session, error = "failed", None, None
 
     def on_event(kind, text):
@@ -585,12 +584,17 @@ def _run(run_id, fd):
         if row is None or row["cancel_requested"]:
             status = "cancelled"
             return
+        yolo = request.get("yolo", False)
+        watcher = threading.Thread(
+            target=_watch_run, args=(run_id, done, interrupted),
+            kwargs={"timeout": None if yolo else RUN_TIMEOUT}, daemon=True,
+        )
         watcher.start()
         session = run(
             Path(request["repo"]), request["agent"], request["prompt"], set(request["tags"]),
             request["session"], request["filter"], on_event=on_event, detailed=True, silent=True,
             view=request["view"], model=request["model"],
-            interactive_run=run_id if request.get("approval_cards") else None, yolo=request.get("yolo", False),
+            interactive_run=run_id if request.get("approval_cards") or yolo else None, yolo=yolo,
         )
         if session and status == "completed":
             from fleet_models import remember
