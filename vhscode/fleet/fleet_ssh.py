@@ -78,9 +78,11 @@ def remote_python(arguments):
     # macOS can expose an older system Python over SSH while the installed app ships a newer one.
     return (
         'fleet_python=python3; '
-        'for candidate in "$HOME/Applications/Fleet Workbench.app/Contents/Resources/python/bin/python3" '
-        '"/Applications/Fleet Workbench.app/Contents/Resources/python/bin/python3"; do '
-        'if [ -x "$candidate" ]; then fleet_python="$candidate"; break; fi; done; '
+        'for directory in "$HOME/Applications" /Applications; do '
+        'for app in "Fleet Workspace.app" "Fleet Workbench.app"; do '
+        'candidate="$directory/$app/Contents/Resources/python/bin/python3"; '
+        'if [ -x "$candidate" ]; then fleet_python="$candidate"; break 2; fi; '
+        'done; done; '
         f'exec "$fleet_python" -E -s -B {arguments}'
     )
 

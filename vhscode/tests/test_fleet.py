@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -9,6 +10,9 @@ import unittest
 
 
 FLEET = Path(__file__).resolve().parents[1] / "fleet" / "fleet.py"
+sys.path.insert(0, str(FLEET.parent))
+
+from fleet_ssh import remote_python
 
 
 class FleetTest(unittest.TestCase):
@@ -41,6 +45,23 @@ class FleetTest(unittest.TestCase):
         reply = json.loads(response.stdout)
         self.assertNotIn("error", reply, reply)
         return reply
+
+    def test_remote_shell_prefers_bundled_python_under_both_app_names(self):
+        apps = self.root / "Applications"
+        bundle = apps / "Fleet Workspace.app"
+        interpreter = Path("Contents/Resources/python/bin/python3")
+        python = bundle / interpreter
+        python.parent.mkdir(parents=True)
+        python.write_text(f'#!/bin/sh\nFLEET_FIXTURE_PYTHON="$0" exec {shlex.quote(sys.executable)} "$@"\n')
+        python.chmod(0o700)
+        command = remote_python(shlex.join(["-c", "import os; print(os.environ['FLEET_FIXTURE_PYTHON'])"]))
+        env = dict(self.env, HOME=str(self.root), PATH="/usr/bin:/bin")
+        for name in ("Fleet Workspace.app", "Fleet Workbench.app"):
+            with self.subTest(name=name):
+                bundle = bundle.rename(apps / name) if bundle.name != name else bundle
+                result = subprocess.run(["/bin/sh", "-c", command], env=env, text=True,
+                                        capture_output=True, check=True, timeout=5)
+                self.assertEqual(Path(result.stdout.strip()), bundle / interpreter)
 
     def test_manual_view_and_one_turn_override(self):
         result = self.invoke([str(self.repo)], "/view summary\nreview\n/actions review again\n/quit\n")
