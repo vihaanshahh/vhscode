@@ -22,11 +22,9 @@ vhscode         # launch
 
 From this checkout, run `opencode --agent approval`, or press **Tab** in the OpenCode TUI to select **approval**. The agent explains proposed shell commands, file changes, and subagent launches before OpenCode asks you to approve them. Choose **Allow Once** to review each request individually.
 
-In Fleet Workbench, select a Codex agent and open **Agent options → Approval Cards**. Approval Cards are on by default, and **Approve Once** or **Decline** appears in the conversation when Codex requests a decision.
+## Fleet Workspace
 
-## Fleet Workbench
-
-Open the macOS app for a graphical workspace editor, fleet activity, and schedules. The native Codex and Cursor CLIs own model execution and session context. Fleet stores per-workspace model preferences and references to the CLI sessions. The source checkout also offers a terminal command for headless hosts. [Fleet guide](fleet/README.md)
+Fleet Workspace is maintained separately from VHSCode. See the [standalone project](https://github.com/vihaanshahh/fleet-workspace).
 
 ## The orchestration layer
 
