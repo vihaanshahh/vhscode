@@ -22,7 +22,7 @@ Choose **Open Agent in Terminal** or type `/native` to use the CLI interactively
 
 Codex desktop runs show approval cards for shell commands and supported GitHub or other MCP confirmations when Codex requests a decision. Review the command or confirmation and choose **Approve Once** or **Decline** in the conversation. **Agent options → Approval Cards** controls this behavior for new desktop runs. Use **Open Agent in Terminal** for other interactive requests.
 
-Choose **Agent options → YOLO Mode (Full Access)** to run desktop Codex prompts without the Codex command sandbox or approval prompts. The setting applies to fresh and resumed turns for the selected agent, on the machine that hosts its workspace. Turn it off to return to your Approval Cards setting. Fleet starts with YOLO off when you reopen the app.
+Choose **Agent options → YOLO Mode (Full Access)** to run desktop Codex prompts without the Codex command sandbox or approval prompts. The setting applies to fresh and resumed turns for the selected agent, on the machine that hosts its workspace. Turn it off to return to your Approval Cards setting. When Approval Cards resumes a full-access conversation, Fleet restores the workspace sandbox. Fleet starts with YOLO off when you reopen the app.
 
 ### Running from a source checkout
 

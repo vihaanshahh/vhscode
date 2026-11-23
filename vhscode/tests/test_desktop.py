@@ -77,12 +77,27 @@ if name == "codex" and arguments == ["app-server", "--listen", "stdio://"]:
         sys.exit()
     if request["method"] in ("thread/start", "thread/resume"):
         assert request["params"]["approvalPolicy"] == "on-request", request
-        thread_id = "approval-thread"
-        print(json.dumps({"id": request["id"], "result": {"thread": {"id": thread_id}}}), flush=True)
+        resumed = request["method"] == "thread/resume"
+        thread_id = "codex-fixture" if resumed else "approval-thread"
+        result = {"thread": {"id": thread_id}}
+        if resumed:
+            assert request["params"]["threadId"] == thread_id, request
+            result["sandbox"] = {"type": "dangerFullAccess"}
+        print(json.dumps({"id": request["id"], "result": result}), flush=True)
         request = json.loads(sys.stdin.readline())
         assert request["method"] == "turn/start" and request["params"]["threadId"] == thread_id, request
         turn_id = "approval-turn"
         print(json.dumps({"id": request["id"], "result": {"turn": {"id": turn_id}}}), flush=True)
+        if resumed:
+            assert request["params"]["sandboxPolicy"] == {
+                "type": "workspaceWrite", "writableRoots": [str(Path.cwd())], "networkAccess": False,
+                "excludeTmpdirEnvVar": False, "excludeSlashTmp": False,
+            }, request
+            print(json.dumps({"method": "turn/completed", "params": {
+                "threadId": thread_id, "turn": {"id": turn_id, "status": "completed"},
+            }}), flush=True)
+            sys.exit()
+        assert "sandboxPolicy" not in request["params"], request
         context = {"threadId": thread_id, "turnId": turn_id}
         print(json.dumps({
             "id": "command-approval", "method": "item/commandExecution/requestApproval",
@@ -508,6 +523,11 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertEqual(resumed["outcome"], "codex-fixture follow-up completed.")
         ordinary, _ = self.finished_run("codex", prompt="Follow up", tags=tags)
         self.assertEqual(ordinary["session"], first["session"])
+
+    def test_approval_cards_restore_workspace_sandbox_after_yolo(self):
+        full_access, _ = self.finished_run("codex", prompt="YOLO logout", yolo=True)
+        reviewed, _ = self.finished_run("codex", prompt="Approval fixture", approval_cards=True)
+        self.assertEqual(reviewed["session"], full_access["session"])
 
     def test_yolo_rejects_invalid_desktop_run_options(self):
         for options in ({"agent": "cursor", "yolo": True},

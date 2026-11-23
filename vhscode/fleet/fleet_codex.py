@@ -95,9 +95,17 @@ def run_approval_turn(root, argv, environment, prompt, session, stream, model, r
                 if not isinstance(thread_id, str) or not thread_id:
                     raise ValueError("Codex returned no thread ID.")
                 stream.session = thread_id
-                send({"id": 3, "method": "turn/start", "params": {
+                options = {
                     "threadId": thread_id, "input": [{"type": "text", "text": prompt, "text_elements": []}],
-                }})
+                }
+                sandbox = result.get("sandbox")
+                if session and isinstance(sandbox, dict) and sandbox.get("type") == "dangerFullAccess":
+                    # Codex can restore the previous turn's sandbox independently of approvalPolicy.
+                    options["sandboxPolicy"] = {
+                        "type": "workspaceWrite", "writableRoots": [str(root)], "networkAccess": False,
+                        "excludeTmpdirEnvVar": False, "excludeSlashTmp": False,
+                    }
+                send({"id": 3, "method": "turn/start", "params": options})
             elif turn_id is None:
                 turn_id = result.get("turn", {}).get("id")
             return
