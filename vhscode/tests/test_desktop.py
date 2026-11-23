@@ -145,9 +145,13 @@ if name in ("cursor-agent", "agent") and arguments == ["acp"]:
 
 if name == "codex":
     session = "codex-fixture"
-    resumed = arguments == ["exec", "resume", "--json", "--model=fixture-codex", "--", session, "-"]
-    assert resumed or arguments == ["exec", "--json", "-"], arguments
     prompt = sys.stdin.read()
+    options = ["--json"]
+    if prompt.startswith("YOLO "):
+        options.append("--dangerously-bypass-approvals-and-sandbox")
+        prompt = prompt.removeprefix("YOLO ")
+    resumed = arguments == ["exec", "resume", *options, "--model=fixture-codex", "--", session, "-"]
+    assert resumed or arguments == ["exec", *options, "-"], arguments
 else:
     assert name in ("cursor-agent", "agent"), name
     session = "cursor-fixture"
@@ -341,9 +345,9 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertEqual(reply["files"], [self.guide.relative_to(self.repo).as_posix()])
         self.assertIs(reply["more"], False)
 
-    def finished_run(self, agent, *, prompt, tags=(), expected_status="completed"):
+    def finished_run(self, agent, *, prompt, tags=(), expected_status="completed", **settings):
         run_id = self.success(self.request(
-            "submit", agent=agent, prompt=prompt, tags=list(tags), view="actions"
+            "submit", agent=agent, prompt=prompt, tags=list(tags), view="actions", **settings,
         ))["id"]
         deadline = time.monotonic() + 8
         while True:
@@ -493,6 +497,24 @@ class DesktopBridgeTest(unittest.TestCase):
                 return
             time.sleep(0.1)
         self.fail("Codex did not resume after the approval decision")
+
+    def test_codex_yolo_applies_only_to_requested_turns(self):
+        first, _ = self.finished_run("codex", prompt="YOLO logout", yolo=True)
+        self.assertEqual(first["outcome"], "codex-fixture initial completed.")
+        self.success(self.request("set_model", agent="codex", model="fixture-codex"))
+        tags = [self.guide.relative_to(self.repo).as_posix()]
+        resumed, _ = self.finished_run("codex", prompt="YOLO Follow up", tags=tags, yolo=True)
+        self.assertEqual(resumed["session"], first["session"])
+        self.assertEqual(resumed["outcome"], "codex-fixture follow-up completed.")
+        ordinary, _ = self.finished_run("codex", prompt="Follow up", tags=tags)
+        self.assertEqual(ordinary["session"], first["session"])
+
+    def test_yolo_rejects_invalid_desktop_run_options(self):
+        for options in ({"agent": "cursor", "yolo": True},
+                        {"agent": "codex", "yolo": "true"},
+                        {"agent": "codex", "yolo": True, "approval_cards": True}):
+            with self.subTest(options=options):
+                self.assertIn("YOLO mode requires Codex", self.request("submit", prompt="logout", **options)["error"])
 
     def test_cursor_catalog_reports_host_authentication_and_network_errors(self):
         for error, expected in (

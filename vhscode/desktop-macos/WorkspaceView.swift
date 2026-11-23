@@ -113,6 +113,7 @@ private struct AgentDraft {
     var tags = Set<String>()
     var reporting = "actions"
     var filterProgress = false
+    var yolo = false
 }
 
 private enum ComposerCommand: String, CaseIterable, Identifiable {
@@ -652,10 +653,11 @@ private final class WorkspaceModel: ObservableObject {
         guard canSend(from: agent), let draft = drafts[agent] else { return }
         let prompt = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard ComposerCommand.parse(prompt) == nil else { return }
+        let yolo = agent.harness == "codex" && draft.yolo
         let request: [String: Any] = [
             "op": "submit", "agent": agent.harness, "lane": agent.lane, "prompt": prompt,
             "tags": draft.tags.sorted(), "view": draft.reporting, "filter": draft.filterProgress,
-            "approval_cards": agent.harness == "codex" && approvalCards,
+            "approval_cards": agent.harness == "codex" && approvalCards && !yolo, "yolo": yolo,
         ]
         submitting.insert(agent)
         composerErrors[agent] = nil
@@ -1065,6 +1067,7 @@ private struct WorkspacePane: View {
 
     private var composer: some View {
         let agent = model.selectedAgent
+        let yolo = model.draftBinding(for: agent, \.yolo)
         return VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(agent.label).font(.subheadline.weight(.semibold))
@@ -1089,6 +1092,9 @@ private struct WorkspacePane: View {
                     Divider()
                     if agent.harness == "codex" {
                         Toggle("Approval Cards", isOn: $codexApprovalCards)
+                            .disabled(yolo.wrappedValue)
+                        Toggle("YOLO Mode (Full Access)", isOn: yolo)
+                            .disabled(!model.canReset)
                     }
                     if agent.harness == "cursor" {
                         Button("Sign In to Cursor…") { Task { await model.signInToCursor() } }
@@ -1141,6 +1147,12 @@ private struct WorkspacePane: View {
             .id(agent)
             Divider()
             VStack(alignment: .leading, spacing: 10) {
+                if agent.harness == "codex", yolo.wrappedValue {
+                    Label("YOLO · Full access", systemImage: "exclamationmark.shield")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.orange)
+                        .help("Codex can run commands on \(host.label) without sandboxing or approval prompts.")
+                }
                 if !model.tagPaths.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 5) {

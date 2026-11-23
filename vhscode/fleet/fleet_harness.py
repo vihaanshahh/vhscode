@@ -59,7 +59,7 @@ class HarnessError(RuntimeError):
 def run(
     root: Path, agent: str, prompt: str, tags: set[str], session: str | None, quiet: bool,
     *, on_event: Callable[[str, str], None] | None = None, detailed: bool = False, silent: bool = False,
-    view: str = "actions", model: str | None = None, interactive_run: str | None = None,
+    view: str = "actions", model: str | None = None, interactive_run: str | None = None, yolo: bool = False,
 ) -> str | None:
     """Run one turn and report public events, ending with one status event."""
     if view not in ("actions", "summary", "risks"):
@@ -77,7 +77,7 @@ def run(
 
             code = run_approval_turn(root, command, environment, prompt, session, stream, model, interactive_run)
         else:
-            code = _run_process(root, agent, command, environment, prompt, session, stream, model)
+            code = _run_process(root, agent, command, environment, prompt, session, stream, model, yolo=yolo)
         if code:
             failure = f"{agent} exited with status {code}."
         elif stream.failed:
@@ -102,10 +102,12 @@ def run(
 
 
 def _run_process(root: Path, agent: str, command: list[str], environment: dict[str, str],
-                 prompt: str, session: str | None, stream: _Stream, model: str | None) -> int:
+                 prompt: str, session: str | None, stream: _Stream, model: str | None, *, yolo: bool) -> int:
     if agent == "codex":
         args = ["exec", "resume"] if session else ["exec"]
         args.append("--json")
+        if yolo:
+            args.append("--dangerously-bypass-approvals-and-sandbox")
         if model:
             args.append(f"--model={model}")
         args.extend(["--", session, "-"] if session else ["-"])

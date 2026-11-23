@@ -376,6 +376,9 @@ def _submit(root, request):
     approval_cards = request.get("approval_cards", False)
     if type(approval_cards) is not bool:
         raise ValueError("Invalid approval card setting")
+    yolo = request.get("yolo", False)
+    if type(yolo) is not bool or (yolo and (agent != "codex" or approval_cards)):
+        raise ValueError("YOLO mode requires Codex with Approval Cards off")
     if type(quiet) is not bool:
         raise ValueError("Invalid classifier setting")
     for tag in tags:
@@ -405,7 +408,7 @@ def _submit(root, request):
                     "repo": str(root), "agent": agent, "prompt": prompt, "view": view,
                     "session": session, "tags": tags, "filter": quiet,
                     "model": settings["model"], "generation": settings["generation"], "lane": lane,
-                    "approval_cards": approval_cards and agent == "codex",
+                    "approval_cards": approval_cards and agent == "codex", "yolo": yolo,
                 }).encode("ascii"))
                 payload.seek(0)
                 subprocess.Popen(
@@ -452,7 +455,7 @@ def _run(run_id, fd):
             Path(request["repo"]), request["agent"], request["prompt"], set(request["tags"]),
             request["session"], request["filter"], on_event=on_event, detailed=True, silent=True,
             view=request["view"], model=request["model"],
-            interactive_run=run_id if request.get("approval_cards") else None,
+            interactive_run=run_id if request.get("approval_cards") else None, yolo=request.get("yolo", False),
         )
         if session and status == "completed":
             from fleet_models import remember
