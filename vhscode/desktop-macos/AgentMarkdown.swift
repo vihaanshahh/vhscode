@@ -3,6 +3,11 @@ import SwiftUI
 struct AgentMarkdown: View, Equatable {
     let source: String
     var font: Font = .callout
+    @Environment(\.workbenchTypography) private var typography
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.source == rhs.source && lhs.font == rhs.font
+    }
 
     static func rendersEvent(_ kind: String) -> Bool {
         ["result", "info", "plan", "error", "risk"].contains(kind)
@@ -15,7 +20,7 @@ struct AgentMarkdown: View, Equatable {
                 case .code:
                     ScrollView(.horizontal) {
                         Text(verbatim: String(block.content.characters))
-                            .font(font.monospaced())
+                            .font(typography.code)
                             .fixedSize(horizontal: true, vertical: true)
                             .padding(8)
                     }
@@ -53,7 +58,7 @@ struct AgentMarkdown: View, Equatable {
         let codeRanges = content.runs.compactMap { run in
             run.inlinePresentationIntent?.contains(.code) == true ? run.range : nil
         }
-        for range in codeRanges { content[range].font = font.monospaced() }
+        for range in codeRanges { content[range].font = typography.code }
         return Text(content)
     }
 

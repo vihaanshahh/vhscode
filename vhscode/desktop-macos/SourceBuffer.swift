@@ -54,6 +54,8 @@ struct PlainSourceView: NSViewRepresentable {
     let buffer: SourceBuffer
     let edited: () -> Void
     let save: () -> Void
+    @Environment(\.workbenchPalette) private var palette
+    @Environment(\.workbenchTypography) private var typography
 
     func makeCoordinator() -> Coordinator { Coordinator(buffer: buffer, edited: edited) }
 
@@ -70,8 +72,7 @@ struct PlainSourceView: NSViewRepresentable {
         buffer.storage.addLayoutManager(layout)
         let editor = SourceTextView(frame: scroll.contentView.bounds, textContainer: container)
         editor.delegate = context.coordinator
-        editor.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
-        editor.textContainerInset = NSSize(width: 12, height: 10)
+        editor.textContainerInset = NSSize(width: 16, height: 12)
         editor.textContainer?.widthTracksTextView = false
         editor.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                                                      height: CGFloat.greatestFiniteMagnitude)
@@ -92,6 +93,8 @@ struct PlainSourceView: NSViewRepresentable {
         editor.setAccessibilityLabel("Editor for \(buffer.path)")
         editor.save = save
         scroll.documentView = editor
+        context.coordinator.editor = editor
+        buffer.storage.delegate = context.coordinator
         return scroll
     }
 
@@ -99,22 +102,90 @@ struct PlainSourceView: NSViewRepresentable {
         context.coordinator.edited = edited
         guard let editor = scroll.documentView as? SourceTextView else { return }
         editor.save = save
+        context.coordinator.setAppearance(palette, typography: typography)
     }
 
     static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
+        coordinator.highlightTask?.cancel()
+        if coordinator.buffer.storage.delegate === coordinator { coordinator.buffer.storage.delegate = nil }
         guard let editor = scroll.documentView as? SourceTextView, let layout = editor.layoutManager else { return }
         editor.delegate = nil
         editor.undoManager?.removeAllActions()
         layout.textStorage?.removeLayoutManager(layout)
     }
 
-    final class Coordinator: NSObject, NSTextViewDelegate {
+    @MainActor
+    final class Coordinator: NSObject, NSTextViewDelegate, NSTextStorageDelegate {
         let buffer: SourceBuffer
+        private let language: SourceLanguage?
         var edited: () -> Void
+        weak var editor: SourceTextView?
+        var highlightTask: Task<Void, Never>?
+        private var palette: WorkbenchPalette?
+        private var typography: WorkbenchTypography?
+        private var sourceAttributes: [NSAttributedString.Key: Any] = [:]
 
         init(buffer: SourceBuffer, edited: @escaping () -> Void) {
             self.buffer = buffer
+            language = SourceLanguage(path: buffer.path)
             self.edited = edited
+        }
+
+        func setAppearance(_ palette: WorkbenchPalette, typography: WorkbenchTypography) {
+            guard let editor, self.palette != palette || self.typography != typography else { return }
+            let themeChanged = self.palette != palette
+            self.palette = palette
+            self.typography = typography
+
+            let ink = WorkbenchPalette.color(palette.ink)
+            let canvas = WorkbenchPalette.color(palette.canvas)
+            editor.backgroundColor = canvas
+            editor.enclosingScrollView?.backgroundColor = canvas
+            editor.insertionPointColor = ink
+            let highlight = WorkbenchPalette.color(palette.accent).blended(withFraction: 0.72, of: canvas) ?? canvas
+            editor.selectedTextAttributes = [.backgroundColor: highlight, .foregroundColor: ink]
+
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineSpacing = 3
+            sourceAttributes = [
+                .font: typography.native, .foregroundColor: ink, .paragraphStyle: paragraph,
+            ]
+            editor.defaultParagraphStyle = paragraph
+            buffer.storage.setAttributes(sourceAttributes, range: NSRange(location: 0, length: buffer.storage.length))
+            editor.typingAttributes = sourceAttributes
+            if themeChanged { refreshHighlighting() }
+        }
+
+        nonisolated func textStorage(_ textStorage: NSTextStorage, willProcessEditing editedMask: NSTextStorageEditActions,
+                                     range editedRange: NSRange, changeInLength delta: Int) {
+            guard editedMask.contains(.editedCharacters), editedRange.length > 0 else { return }
+            // AppKit's undo restores the attributes that were present before a theme or font change.
+            MainActor.assumeIsolated {
+                if !sourceAttributes.isEmpty { self.buffer.storage.setAttributes(sourceAttributes, range: editedRange) }
+            }
+        }
+
+        nonisolated func textStorage(_ textStorage: NSTextStorage, didProcessEditing editedMask: NSTextStorageEditActions,
+                                     range editedRange: NSRange, changeInLength delta: Int) {
+            // SourceBuffer owns the storage and mutates it on the main actor.
+            if editedMask.contains(.editedCharacters) { MainActor.assumeIsolated { refreshHighlighting() } }
+        }
+
+        private func refreshHighlighting() {
+            guard let language, let palette, let layout = editor?.layoutManager else { return }
+            highlightTask?.cancel()
+            let buffer = self.buffer
+            highlightTask = Task { [weak layout] in
+                guard (try? await Task.sleep(for: .milliseconds(120))) != nil else { return }
+                let tokens = await language.tokens(in: buffer.text)
+                guard !Task.isCancelled, let layout else { return }
+                // Layout-only color keeps syntax out of undo, clipboard contents, and saves.
+                layout.removeTemporaryAttribute(.foregroundColor, forCharacterRange: NSRange(location: 0, length: buffer.storage.length))
+                let colors = SourceLanguage.Token.allCases.map { WorkbenchPalette.color($0.color(palette)) }
+                for (range, token) in tokens {
+                    layout.addTemporaryAttribute(.foregroundColor, value: colors[token.rawValue], forCharacterRange: range)
+                }
+            }
         }
 
         func textDidChange(_ notification: Notification) {

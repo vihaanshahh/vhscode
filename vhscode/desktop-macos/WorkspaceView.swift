@@ -867,6 +867,7 @@ private final class WorkspaceModel: ObservableObject {
 
 @MainActor
 private struct WorkspacePane: View {
+    @Environment(\.workbenchPalette) private var palette
     let host: FleetHost
     var monitorRuns: Bool
     let showsFiles: Bool
@@ -888,15 +889,15 @@ private struct WorkspacePane: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider()
+            palette.separator.frame(height: 1)
             if showsFiles {
                 HSplitView {
                     if explorerVisible {
                         WorkspaceExplorer(host: host, model: model, active: monitorRuns)
-                            .frame(minWidth: 145, idealWidth: 188)
+                            .frame(minWidth: 152, idealWidth: 212)
                     }
                     editor.frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
-                    agentPane.frame(minWidth: 255, idealWidth: 316)
+                    agentPane.frame(minWidth: 255, idealWidth: 342)
                 }
             } else {
                 agentPane
@@ -1023,7 +1024,7 @@ private struct WorkspacePane: View {
             HStack(spacing: 7) {
                 Image(systemName: host.ssh.isEmpty ? "folder" : "server.rack")
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(FleetPalette.accent)
+                    .foregroundStyle(palette.tint)
                     .accessibilityHidden(true)
                 Text(host.label)
                     .font(.subheadline.weight(.semibold))
@@ -1059,15 +1060,16 @@ private struct WorkspacePane: View {
             .disabled(!model.agentsLoaded || model.changingAgents)
         }
         .controlSize(.small)
-        .frame(minHeight: 32)
-        .padding(.horizontal, 12)
+        .frame(minHeight: 38)
+        .padding(.horizontal, 16)
+        .background(palette.surface)
     }
 
     private var editor: some View {
         VStack(spacing: 0) {
             if !model.buffers.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 6) {
                         ForEach(model.buffers) { buffer in
                             FileTab(buffer: buffer, selected: model.selectedPath == buffer.path) {
                                 model.selectedPath = buffer.path
@@ -1076,9 +1078,11 @@ private struct WorkspacePane: View {
                             }
                         }
                     }
-                    .padding(6)
+                    .padding(.horizontal, 8)
+                    .padding(.top, 4)
                 }
-                Divider()
+                .background(palette.navigation)
+                palette.separator.frame(height: 1)
             }
             if let path = model.selectedPath { breadcrumbs(path) }
             if let buffer = model.selectedBuffer {
@@ -1100,7 +1104,7 @@ private struct WorkspacePane: View {
             if let notice = model.notice {
                 Divider()
                 HStack(alignment: .firstTextBaseline) {
-                    Text(notice).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
+                    Text(notice).font(.caption).foregroundStyle(palette.caution).textSelection(.enabled)
                     Spacer()
                     Button { model.notice = nil } label: { Image(systemName: "xmark") }
                         .buttonStyle(.plain)
@@ -1109,7 +1113,7 @@ private struct WorkspacePane: View {
                 .padding(8)
             }
         }
-        .background(Color(nsColor: .textBackgroundColor))
+        .background(palette.editor)
     }
 
     private func breadcrumbs(_ path: String) -> some View {
@@ -1128,9 +1132,10 @@ private struct WorkspacePane: View {
             }
             .font(.system(.caption, design: .monospaced))
             .foregroundStyle(.secondary)
-            .padding(.horizontal, 11)
-            .padding(.vertical, 6)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
         }
+        .background(palette.editor)
         .help(path)
         .accessibilityLabel(path)
     }
@@ -1141,7 +1146,7 @@ private struct WorkspacePane: View {
             VStack(alignment: .leading, spacing: 13) {
                 Image(systemName: "folder.badge.gearshape")
                     .font(.system(size: 36, weight: .light))
-                    .foregroundStyle(FleetPalette.accent)
+                    .foregroundStyle(palette.tint)
                 Text((host.repo as NSString).lastPathComponent.isEmpty ? host.label : (host.repo as NSString).lastPathComponent)
                     .font(.system(.largeTitle, design: .rounded).weight(.semibold))
                 Text("Open a file from the project tree or send a prompt from the agent panel.")
@@ -1192,7 +1197,7 @@ private struct WorkspacePane: View {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(palette.surface)
     }
 
     private func composer(_ agent: WorkspaceAgent) -> some View {
@@ -1256,9 +1261,9 @@ private struct WorkspacePane: View {
                 .help("Agent options")
                 .accessibilityLabel("Agent options")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            Divider()
+            .padding(.horizontal, 14)
+            .frame(minHeight: 39)
+            palette.separator.frame(height: 1)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
                     if model.turns.isEmpty {
@@ -1275,16 +1280,16 @@ private struct WorkspacePane: View {
                         }
                     }
                 }
-                .padding(12)
+                .padding(16)
             }
             .defaultScrollAnchor(.bottom)
             .id(agent)
-            Divider()
+            palette.separator.frame(height: 1)
             VStack(alignment: .leading, spacing: 10) {
                 if agent.harness == "codex", yolo.wrappedValue {
                     Label("YOLO · Full access", systemImage: "exclamationmark.shield")
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(FleetPalette.warning)
+                        .foregroundStyle(palette.caution)
                         .help("Codex can run commands on \(host.label) without sandboxing or approval prompts.")
                 }
                 if !model.tagPaths.isEmpty {
@@ -1313,7 +1318,7 @@ private struct WorkspacePane: View {
                                 }
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 4)
-                                .background(FleetPalette.accent.opacity(0.12), in: Capsule())
+                                .background(palette.tint.opacity(0.12), in: Capsule())
                             }
                         }
                     }
@@ -1323,14 +1328,14 @@ private struct WorkspacePane: View {
                     .font(.system(.body))
                     .scrollContentBackground(.hidden)
                     .frame(minHeight: 64, idealHeight: 82, maxHeight: 100)
-                    .padding(5)
-                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
-                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary))
+                    .padding(8)
+                    .background(palette.editor, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(palette.separator).allowsHitTesting(false))
                     .overlay(alignment: .topLeading) {
                         if model.input(for: agent).isEmpty {
                             Text(model.steeringRun(agent) == nil ? "Type a prompt or / for commands" : "Send a follow-up to the active turn")
                                 .foregroundStyle(.tertiary)
-                                .padding(.leading, 11).padding(.top, 6)
+                                .padding(.leading, 13).padding(.top, 9)
                                 .allowsHitTesting(false).accessibilityHidden(true)
                         }
                     }
@@ -1346,7 +1351,7 @@ private struct WorkspacePane: View {
                             .disabled(model.cursorSigningIn)
                             .help("Use the browser on this Mac to sign in on " + host.label)
                     } else {
-                        Text(error).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
+                        Text(error).font(.caption).foregroundStyle(palette.caution).textSelection(.enabled)
                     }
                 }
                 if agent.harness == "cursor", let message = model.cursorLoginMessage {
@@ -1356,13 +1361,13 @@ private struct WorkspacePane: View {
                     }
                 }
                 if let error = model.composerError {
-                    Text(error).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
+                    Text(error).font(.caption).foregroundStyle(palette.caution).textSelection(.enabled)
                 }
                 if agent.harness == "cursor", let error = model.cursorTrustError {
-                    Text(error).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
+                    Text(error).font(.caption).foregroundStyle(palette.caution).textSelection(.enabled)
                 }
             }
-            .padding(11)
+            .padding(14)
         }
         .task(id: agent.harness, priority: .utility) { await model.loadModelOptions(for: agent.harness) }
     }
@@ -1393,7 +1398,7 @@ private struct WorkspacePane: View {
                 Label("Send", systemImage: "arrow.up").labelStyle(.iconOnly)
             }
             .buttonStyle(.borderedProminent)
-            .tint(FleetPalette.accent)
+            .tint(palette.tint)
             .fixedSize()
             .disabled(!model.canSend && !isCommand)
             .keyboardShortcut(.return, modifiers: .command)
@@ -1519,6 +1524,7 @@ private enum WorkspacePanel: Identifiable {
 
 @MainActor
 private struct AgentNamePanel: View {
+    @Environment(\.workbenchPalette) private var palette
     @ObservedObject var model: WorkspaceModel
     let agent: WorkspaceAgent?
     @Environment(\.dismiss) private var dismiss
@@ -1547,7 +1553,7 @@ private struct AgentNamePanel: View {
             TextField("Name", text: $name, prompt: Text(agent?.sidebarLane.defaultLabel ?? "Optional"))
                 .focused($nameFocused)
                 .disabled(saving)
-            if let error { Text(error).font(.caption).foregroundStyle(FleetPalette.warning) }
+            if let error { Text(error).font(.caption).foregroundStyle(palette.caution) }
             HStack {
                 if saving { ProgressView().controlSize(.small) }
                 Spacer()
@@ -1653,6 +1659,7 @@ private struct AgentCommandPanel: View {
 
 @MainActor
 private struct ResumeSessionPanel: View {
+    @Environment(\.workbenchPalette) private var palette
     @ObservedObject var model: WorkspaceModel
     let agent: WorkspaceAgent
     @Environment(\.dismiss) private var dismiss
@@ -1679,7 +1686,7 @@ private struct ResumeSessionPanel: View {
             if loading {
                 ProgressView("Loading sessions…").controlSize(.small)
             } else if let listError {
-                Text(listError).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
+                Text(listError).font(.caption).foregroundStyle(palette.caution).textSelection(.enabled)
                 Button("Retry") { Task { await load() } }
                     .disabled(resuming)
             } else if options.isEmpty {
@@ -1717,7 +1724,7 @@ private struct ResumeSessionPanel: View {
                 .disabled(resuming)
             }
             if let resumeError {
-                Text(resumeError).font(.caption).foregroundStyle(FleetPalette.warning).textSelection(.enabled)
+                Text(resumeError).font(.caption).foregroundStyle(palette.caution).textSelection(.enabled)
             }
             HStack {
                 Spacer()
@@ -1893,6 +1900,7 @@ private final class QuickOpenSearch: ObservableObject {
 
 @MainActor
 private struct QuickOpenPanel: View {
+    @Environment(\.workbenchPalette) private var palette
     let openFiles: [String]
     let open: (String) -> Void
     @Environment(\.dismiss) private var dismiss
@@ -1944,7 +1952,7 @@ private struct QuickOpenPanel: View {
                                 .id(path)
                         }
                         if files.isEmpty {
-                            Text(message).font(.callout).foregroundStyle(response?.error != nil ? FleetPalette.warning : .secondary)
+                            Text(message).font(.callout).foregroundStyle(response?.error != nil ? palette.caution : .secondary)
                                 .padding(8)
                         }
                     }
@@ -1980,7 +1988,7 @@ private struct QuickOpenPanel: View {
         let name = (path as NSString).lastPathComponent
         let folder = (path as NSString).deletingLastPathComponent
         return HStack(spacing: 8) {
-            Image(systemName: "doc").foregroundStyle(.secondary).accessibilityHidden(true)
+            WorkbenchFileIcon(path: path)
             Text(name).font(.system(.callout, design: .monospaced)).lineLimit(1)
             if !folder.isEmpty {
                 Text(folder).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
@@ -1990,7 +1998,7 @@ private struct QuickOpenPanel: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .contentShape(Rectangle())
-        .background(focusedFile == path ? Color.accentColor.opacity(0.17) : .clear,
+        .background(focusedFile == path ? palette.selection : .clear,
                     in: RoundedRectangle(cornerRadius: 5))
         .help(path)
     }
@@ -2060,6 +2068,7 @@ private struct QuickOpenInput: NSViewRepresentable {
 
 @MainActor
 private struct WorkspaceExplorer: View {
+    @Environment(\.workbenchPalette) private var palette
     @ObservedObject var model: WorkspaceModel
     let active: Bool
     @StateObject private var git: WorkspaceGit
@@ -2086,9 +2095,9 @@ private struct WorkspaceExplorer: View {
                 .help("Refresh files and Git status")
                 .accessibilityLabel("Refresh files and Git status")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            Divider()
+            .padding(.horizontal, 14)
+            .frame(minHeight: 39)
+            palette.separator.frame(height: 1)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     WorkspaceGitChanges(git: git) { diff = $0 }
@@ -2097,7 +2106,7 @@ private struct WorkspaceExplorer: View {
                 .padding(.vertical, 6)
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.7))
+        .background(palette.navigation)
         .task(id: active, priority: .utility) {
             if active { await git.monitor() }
         }
@@ -2125,6 +2134,7 @@ private struct WorkspaceExplorer: View {
 
 @MainActor
 private struct FileBranch: View {
+    @Environment(\.workbenchPalette) private var palette
     @ObservedObject var model: WorkspaceModel
     @ObservedObject var git: WorkspaceGit
     let directory: String
@@ -2142,7 +2152,7 @@ private struct FileBranch: View {
                 ProgressView().controlSize(.small).padding(.leading, indent)
             } else if let error = page.error {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(error).font(.caption).foregroundStyle(FleetPalette.warning)
+                    Text(error).font(.caption).foregroundStyle(palette.caution)
                     Button("Retry") { Task { await model.loadFolder(directory, direction: page.retry) } }
                 }
                 .padding(.horizontal, 10).padding(.leading, indent)
@@ -2188,24 +2198,38 @@ private struct FileBranch: View {
                     }
                 }
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: entry.isDirectory
-                          ? (model.expanded.contains(entry.path) ? "chevron.down" : "chevron.right")
-                          : "doc")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(entry.isDirectory ? FleetPalette.accent : .secondary)
-                        .frame(width: 12)
+                HStack(spacing: 5) {
+                    Group {
+                        if entry.isDirectory {
+                            Image(systemName: model.expanded.contains(entry.path) ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Color.clear
+                        }
+                    }
+                    .frame(width: 8, height: 13)
+                    .accessibilityHidden(true)
+                    if entry.isDirectory {
+                        Image(systemName: "folder")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(palette.tint)
+                            .frame(width: 14)
+                            .accessibilityHidden(true)
+                    } else {
+                        WorkbenchFileIcon(path: entry.path)
+                    }
                     Text(entry.name).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 0)
                     if let change = git.files[entry.path] {
                         WorkspaceGitBadge(change: change)
                     } else if entry.isDirectory, git.folders.contains(entry.path) {
-                        Circle().fill(FleetPalette.warning).frame(width: 5, height: 5)
+                        Circle().fill(palette.caution).frame(width: 5, height: 5)
                             .help("Contains Git changes")
                             .accessibilityLabel("Contains Git changes")
                     }
                 }
-                .frame(maxWidth: .infinity, minHeight: 24)
+                .frame(maxWidth: .infinity, minHeight: 27)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -2214,8 +2238,8 @@ private struct FileBranch: View {
                 Button { model.toggleTag(entry.path) } label: {
                     Image(systemName: tagged ? "paperclip.circle.fill" : "paperclip")
                         .font(.system(size: 11))
-                        .foregroundStyle(tagged ? FleetPalette.accent : .secondary)
-                        .frame(width: 20, height: 22)
+                        .foregroundStyle(tagged ? palette.tint : .secondary)
+                        .frame(width: 23, height: 25)
                 }
                 .buttonStyle(.plain)
                 .help(tagged ? "Detach \(entry.name)" : "Attach \(entry.name) to prompts")
@@ -2224,7 +2248,7 @@ private struct FileBranch: View {
         }
         .padding(.leading, indent)
         .padding(.trailing, 4)
-        .background(selected ? FleetPalette.accent.opacity(0.16) : .clear,
+        .background(selected ? palette.selection : .clear,
                     in: RoundedRectangle(cornerRadius: 5))
         .padding(.horizontal, 4)
     }
@@ -2232,6 +2256,7 @@ private struct FileBranch: View {
 
 @MainActor
 private struct FileTab: View {
+    @Environment(\.workbenchPalette) private var palette
     @ObservedObject var buffer: SourceBuffer
     let selected: Bool
     let activate: () -> Void
@@ -2240,18 +2265,23 @@ private struct FileTab: View {
     var body: some View {
         HStack(spacing: 5) {
             Button(action: activate) {
-                HStack(spacing: 5) {
+                HStack(spacing: 6) {
+                    WorkbenchFileIcon(path: buffer.path)
                     if buffer.isDirty {
-                        Circle().fill(FleetPalette.accent).frame(width: 5, height: 5)
+                        Circle().fill(palette.tint).frame(width: 5, height: 5)
                             .accessibilityHidden(true)
                     }
-                    Text(buffer.name).font(.caption).lineLimit(1)
+                    Text(buffer.name).font(.system(size: 12, weight: selected ? .semibold : .regular)).lineLimit(1)
                 }
+                .frame(minHeight: 31)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help(buffer.path)
             Button(action: close) {
                 Image(systemName: "xmark").font(.caption2).foregroundStyle(.secondary)
+                    .frame(width: 19, height: 24)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help("Close \(buffer.name)")
@@ -2259,14 +2289,17 @@ private struct FileTab: View {
             .disabled(buffer.isSaving)
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(selected ? FleetPalette.accent.opacity(0.14) : .clear,
-                    in: RoundedRectangle(cornerRadius: 5))
+        .background(selected ? palette.editor : .clear, in: RoundedRectangle(cornerRadius: 5))
+        .overlay(alignment: .bottom) {
+            if selected { palette.tint.frame(height: 2).allowsHitTesting(false) }
+        }
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
 @MainActor
 private struct SourceEditor: View {
+    @Environment(\.workbenchPalette) private var palette
     @ObservedObject var model: WorkspaceModel
     @ObservedObject var buffer: SourceBuffer
 
@@ -2276,7 +2309,7 @@ private struct SourceEditor: View {
                 VStack(alignment: .leading, spacing: 7) {
                     Label("This file changed on disk. Your edits are intact.", systemImage: "exclamationmark.triangle")
                         .font(.caption)
-                        .foregroundStyle(FleetPalette.warning)
+                        .foregroundStyle(palette.caution)
                     HStack {
                         Button("Reload and Discard Edits") { Task { await model.reload(buffer) } }
                         Button("Save My Version") { Task { await model.save(buffer, replace: true) } }
@@ -2291,7 +2324,7 @@ private struct SourceEditor: View {
             PlainSourceView(buffer: buffer, edited: { model.publishDirty() }) {
                 Task { await model.save(buffer) }
             }
-            Divider()
+            palette.separator.frame(height: 1)
             HStack {
                 Text(buffer.path)
                     .font(.system(.caption, design: .monospaced))
@@ -2316,14 +2349,16 @@ private struct SourceEditor: View {
                     .help("Save (⌘S)")
             }
             .controlSize(.small)
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 14)
             .padding(.vertical, 6)
+            .background(palette.surface)
         }
     }
 }
 
 @MainActor
 private struct TurnCard: View {
+    @Environment(\.workbenchPalette) private var palette
     let turn: WorkspaceTurn
     var trustWorkspace: (() -> Void)?
     var openTerminal: (() -> Void)?
@@ -2337,7 +2372,7 @@ private struct TurnCard: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(8)
-                .background(FleetPalette.accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
+                .background(palette.tint.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
             ForEach(turn.steers) { message in
                 VStack(alignment: .leading, spacing: 3) {
                     Text(message.status).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
@@ -2345,7 +2380,7 @@ private struct TurnCard: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(8)
-                .background(FleetPalette.accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
+                .background(palette.tint.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
             }
             HStack(spacing: 6) {
                 if turn.isActive { ProgressView().controlSize(.small) }
@@ -2360,7 +2395,7 @@ private struct TurnCard: View {
                 HStack(alignment: .top) {
                     Image(systemName: "exclamationmark.triangle").accessibilityHidden(true)
                     AgentMarkdown(source: turn.risk).equatable()
-                }.foregroundStyle(FleetPalette.warning)
+                }.foregroundStyle(palette.caution)
             }
             if turn.reporting != "risks", !turn.outcome.isEmpty,
                !turn.events.contains(where: { $0.kind == "result" || $0.text == turn.outcome }) {
@@ -2373,11 +2408,11 @@ private struct TurnCard: View {
                     }
                     if AgentMarkdown.rendersEvent(event.kind) {
                         AgentMarkdown(source: event.text).equatable()
-                            .foregroundStyle(event.kind == "error" || event.kind == "risk" ? FleetPalette.warning : .primary)
+                            .foregroundStyle(event.kind == "error" || event.kind == "risk" ? palette.caution : .primary)
                     } else {
                         Text(event.text)
                             .font(.caption)
-                            .foregroundStyle(event.kind == "error" ? FleetPalette.warning : .primary)
+                            .foregroundStyle(event.kind == "error" ? palette.caution : .primary)
                             .textSelection(.enabled)
                     }
                 }
@@ -2403,8 +2438,8 @@ private struct TurnCard: View {
                 }
                 .padding(9)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(FleetPalette.warning.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(FleetPalette.warning.opacity(0.35)))
+                .background(palette.caution.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(palette.caution.opacity(0.35)))
             }
             if let trustWorkspace {
                 Button("Trust Workspace for Cursor…", action: trustWorkspace)

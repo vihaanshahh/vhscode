@@ -96,7 +96,7 @@ exec "$bin/../../MacOS/FleetWorkbench" --ssh-askpass "$@"
                     "-o", str(contents / "MacOS/FleetWorkbench")], check=True)
     info = dict(CFBundleExecutable="FleetWorkbench", CFBundleName="Fleet Workbench",
                 CFBundleDisplayName="Fleet Workbench", CFBundleIdentifier="io.vhscode.fleet-workbench",
-                CFBundleVersion="7", CFBundleShortVersionString="0.7", CFBundlePackageType="APPL",
+                CFBundleVersion="8", CFBundleShortVersionString="0.8", CFBundlePackageType="APPL",
                 CFBundleIconFile="Fleet.icns", NSHighResolutionCapable=True, LSMinimumSystemVersion="14.0")
     info["CFBundleDocumentTypes"] = [dict(CFBundleTypeName="VS Code Workspace",
                                           CFBundleTypeRole="Editor", LSHandlerRank="Alternate",

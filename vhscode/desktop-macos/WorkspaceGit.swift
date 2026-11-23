@@ -29,11 +29,11 @@ struct WorkspaceGitChange: Decodable, Hashable, Identifiable {
         return code.replacingOccurrences(of: ".", with: "")
     }
 
-    var color: Color {
-        if isConflicted || isDeleted { return FleetPalette.failure }
-        if isUntracked || code.contains("A") { return FleetPalette.success }
-        if code.contains("R") || code.contains("C") { return FleetPalette.accent }
-        return FleetPalette.warning
+    func color(_ palette: WorkbenchPalette) -> Color {
+        if isConflicted || isDeleted { return palette.negative }
+        if isUntracked || code.contains("A") { return palette.positive }
+        if code.contains("R") || code.contains("C") { return palette.tint }
+        return palette.caution
     }
 
     var summary: String {
@@ -120,12 +120,13 @@ final class WorkspaceGit: ObservableObject {
 }
 
 struct WorkspaceGitBadge: View {
+    @Environment(\.workbenchPalette) private var palette
     let change: WorkspaceGitChange
 
     var body: some View {
         Text(change.badge)
             .font(.system(size: 10, weight: .semibold, design: .monospaced))
-            .foregroundStyle(change.color)
+            .foregroundStyle(change.color(palette))
             .help(change.summary)
             .accessibilityLabel(change.summary)
     }
@@ -133,6 +134,7 @@ struct WorkspaceGitBadge: View {
 
 @MainActor
 struct WorkspaceGitChanges: View {
+    @Environment(\.workbenchPalette) private var palette
     @ObservedObject var git: WorkspaceGit
     let openDiff: (WorkspaceGitChange) -> Void
     @State private var expanded = false
@@ -174,7 +176,7 @@ struct WorkspaceGitChanges: View {
                     }
                 }
                 if let error = git.fetchError ?? git.statusError {
-                    Text(error).font(.caption).foregroundStyle(FleetPalette.warning)
+                    Text(error).font(.caption).foregroundStyle(palette.caution)
                 }
             }
             .padding(.horizontal, 10).padding(.vertical, 8)
@@ -182,7 +184,7 @@ struct WorkspaceGitChanges: View {
         } else if let error = git.statusError {
             Text("Git status unavailable")
                 .font(.caption)
-                .foregroundStyle(FleetPalette.warning)
+                .foregroundStyle(palette.caution)
                 .padding(.horizontal, 10).padding(.vertical, 6)
                 .help(error)
         }
@@ -220,6 +222,7 @@ struct WorkspaceGitChanges: View {
 
 @MainActor
 struct WorkspaceGitDiff: View {
+    @Environment(\.workbenchPalette) private var palette
     private struct Section: Decodable, Identifiable {
         let title: String
         let text: String
@@ -231,6 +234,7 @@ struct WorkspaceGitDiff: View {
     let change: WorkspaceGitChange
     let openFile: (String) -> Void
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.workbenchTypography) private var typography
     @State private var sections: [Section]?
     @State private var error: String?
 
@@ -251,7 +255,7 @@ struct WorkspaceGitDiff: View {
                                 Text(section.title).font(.subheadline.weight(.semibold))
                                 ScrollView(.horizontal) {
                                     Text(verbatim: section.text)
-                                        .font(.system(.caption, design: .monospaced))
+                                        .font(typography.code)
                                         .textSelection(.enabled)
                                         .fixedSize(horizontal: true, vertical: false)
                                 }
@@ -265,7 +269,7 @@ struct WorkspaceGitDiff: View {
                 }
             } else {
                 Group {
-                    if let error { Text(error).foregroundStyle(FleetPalette.warning).textSelection(.enabled) }
+                    if let error { Text(error).foregroundStyle(palette.caution).textSelection(.enabled) }
                     else if sections != nil { Text("No current changes for this file.").foregroundStyle(.secondary) }
                     else { ProgressView("Loading diff…") }
                 }

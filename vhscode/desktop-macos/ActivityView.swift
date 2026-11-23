@@ -1,8 +1,5 @@
 import SwiftUI
 
-private let panel = Color(red: 0.105, green: 0.117, blue: 0.133)
-private let divider = Color.white.opacity(0.09)
-
 struct FleetActivityAgent: Identifiable {
     let host: FleetHost
     let lane: FleetAgentLane
@@ -119,6 +116,7 @@ struct FleetOverview: View {
     let onSelectAgent: (FleetActivityAgent) -> Void
     let onShowRuns: () -> Void
 
+    @Environment(\.workbenchPalette) private var palette
     @Environment(\.scenePhase) private var scenePhase
     @State private var snapshots: [String: FleetSnapshot] = [:]
     @State private var refreshing = false
@@ -260,15 +258,15 @@ struct FleetOverview: View {
     private var metrics: some View {
         HStack(spacing: 9) {
             if schedulesOnly {
-                metric("Enabled", schedules.filter(\.enabled).count, icon: "clock", color: FleetPalette.accent)
+                metric("Enabled", schedules.filter(\.enabled).count, icon: "clock", color: palette.tint)
                 metric("Paused", schedules.filter { !$0.enabled }.count, icon: "pause", color: .secondary)
             } else if risksOnly {
-                metric("Flagged runs", runs.count, icon: "exclamationmark.triangle", color: FleetPalette.warning)
-                metric("Failed", runs.filter { $0.status == "failed" }.count, icon: "xmark.circle", color: FleetPalette.failure)
+                metric("Flagged runs", runs.count, icon: "exclamationmark.triangle", color: palette.caution)
+                metric("Failed", runs.filter { $0.status == "failed" }.count, icon: "xmark.circle", color: palette.negative)
             } else {
-                metric("Running", allRuns.filter { $0.status == "running" }.count, icon: "bolt", color: FleetPalette.accent)
+                metric("Running", allRuns.filter { $0.status == "running" }.count, icon: "bolt", color: palette.tint)
                 metric("Completed", allRuns.filter { $0.status == "completed" }.count, icon: "checkmark.circle", color: .secondary)
-                metric("Flagged", allRuns.filter(\.hasRisk).count, icon: "exclamationmark.triangle", color: FleetPalette.warning)
+                metric("Flagged", allRuns.filter(\.hasRisk).count, icon: "exclamationmark.triangle", color: palette.caution)
             }
         }
     }
@@ -284,7 +282,7 @@ struct FleetOverview: View {
         }
         .padding(.horizontal, 11)
         .padding(.vertical, 9)
-        .fleetPanel()
+        .fleetPanel(palette)
     }
 
     @ViewBuilder private var connectionNotice: some View {
@@ -303,9 +301,9 @@ struct FleetOverview: View {
                       systemImage: "wifi.exclamationmark")
             }
             .font(.system(size: 12))
-            .foregroundStyle(FleetPalette.warning)
+            .foregroundStyle(palette.caution)
             .padding(10)
-            .fleetPanel()
+            .fleetPanel(palette)
         }
     }
 
@@ -334,7 +332,7 @@ struct FleetOverview: View {
                                     metadata: "\(row.host.label) · \(displayAgent(row.agent)) · every \(row.minutes) min",
                                     note: row.repository,
                                     status: row.enabled ? "Enabled" : "Paused",
-                                    color: row.enabled ? FleetPalette.accent : .secondary,
+                                    color: row.enabled ? palette.tint : .secondary,
                                     active: selectedSchedule?.id == row.id
                                 ) { scheduleSelection = row.id }
                             }
@@ -369,7 +367,7 @@ struct FleetOverview: View {
                 }
             }
         }
-        .fleetPanel()
+        .fleetPanel(palette)
     }
 
     private func listHeading(_ title: String, count: Int) -> some View {
@@ -381,7 +379,7 @@ struct FleetOverview: View {
             }
             .padding(.horizontal, 13)
             .padding(.vertical, 10)
-            Rectangle().fill(divider).frame(height: 1)
+            Rectangle().fill(palette.separator).frame(height: 1)
         }
     }
 
@@ -402,7 +400,7 @@ struct FleetOverview: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 9)
-            .background(active ? FleetPalette.accent.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
+            .background(active ? palette.selection : .clear, in: RoundedRectangle(cornerRadius: 6))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -416,7 +414,7 @@ struct FleetOverview: View {
             detailPanel(title: "Run Details") { runDetails(row) }
         } else {
             empty(schedulesOnly ? "Select a schedule" : "Select a run", "", icon: "sidebar.trailing")
-                .fleetPanel()
+                .fleetPanel(palette)
         }
     }
 
@@ -426,10 +424,10 @@ struct FleetOverview: View {
                 .font(.system(size: 12, weight: .semibold))
                 .padding(.horizontal, 13)
                 .padding(.vertical, 10)
-            Rectangle().fill(divider).frame(height: 1)
+            Rectangle().fill(palette.separator).frame(height: 1)
             content()
         }
-        .fleetPanel()
+        .fleetPanel(palette)
     }
 
     private func runDetails(_ row: FleetRunRow) -> some View {
@@ -451,13 +449,13 @@ struct FleetOverview: View {
                     let diagnostic = row.status == "failed" ? runEvents.last { $0.kind == "error" } : nil
                     let planEvent = runEvents.last { $0.kind == "plan" && !row.action.isEmpty && $0.text.hasPrefix(row.action) }
                     if !row.risk.isEmpty && !(showEvents && riskEvent != nil) {
-                        field("Risk", riskEvent?.text ?? row.risk, color: FleetPalette.warning, markdown: true)
+                        field("Risk", riskEvent?.text ?? row.risk, color: palette.caution, markdown: true)
                     }
                     let outcomeEvent = diagnostic ?? resultEvent ?? planEvent
                     let outcome = outcomeEvent?.text ?? (row.outcome.isEmpty ? row.action : row.outcome)
                     if !outcome.isEmpty && !(showEvents && outcomeEvent != nil) {
                         field(row.status == "running" ? "Current action" : "Outcome", outcome,
-                              color: diagnostic == nil ? .primary : FleetPalette.warning,
+                              color: diagnostic == nil ? .primary : palette.caution,
                               markdown: outcomeEvent != nil || !row.outcome.isEmpty || outcome.hasPrefix("### Plan\n"))
                     }
                     DisclosureGroup("Event log", isExpanded: $showEvents) {
@@ -468,7 +466,7 @@ struct FleetOverview: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(13)
             }
-            Rectangle().fill(divider).frame(height: 1)
+            Rectangle().fill(palette.separator).frame(height: 1)
             HStack {
                 Spacer()
                 let host = hostForRepository(row.host, repo: row.repository)
@@ -489,7 +487,7 @@ struct FleetOverview: View {
             if loadingEvents {
                 ProgressView().controlSize(.small).accessibilityLabel("Loading events")
             } else if let eventError {
-                Text(eventError).foregroundStyle(FleetPalette.warning)
+                Text(eventError).foregroundStyle(palette.caution)
                 Button("Retry") { Task { await loadEvents() } }
             } else if eventsRunID != row.id || events.isEmpty {
                 Text("No events recorded.").foregroundStyle(.secondary)
@@ -501,7 +499,7 @@ struct FleetOverview: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
                         Text(event.kind.capitalized)
-                            .foregroundStyle(event.kind == "risk" || event.kind == "error" ? FleetPalette.warning : FleetPalette.accent)
+                            .foregroundStyle(event.kind == "risk" || event.kind == "error" ? palette.caution : palette.tint)
                         Spacer()
                         if let date = event.date {
                             Text(date.formatted(date: .omitted, time: .shortened)).foregroundStyle(.secondary)
@@ -518,7 +516,7 @@ struct FleetOverview: View {
                     }
                 }
                 .padding(8)
-                .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 5))
+                .background(palette.editor, in: RoundedRectangle(cornerRadius: 5))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -530,7 +528,7 @@ struct FleetOverview: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 13) {
                     Text(row.title).font(.system(size: 15, weight: .semibold)).lineLimit(3)
-                    statusPill(row.enabled ? "Enabled" : "Paused", color: row.enabled ? FleetPalette.accent : .secondary)
+                    statusPill(row.enabled ? "Enabled" : "Paused", color: row.enabled ? palette.tint : .secondary)
                     field("Host", row.host.label)
                     field("Repository", row.repository, monospaced: true)
                     field("Agent", displayAgent(row.agent))
@@ -542,7 +540,7 @@ struct FleetOverview: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(13)
             }
-            Rectangle().fill(divider).frame(height: 1)
+            Rectangle().fill(palette.separator).frame(height: 1)
             HStack {
                 Menu {
                     Button("Delete Schedule…", role: .destructive) { deleting = row }
@@ -579,7 +577,7 @@ struct FleetOverview: View {
 
     private func empty(_ title: String, _ description: String, icon: String) -> some View {
         VStack(spacing: 7) {
-            Image(systemName: icon).font(.system(size: 24)).foregroundStyle(FleetPalette.accent.opacity(0.7))
+            Image(systemName: icon).font(.system(size: 24)).foregroundStyle(palette.tint.opacity(0.7))
             Text(title).font(.system(size: 13, weight: .semibold))
             if !description.isEmpty {
                 Text(description).font(.system(size: 12)).foregroundStyle(.secondary)
@@ -602,9 +600,9 @@ struct FleetOverview: View {
 
     private func statusColor(_ status: String) -> Color {
         switch status {
-        case "running": FleetPalette.accent
-        case "failed": FleetPalette.failure
-        case "cancelled": FleetPalette.warning
+        case "running": palette.tint
+        case "failed": palette.negative
+        case "cancelled": palette.caution
         default: .secondary
         }
     }
@@ -714,6 +712,7 @@ private struct ScheduleEditor: View {
     @State var draft: ScheduleDraft
     let hosts: [FleetHost]
     let onSave: () -> Void
+    @Environment(\.workbenchPalette) private var palette
     @Environment(\.dismiss) private var dismiss
     @State private var error: String?
     @State private var saving = false
@@ -778,7 +777,7 @@ private struct ScheduleEditor: View {
                             .accessibilityLabel("Interval in minutes")
                         Text("minutes").font(.system(size: 12)).foregroundStyle(.secondary)
                         if interval == nil {
-                            Text("Enter 1–525,600 minutes.").font(.system(size: 11)).foregroundStyle(FleetPalette.warning)
+                            Text("Enter 1–525,600 minutes.").font(.system(size: 11)).foregroundStyle(palette.caution)
                         }
                     }
                 }
@@ -791,12 +790,12 @@ private struct ScheduleEditor: View {
                     .padding(5)
                     .frame(minHeight: 104, maxHeight: 150)
                     .accessibilityLabel("Prompt")
-                    .fleetPanel()
+                    .fleetPanel(palette)
             }
             if let error {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .font(.system(size: 12))
-                    .foregroundStyle(FleetPalette.warning)
+                    .foregroundStyle(palette.caution)
             }
             HStack(spacing: 10) {
                 Spacer()
@@ -847,10 +846,10 @@ private func displayAgent(_ value: String) -> String {
 }
 
 private extension View {
-    func fleetPanel() -> some View {
-        background(panel, in: RoundedRectangle(cornerRadius: 8))
+    func fleetPanel(_ palette: WorkbenchPalette) -> some View {
+        background(palette.surface, in: RoundedRectangle(cornerRadius: 8))
             .overlay {
-                RoundedRectangle(cornerRadius: 8).strokeBorder(divider)
+                RoundedRectangle(cornerRadius: 8).strokeBorder(palette.separator)
                     .allowsHitTesting(false)
             }
     }
