@@ -1,6 +1,6 @@
 """JSON bridge for Fleet's desktop workspace."""
 
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager, suppress
 import fcntl
 import hashlib
 from heapq import nsmallest
@@ -23,7 +23,11 @@ MAX_FILE_BYTES = 256 * 1024
 MAX_PAGE = 200
 MAX_SEARCH_ENTRIES = 50000
 SEARCH_SECONDS = 2.0
+MAX_GIT_STATUS_BYTES = 512 * 1024
+MAX_GIT_DIFF_BYTES = 64 * 1024
+MAX_GIT_CHANGES = 1500
 WORKSPACE_OPS = {
+    "git_status", "git_diff", "git_fetch",
     "files", "find_files", "read_file", "save_file", "submit",
     "workspace_settings", "workspace_agents", "add_agent", "rename_agent", "delete_agent",
     "set_model", "models", "reset_session", "list_sessions", "resume_session",
@@ -172,6 +176,123 @@ def _git_files(root):
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+def _git_output(root, arguments, *, limit, timeout=SEARCH_SECONDS):
+    command = ["git", "--no-pager", "--literal-pathspecs", "-c", "core.fsmonitor=false", *arguments]
+    environment = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    with subprocess.Popen(command, cwd=root, env=environment, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True) as process:
+        deadline = monotonic() + timeout
+        output = bytearray()
+        try:
+            with DefaultSelector() as selector:
+                selector.register(process.stdout, EVENT_READ)
+                while len(output) <= limit:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise ValueError("Git did not respond in time.")
+                    chunk = os.read(process.stdout.fileno(), min(64 * 1024, limit + 1 - len(output)))
+                    if not chunk:
+                        return process.wait(timeout=max(.1, deadline - monotonic())), bytes(output)
+                    output.extend(chunk)
+            return None, bytes(output[:limit])
+        finally:
+            if process.returncode is None:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+
+
+def _git_worktree_path(raw, prefix):
+    if not raw.startswith(prefix):
+        return None
+    try:
+        path = raw[len(prefix):].decode("utf-8")
+        _parts(path)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return path
+
+
+def _git_status(root):
+    try:
+        code, location = _git_output(root, ["rev-parse", "--is-inside-work-tree", "--show-prefix"], limit=4096)
+    except FileNotFoundError:
+        return {"status": None}
+    if code == 128 or location.startswith(b"false\n"):
+        return {"status": None}
+    if code or not location.startswith(b"true\n"):
+        raise ValueError("Could not find the Git working tree.")
+    prefix = location.removesuffix(b"\n").partition(b"\n")[2]
+    code, data = _git_output(
+        root, ["status", "--porcelain=v2", "-z", "--branch", "--ahead-behind",
+               "--untracked-files=all", "--renames", "--", "."],
+        limit=MAX_GIT_STATUS_BYTES,
+    )
+    if code not in (0, None):
+        raise ValueError("Could not read Git status.")
+
+    # Porcelain paths are repository-relative even when the opened folder is a subdirectory.
+    records = iter(data.split(b"\0")[:-1])
+    branch, head, upstream, ahead, behind = "", "", None, None, None
+    changes = []
+    truncated = code is None
+    for record in records:
+        if record.startswith(b"# branch.oid "):
+            head = record[len(b"# branch.oid "):].decode("ascii")
+            continue
+        if record.startswith(b"# branch.head "):
+            branch = record[len(b"# branch.head "):].decode("utf-8", errors="replace")
+            continue
+        if record.startswith(b"# branch.upstream "):
+            upstream = record[len(b"# branch.upstream "):].decode("utf-8", errors="replace")
+            continue
+        if record.startswith(b"# branch.ab "):
+            ahead, behind = map(abs, map(int, record.split()[2:]))
+            continue
+        kind = record[:1]
+        if kind == b"?":
+            status, raw, original = "??", record[2:], None
+        elif kind in (b"1", b"2", b"u"):
+            columns = record.split(b" ", {b"1": 8, b"2": 9, b"u": 10}[kind])
+            status, raw = columns[1].decode("ascii"), columns[-1]
+            original = _git_worktree_path(next(records, b""), prefix) if kind == b"2" else None
+        else:
+            continue
+        path = _git_worktree_path(raw, prefix)
+        if path is not None:
+            if len(changes) == MAX_GIT_CHANGES:
+                truncated = True
+                break
+            changes.append({"path": path, "code": status, "original": original})
+    return {"status": {
+        "branch": "Detached HEAD" if branch == "(detached)" else branch,
+        "head": head, "upstream": upstream, "ahead": ahead, "behind": behind,
+        "changes": sorted(changes, key=lambda change: change["path"]), "truncated": truncated,
+    }}
+
+
+def _git_diff(root, request):
+    path = request.get("path")
+    parts = _parts(path)
+    original = request.get("original")
+    if original is not None:
+        _parts(original)
+    if request.get("untracked") is True:
+        with _directory(root, parts[:-1]) as fd:
+            text, _, _ = _read(fd, parts[-1])
+        return {"sections": [{"title": "Untracked file", "text": text, "truncated": False}]}
+
+    paths = [path] if original is None else [path, original]
+    args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames"]
+    sections = []
+    for title, options in (("Staged changes", ["--cached"]), ("Working tree changes", [])):
+        code, output = _git_output(root, [*args, *options, "--", *paths], limit=MAX_GIT_DIFF_BYTES)
+        if code not in (0, None):
+            raise ValueError("Could not read the Git diff.")
+        if output:
+            sections.append({"title": title, "text": output.decode("utf-8", errors="replace"), "truncated": code is None})
+    return {"sections": sections}
 
 
 def _filesystem_files(root):
@@ -347,6 +468,15 @@ def workspace(request):
         return _page(root, request.get("path", ""), request.get("cursor"), request.get("limit", 100))
     if op == "find_files":
         return _find_files(root, request.get("query", ""), request.get("limit", 100))
+    if op == "git_status":
+        return _git_status(root)
+    if op == "git_diff":
+        return _git_diff(root, request)
+    if op == "git_fetch":
+        code, _ = _git_output(root, ["fetch", "--quiet", "--no-tags", "--no-recurse-submodules"], limit=4096, timeout=14)
+        if code != 0:
+            raise ValueError("Git could not fetch. Check the workspace’s remote and credentials.")
+        return {}
     if op == "submit":
         return _submit(root, request)
     parts = _parts(request.get("path"))

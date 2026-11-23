@@ -52,7 +52,7 @@ enum FleetBridge {
     static func call(_ host: FleetHost, _ request: [String: Any]) async throws -> [String: Any] {
         let payload: [String: Any] = ["host": host.dictionary, "request": request]
         if host.ssh.isEmpty, let op = request["op"] as? String,
-           ["sidebar_agents", "detail", "snapshot", "files", "read_file", "workspace_settings", "workspace_agents"].contains(op) {
+           ["sidebar_agents", "detail", "snapshot", "files", "read_file", "git_status", "workspace_settings", "workspace_agents"].contains(op) {
             let input = try JSONSerialization.data(withJSONObject: payload)
             return try decode(await LocalReadWorker.shared.read(input))
         }

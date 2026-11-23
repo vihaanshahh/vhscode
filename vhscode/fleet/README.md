@@ -6,6 +6,8 @@ Open **Fleet Workbench** in Applications. Choose **File → Open Folder** (⌘O)
 
 The file explorer, editor tabs, and agent controls share a native Mac window. Use ⌘P to find files, ⌘S to save, ⌘B to toggle the explorer, and ⌘W to close the current editor tab. Attach files using the paperclip beside a path in the explorer.
 
+In a Git workspace, the Explorer marks changed files and folders. Expand **Git Changes** to see staged, unstaged, deleted, and untracked files. Select a file there to preview its changes. The working tree refreshes while the Explorer is open, including on SSH workspaces. For branches with an upstream, **Fetch Git updates** refreshes the ahead and behind counts from the configured remote. Fetch updates the remote-tracking branch and leaves your working files intact.
+
 New workspaces open with no agents, and you can edit files immediately. Use **New Agent**, choose Codex or Cursor, and enter a name such as **API review**. The name appears in the sidebar and the agent picker. Leave it blank to use the default name, or change it later with **Agent options → Rename Agent…**. Fleet saves names on the workspace host.
 
 Each agent keeps its own prompt, file attachments, and native CLI session. You can add more agents and run them in parallel. Click an agent in the sidebar to view its progress or stop its run.

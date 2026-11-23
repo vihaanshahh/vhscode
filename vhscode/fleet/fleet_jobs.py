@@ -332,7 +332,7 @@ def rpc(request):
         from fleet_models import workspace
         from fleet_hosts import workspace_root
         return workspace(workspace_root(request["repo"]), request)
-    if op in {"files", "read_file", "save_file", "find_files", "submit"}:
+    if op in {"files", "read_file", "save_file", "find_files", "submit", "git_status", "git_diff", "git_fetch"}:
         from fleet_desktop import workspace
 
         return workspace(request)

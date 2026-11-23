@@ -66,7 +66,7 @@ private struct DirectoryPage {
     var retry = FolderNavigation.first
 }
 
-private enum FolderNavigation { case first, previous, next }
+private enum FolderNavigation { case first, previous, next, refresh }
 
 private struct WorkspaceFailure: LocalizedError {
     let errorDescription: String?
@@ -333,6 +333,8 @@ private final class WorkspaceModel: ObservableObject {
         switch direction {
         case .first:
             cursor = nil
+        case .refresh:
+            cursor = page.currentCursor
         case .previous:
             guard let previous = page.previousCursors.last else { return }
             cursor = previous
@@ -374,6 +376,7 @@ private final class WorkspaceModel: ObservableObject {
             case .first: page.previousCursors = []
             case .previous: page.previousCursors.removeLast()
             case .next: page.previousCursors.append(page.currentCursor)
+            case .refresh: break
             }
             page.currentCursor = cursor
             let next = reply["cursor"] as? String
@@ -851,7 +854,10 @@ private struct WorkspacePane: View {
             Divider()
             if showsFiles {
                 HSplitView {
-                    if explorerVisible { browser.frame(minWidth: 145, idealWidth: 188) }
+                    if explorerVisible {
+                        WorkspaceExplorer(host: host, model: model, active: monitorRuns)
+                            .frame(minWidth: 145, idealWidth: 188)
+                    }
                     editor.frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
                     agentPane.frame(minWidth: 255, idealWidth: 316)
                 }
@@ -1018,33 +1024,6 @@ private struct WorkspacePane: View {
         .controlSize(.small)
         .frame(minHeight: 32)
         .padding(.horizontal, 12)
-    }
-
-    private var browser: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("Explorer").font(.subheadline.weight(.semibold))
-                Spacer()
-                Button {
-                    Task { await model.loadFolder("") }
-                } label: {
-                    Image(systemName: "arrow.clockwise").frame(width: 20, height: 20)
-                }
-                .buttonStyle(.plain)
-                .help("Refresh files")
-                .accessibilityLabel("Refresh files")
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            Divider()
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    FileBranch(model: model, directory: "", depth: 0)
-                }
-                .padding(.vertical, 6)
-            }
-        }
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.7))
     }
 
     private var editor: some View {
@@ -2041,8 +2020,74 @@ private struct QuickOpenInput: NSViewRepresentable {
 }
 
 @MainActor
+private struct WorkspaceExplorer: View {
+    @ObservedObject var model: WorkspaceModel
+    let active: Bool
+    @StateObject private var git: WorkspaceGit
+    @State private var diff: WorkspaceGitChange?
+
+    init(host: FleetHost, model: WorkspaceModel, active: Bool) {
+        self.model = model
+        self.active = active
+        _git = StateObject(wrappedValue: WorkspaceGit(host: host))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Explorer").font(.subheadline.weight(.semibold))
+                Spacer()
+                Button {
+                    Task { await model.loadFolder("", direction: .refresh) }
+                    Task { await git.refresh() }
+                } label: {
+                    Image(systemName: "arrow.clockwise").frame(width: 20, height: 20)
+                }
+                .buttonStyle(.plain)
+                .help("Refresh files and Git status")
+                .accessibilityLabel("Refresh files and Git status")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    WorkspaceGitChanges(git: git) { diff = $0 }
+                    FileBranch(model: model, git: git, directory: "", depth: 0)
+                }
+                .padding(.vertical, 6)
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.7))
+        .task(id: active, priority: .utility) {
+            if active { await git.monitor() }
+        }
+        .onChange(of: git.status) { previous, current in
+            guard let current else { return }
+            let headChanged = previous.map { $0.head != current.head } ?? false
+            let changes = Set(previous?.changes ?? []).symmetricDifference(current.changes).filter(\.affectsFileTree)
+            guard headChanged || !changes.isEmpty else { return }
+            let directories = headChanged ? model.expanded.union([""])
+                : changes.reduce(into: Set([""])) { $0.formUnion($1.parentFolders) }
+            Task {
+                for directory in directories.sorted() where model.folders[directory] != nil
+                    && (directory.isEmpty || model.expanded.contains(directory)) {
+                    await model.loadFolder(directory, direction: .refresh)
+                }
+            }
+        }
+        .sheet(item: $diff) { change in
+            WorkspaceGitDiff(host: git.host, change: change) { path in
+                Task { await model.openFile(path) }
+            }
+        }
+    }
+}
+
+@MainActor
 private struct FileBranch: View {
     @ObservedObject var model: WorkspaceModel
+    @ObservedObject var git: WorkspaceGit
     let directory: String
     let depth: Int
 
@@ -2051,7 +2096,7 @@ private struct FileBranch: View {
             ForEach(page.entries) { entry in
                 entryRow(entry)
                 if entry.isDirectory, model.expanded.contains(entry.path) {
-                    FileBranch(model: model, directory: entry.path, depth: depth + 1)
+                    FileBranch(model: model, git: git, directory: entry.path, depth: depth + 1)
                 }
             }
             if page.isLoading {
@@ -2113,6 +2158,13 @@ private struct FileBranch: View {
                         .frame(width: 12)
                     Text(entry.name).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 0)
+                    if let change = git.files[entry.path] {
+                        WorkspaceGitBadge(change: change)
+                    } else if entry.isDirectory, git.folders.contains(entry.path) {
+                        Circle().fill(FleetPalette.warning).frame(width: 5, height: 5)
+                            .help("Contains Git changes")
+                            .accessibilityLabel("Contains Git changes")
+                    }
                 }
                 .frame(maxWidth: .infinity, minHeight: 24)
                 .contentShape(Rectangle())
