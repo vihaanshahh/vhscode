@@ -6,9 +6,15 @@ Open **Fleet Workbench** in Applications. Choose **File → Open Folder** (⌘O)
 
 The file explorer, editor tabs, and agent controls share a native Mac window. Use ⌘P to find files, ⌘S to save, ⌘B to toggle the explorer, and ⌘W to close the current editor tab. Attach files using the paperclip beside a path in the explorer.
 
-Use **New Agent** to add Codex or Cursor sessions to a workspace. Each session keeps its own prompt, file attachments, and native CLI context. Up to four desktop tasks can run at once on each host. Click an agent beneath its workspace in the sidebar to view its progress or stop that run. Opening a finished run shows its Markdown response, including selectable code blocks.
+New workspaces open with no agents, and you can edit files immediately. Use **New Agent**, choose Codex or Cursor, and enter a name such as **API review**. The name appears in the sidebar and the agent picker. Leave it blank to use the default name, or change it later with **Agent options → Rename Agent…**. Fleet saves names on the workspace host.
 
-Type `/resume` in the composer to choose an existing session for this workspace, or use **Agent options → Resume Session…**. Fleet can resume a conversation started by the standalone CLI. Use `/new` for a fresh conversation in the current agent, `/status` to inspect it, and `/help` to see composer commands. The workspace header’s **New Agent** button adds an independent agent.
+Each agent keeps its own prompt, file attachments, and native CLI session. You can add more agents and run them in parallel. Click an agent in the sidebar to view its progress or stop its run.
+
+In **Activity**, select an agent to open its conversation beside the agent and run list. Send follow-up prompts, respond to approvals, or stop an active run there. Select a recent run to read its details, or choose **Open Files** to return to the workspace editor.
+
+Choose **Agent options → Delete Agent…** to remove an agent from the workspace. Stop any active run first. Its finished runs are available in **Activity**, and you can resume its native session from another agent.
+
+Type `/resume` in the composer to choose an existing session for this workspace, or use **Agent options → Resume Session…**. Fleet can resume a conversation started by the standalone CLI. Use `/new` for a fresh conversation in the current agent, `/status` to inspect it, and `/help` to see composer commands.
 
 The **Model** dropdown beside the provider and view controls lists models from the selected CLI on the workspace's machine. Choosing a model applies it to that workspace and harness, including scheduled tasks. **CLI default** follows the CLI's configuration. If the account rejects the configured default, choose one of the models returned by that machine. Each scheduled task starts a fresh conversation.
 

@@ -36,8 +36,8 @@ def _agent(agent):
 
 
 def agent_lane(value):
-    if type(value) is not int or not 1 <= value <= 4:
-        raise ValueError("Choose an agent instance between 1 and 4.")
+    if type(value) is not int or not 1 <= value < 2**63:
+        raise ValueError("Choose a valid agent instance.")
     return value
 
 
@@ -68,13 +68,15 @@ def _database():
                  model TEXT,
                  session TEXT,
                  generation INTEGER NOT NULL DEFAULT 0,
+                 listed INTEGER,
+                 name TEXT,
                  PRIMARY KEY(repo, agent)
                )"""
         )
         database.execute(
             """CREATE TABLE IF NOT EXISTS additional_sessions (
                  repo TEXT NOT NULL, agent TEXT NOT NULL, lane INTEGER NOT NULL,
-                 session TEXT, generation INTEGER NOT NULL DEFAULT 0,
+                 session TEXT, generation INTEGER NOT NULL DEFAULT 0, listed INTEGER, name TEXT,
                  PRIMARY KEY(repo, agent, lane)
                )"""
         )
@@ -84,6 +86,14 @@ def _database():
                  PRIMARY KEY(repo, agent)
                )"""
         )
+        for table in ("workspace_settings", "additional_sessions"):
+            columns = {"listed": "INTEGER", "name": "TEXT"}
+            if columns.keys() - {row[1] for row in database.execute(f"PRAGMA table_info({table})")}:
+                with database:
+                    database.execute("BEGIN IMMEDIATE")
+                    existing = {row[1] for row in database.execute(f"PRAGMA table_info({table})")}
+                    for column in columns.keys() - existing:
+                        database.execute(f"ALTER TABLE {table} ADD COLUMN {column} {columns[column]}")
     except Exception:
         database.close()
         raise
@@ -124,16 +134,16 @@ def get(repo, agent, lane=1):
     """Return preferences and the generation a run must present when remembering a session."""
     with closing(_database()) as database:
         row = database.execute(
-            "SELECT model, session, generation FROM workspace_settings WHERE repo = ? AND agent = ?",
+            "SELECT model, session, generation, listed FROM workspace_settings WHERE repo = ? AND agent = ?",
             _key(repo, agent),
         ).fetchone()
-        model, session, generation = row or (None, None, 0)
+        model, session, generation, listed = row or (None, None, 0, None)
         if agent_lane(lane) != 1:
-            session, generation = database.execute(
-                "SELECT session, generation FROM additional_sessions WHERE repo=? AND agent=? AND lane=?",
+            session, generation, listed = database.execute(
+                "SELECT session, generation, listed FROM additional_sessions WHERE repo=? AND agent=? AND lane=?",
                 (*_key(repo, agent), lane),
-            ).fetchone() or (None, 0)
-    return {"model": model, "session": session, "generation": generation}
+            ).fetchone() or (None, 0, None)
+    return {"model": model, "session": session, "generation": generation, "listed": listed}
 
 
 def remember(repo, agent, session, generation, lane=1):
@@ -148,31 +158,48 @@ def remember(repo, agent, session, generation, lane=1):
             return False
         database.execute(f"INSERT OR IGNORE INTO {table}({names}) VALUES ({','.join('?' for _ in key)})", key)
         result = database.execute(
-            f"UPDATE {table} SET session=? WHERE " + " AND ".join(f"{name}=?" for name in columns) + " AND generation=?",
+            f"UPDATE {table} SET session=? WHERE " + " AND ".join(f"{name}=?" for name in columns)
+            + " AND generation=? AND listed IS NOT 0",
             (session, *key, generation),
         )
         return result.rowcount == 1
 
 
-def _latest_instances(roots):
-    from fleet_jobs import RUNS_VIEW, _connect, _reap_manual
+def _instances(roots, runs, settings):
+    from fleet_jobs import RUNS_VIEW
 
-    if not roots:
-        return {}
-    _reap_manual()
-    with _connect() as db:
-        records = db.execute(
-            RUNS_VIEW + f" WHERE detached=1 AND repo IN ({','.join('?' for _ in roots)}) ORDER BY started DESC, id DESC",
-            tuple(roots),
+    placeholders = ",".join("?" for _ in roots)
+    latest = {}
+    for row in runs.execute(
+        RUNS_VIEW + f" WHERE detached=1 AND repo IN ({placeholders}) ORDER BY started DESC, id DESC",
+        tuple(roots),
+    ):
+        latest.setdefault((row["repo"], row["agent"], row["lane"]), dict(row))
+    preferences = {
+        (root, agent, lane): (session, generation, listed, name)
+        for root, agent, lane, session, generation, listed, name in settings.execute(
+            f"SELECT repo, agent, 1, session, generation, listed, name FROM workspace_settings WHERE repo IN ({placeholders}) "
+            f"UNION ALL SELECT repo, agent, lane, session, generation, listed, name FROM additional_sessions WHERE repo IN ({placeholders})",
+            (*roots, *roots),
         )
-        latest = {}
-        for row in records:
-            latest.setdefault((row["repo"], row["agent"], row["lane"]), dict(row))
-    return latest
+    }
+    instances = {}
+    for key in sorted(latest.keys() | preferences.keys()):
+        root, agent, lane = key
+        run = latest.get(key)
+        session, generation, listed, name = preferences.get(key, (None, 0, None, None))
+        # Rows without an explicit choice predate the roster. Restore only agents that were used.
+        if listed == 0 or (listed is None and not (run or session or generation)):
+            continue
+        if run and run["generation"] != generation:
+            run = None
+        instances.setdefault(root, []).append({"agent": agent, "lane": lane, "name": name, "session": session, "run": run})
+    return instances
 
 
 def sidebar_agents(repos):
     from fleet_hosts import workspace_root
+    from fleet_jobs import _connect, _reap_manual, _title
 
     if not isinstance(repos, list) or len(repos) > 256 or not all(isinstance(path, str) for path in repos):
         raise ValueError("Choose up to 256 workspace folders.")
@@ -186,18 +213,10 @@ def sidebar_agents(repos):
     roots = set(mapped.values())
     if not roots:
         return {"workspaces": workspaces}
-    latest = _latest_instances(roots)
+    _reap_manual()
     placeholders = ','.join('?' for _ in roots)
-    with closing(_database()) as settings:
-        generations = {
-            (root, agent, lane): gen for root, agent, lane, gen in settings.execute(
-                f"SELECT repo, agent, 1, generation FROM workspace_settings WHERE repo IN ({placeholders}) "
-                f"UNION ALL SELECT repo, agent, lane, generation FROM additional_sessions WHERE repo IN ({placeholders})",
-                (*roots, *roots),
-            )
-        }
-    from fleet_jobs import _connect, _title
-    with _connect() as db:
+    with _connect() as db, closing(_database()) as settings:
+        instances = _instances(roots, db, settings)
         schedules = db.execute(
             f"""SELECT s.repo,s.id AS schedule,s.agent,s.prompt,s.enabled,
                     EXISTS(SELECT 1 FROM runs WHERE schedule_id=s.id AND status='running') AS running
@@ -205,14 +224,12 @@ def sidebar_agents(repos):
             tuple(roots),
         ).fetchall()
     for repo, root in mapped.items():
-        rows = []
-        for key, run in sorted(latest.items()):
-            if key[0] != root:
-                continue
-            row = {field: run[field] for field in ("agent", "lane", "status", "title")}
-            if run["generation"] != generations.get(key, 0) and run["status"] != "running":
-                row.update(status="ready", title="")
-            rows.append(row)
+        rows = [
+            {"agent": instance["agent"], "lane": instance["lane"], "name": instance["name"],
+             "status": run["status"] if (run := instance["run"]) else "ready",
+             "title": run["title"] if run else ""}
+            for instance in instances.get(root, [])
+        ]
         rows.extend({
             "agent": row["agent"], "lane": 0, "schedule": row["schedule"], "title": _title(row["prompt"]),
             "status": "running" if row["running"] else ("scheduled" if row["enabled"] else "paused"),
@@ -221,21 +238,51 @@ def sidebar_agents(repos):
     return {"workspaces": workspaces}
 
 
-def _instances(repo):
+def _change_agent(repo, agent, request):
+    from fleet_jobs import _connect, _reap_manual
+
     root = str(repo)
-    latest = _latest_instances([root])
-    keys = {(agent, 1) for agent in AGENTS}
-    keys.update((agent, lane) for _, agent, lane in latest)
-    with closing(_database()) as db:
-        keys.update(db.execute("SELECT agent, lane FROM additional_sessions WHERE repo=?", (root,)))
-    instances = []
-    for agent, lane in sorted(keys):
-        settings = get(repo, agent, lane)
-        run = latest.get((root, agent, lane))
-        if run and run["generation"] != settings["generation"]:
-            run = None
-        instances.append({"agent": agent, "lane": lane, "session": settings["session"], "run": run})
-    return {"instances": instances}
+    op = request["op"]
+    adding = op == "add_agent"
+    renaming = op == "rename_agent"
+    lane = None if adding else agent_lane(request.get("lane"))
+    name = request.get("name", "") if adding or renaming else ""
+    if not isinstance(name, str) or any(character in name for character in "\0\r\n"):
+        raise ValueError("Enter a single-line agent name.")
+    name = name.strip() or None
+    _reap_manual()
+    # Share the admission lock with desktop submissions so a running agent cannot be deleted.
+    with _connect() as runs, closing(_database()) as settings, settings:
+        runs.execute("BEGIN IMMEDIATE")
+        settings.execute("BEGIN IMMEDIATE")
+        if adding or renaming:
+            occupied = {row["lane"] for row in _instances([root], runs, settings).get(root, []) if row["agent"] == agent}
+            if adding:
+                lane = next(number for number in range(1, len(occupied) + 2) if number not in occupied)
+            elif lane not in occupied:
+                raise ValueError("This agent no longer exists in the workspace.")
+        elif runs.execute(
+            "SELECT 1 FROM runs WHERE repo=? AND agent=? AND lane=? AND detached=1 AND status='running' LIMIT 1",
+            (root, agent, lane),
+        ).fetchone():
+            raise ValueError("Stop this agent’s active task before deleting it.")
+        table, columns, key = _session_table(repo, agent, lane)
+        names = ", ".join(columns)
+        placeholders = ",".join("?" for _ in key)
+        if renaming:
+            settings.execute(
+                f"INSERT INTO {table}({names}, listed, name) VALUES ({placeholders}, 1, ?) "
+                f"ON CONFLICT({names}) DO UPDATE SET listed=1, name=excluded.name",
+                (*key, name),
+            )
+            return {"lane": lane, "name": name}
+        settings.execute(
+            f"INSERT INTO {table}({names}, generation, listed, name) VALUES ({placeholders}, 1, ?, ?) "
+            f"ON CONFLICT({names}) DO UPDATE SET session=NULL, generation=generation+1, listed=excluded.listed, name=excluded.name "
+            "WHERE listed IS NOT excluded.listed",
+            (*key, int(adding), name),
+        )
+    return {"lane": lane, "name": name} if adding else {}
 
 
 def _assigned_sessions(database, key):
@@ -252,7 +299,10 @@ def _session_in_other_lane(database, key, lane, session):
 
 
 def verify_session_admission(repo, agent, lane, session, generation):
-    if get(repo, agent, lane)["generation"] != generation:
+    settings = get(repo, agent, lane)
+    if settings["listed"] == 0:
+        raise ValueError("This agent was deleted. Add an agent before sending a prompt.")
+    if settings["generation"] != generation:
         raise ValueError("The agent session changed. Refresh the workspace before sending a prompt.")
     if session is not None:
         with closing(_database()) as settings:
@@ -340,21 +390,28 @@ def _resume_session(repo, agent, lane, session):
         settings.execute("BEGIN IMMEDIATE")
         if _session_in_other_lane(settings, workspace, lane, session):
             raise ValueError("This session is already assigned to another agent instance.")
-        settings.execute(
+        updated = settings.execute(
             f"INSERT INTO {table}({names}, session, generation) VALUES ({','.join('?' for _ in key)}, ?, 1) "
-            f"ON CONFLICT({names}) DO UPDATE SET session=excluded.session, generation=generation+1",
+            f"ON CONFLICT({names}) DO UPDATE SET session=excluded.session, generation=generation+1 WHERE listed IS NOT 0",
             (*key, session),
         )
+        if not updated.rowcount:
+            raise ValueError("This agent was deleted. Add an agent before resuming a session.")
     return {"session": session}
 
 
 def workspace(repo, request):
     op = request.get("op")
     if op == "workspace_agents":
-        return _instances(repo)
+        from fleet_jobs import _connect, _reap_manual
+
+        _reap_manual()
+        root = str(repo)
+        with _connect() as runs, closing(_database()) as settings:
+            return {"instances": _instances([root], runs, settings).get(root, [])}
     if op == "workspace_settings":
         settings = {
-            agent: {key: value for key, value in get(repo, agent).items() if key != "generation"}
+            agent: {key: value for key, value in get(repo, agent).items() if key in ("model", "session")}
             for agent in AGENTS
         }
         if request.get("include_cursor_trust") is True:
@@ -362,6 +419,8 @@ def workspace(repo, request):
             settings["cursor"]["trusted"] = cursor_trust(repo)
         return settings
     agent = _agent(request.get("agent"))
+    if op in {"add_agent", "rename_agent", "delete_agent"}:
+        return _change_agent(repo, agent, request)
     if op == "cli_command":
         return {"command": cli_command(repo, agent)}
     if op == "set_cli_command":
@@ -396,11 +455,13 @@ def workspace(repo, request):
         table, columns, key = _session_table(repo, agent, request.get("lane", 1))
         names = ", ".join(columns)
         with closing(_database()) as database, database:
-            database.execute(
+            updated = database.execute(
                 f"INSERT INTO {table}({names}, generation) VALUES ({','.join('?' for _ in key)}, 1) "
-                f"ON CONFLICT({names}) DO UPDATE SET session=NULL, generation=generation+1",
+                f"ON CONFLICT({names}) DO UPDATE SET session=NULL, generation=generation+1 WHERE listed IS NOT 0",
                 key,
             )
+            if not updated.rowcount:
+                raise ValueError("This agent was deleted. Add an agent before starting a conversation.")
         return {}
     raise ValueError("Unknown Fleet model operation")
 

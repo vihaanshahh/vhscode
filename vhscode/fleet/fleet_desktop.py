@@ -23,10 +23,10 @@ MAX_FILE_BYTES = 256 * 1024
 MAX_PAGE = 200
 MAX_SEARCH_ENTRIES = 50000
 SEARCH_SECONDS = 2.0
-MANUAL_SLOTS = 4
 WORKSPACE_OPS = {
     "files", "find_files", "read_file", "save_file", "submit",
-    "workspace_settings", "workspace_agents", "set_model", "models", "reset_session", "list_sessions", "resume_session",
+    "workspace_settings", "workspace_agents", "add_agent", "rename_agent", "delete_agent",
+    "set_model", "models", "reset_session", "list_sessions", "resume_session",
     "cursor_trust_status", "set_cursor_trust",
     "cli_command", "set_cli_command", "test_cli_command",
 }
@@ -360,7 +360,7 @@ def workspace(request):
 
 
 def _submit(root, request):
-    from fleet_jobs import MANUAL_LOCKS, _reap_manual, _try_lock, begin_run, end_run
+    from fleet_jobs import MANUAL_LOCKS, _reap_manual, begin_run, end_run
 
     agent, prompt = request.get("agent"), request.get("prompt")
     view, session = request.get("view", "actions"), request.get("session")
@@ -394,35 +394,27 @@ def _submit(root, request):
     if session is None:
         session = settings["session"]
     _reap_manual()
-    slot = next((fd for number in range(MANUAL_SLOTS)
-                 if (fd := _try_lock(f"desktop-slot-{number}.lock")) is not None), None)
-    if slot is None:
-        raise ValueError("This host already has four desktop runs in progress")
+    run_id = begin_run(root, agent, prompt, view, session=session, detached=True,
+                       known_session=session == settings["session"], lane=lane, generation=settings["generation"])
+    fd = MANUAL_LOCKS[run_id]
     try:
-        run_id = begin_run(root, agent, prompt, view, session=session, detached=True,
-                           known_session=session == settings["session"], lane=lane, generation=settings["generation"])
-        fd = MANUAL_LOCKS[run_id]
-        try:
-            with tempfile.TemporaryFile() as payload:
-                payload.write(json.dumps({
-                    "repo": str(root), "agent": agent, "prompt": prompt, "view": view,
-                    "session": session, "tags": tags, "filter": quiet,
-                    "model": settings["model"], "generation": settings["generation"], "lane": lane,
-                    "approval_cards": approval_cards and agent == "codex", "yolo": yolo,
-                }).encode("ascii"))
-                payload.seek(0)
-                subprocess.Popen(
-                    [sys.executable, "-E", "-s", "-B", str(Path(__file__).resolve()),
-                     "_run", run_id, str(fd), str(slot)],
-                    stdin=payload, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True, pass_fds=(fd, slot),
-                )
-        except Exception as error:
-            end_run(run_id, "failed", error=f"Could not launch the desktop run: {error}")
-            raise
-        os.close(MANUAL_LOCKS.pop(run_id))
-    finally:
-        os.close(slot)
+        with tempfile.TemporaryFile() as payload:
+            payload.write(json.dumps({
+                "repo": str(root), "agent": agent, "prompt": prompt, "view": view,
+                "session": session, "tags": tags, "filter": quiet,
+                "model": settings["model"], "generation": settings["generation"], "lane": lane,
+                "approval_cards": approval_cards and agent == "codex", "yolo": yolo,
+            }).encode("ascii"))
+            payload.seek(0)
+            subprocess.Popen(
+                [sys.executable, "-E", "-s", "-B", str(Path(__file__).resolve()), "_run", run_id, str(fd)],
+                stdin=payload, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, pass_fds=(fd,),
+            )
+    except Exception as error:
+        end_run(run_id, "failed", error=f"Could not launch the desktop run: {error}")
+        raise
+    os.close(MANUAL_LOCKS.pop(run_id))
     return {"id": run_id}
 
 
@@ -563,11 +555,8 @@ def serve_reads():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 5 and sys.argv[1] == "_run":
-        try:
-            _run(sys.argv[2], int(sys.argv[3]))
-        finally:
-            os.close(int(sys.argv[4]))
+    if len(sys.argv) == 4 and sys.argv[1] == "_run":
+        _run(sys.argv[2], int(sys.argv[3]))
     elif sys.argv[1:] == ["--read-stream"]:
         serve_reads()
     else:

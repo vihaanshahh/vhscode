@@ -4,9 +4,11 @@ import SwiftUI
 struct WorkspaceView: View {
     let host: FleetHost
     var monitorRuns = true
+    var showsFiles = true
+    var onOpenFiles: () -> Void = {}
     var selectedAgentLane: FleetAgentLaneSelection? = nil
-    var onAgentLanesChange: ([FleetAgentLane]) -> Void = { _ in }
-    var onActiveAgentLaneChange: (FleetAgentLane) -> Void = { _ in }
+    var onAgentLabelsChange: ([FleetAgentLane: String]?) -> Void = { _ in }
+    var onActiveAgentLaneChange: (FleetAgentLane?) -> Void = { _ in }
     @State private var workspaces: [WorkspaceScope: WorkspaceModel] = [:]
 
     private var scope: WorkspaceScope {
@@ -16,8 +18,9 @@ struct WorkspaceView: View {
     var body: some View {
         Group {
             if let model = workspaces[scope] {
-                WorkspacePane(host: host, monitorRuns: monitorRuns, model: model, selectedAgentLane: selectedAgentLane,
-                              onAgentLanesChange: onAgentLanesChange, onActiveAgentLaneChange: onActiveAgentLaneChange)
+                WorkspacePane(host: host, monitorRuns: monitorRuns, showsFiles: showsFiles, onOpenFiles: onOpenFiles,
+                              model: model, selectedAgentLane: selectedAgentLane,
+                              onAgentLabelsChange: onAgentLabelsChange, onActiveAgentLaneChange: onActiveAgentLaneChange)
             } else {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -104,7 +107,6 @@ private struct WorkspaceAgent: Hashable, Identifiable {
     let harness: String
     let lane: Int
     var id: Self { self }
-    var label: String { "\(harness == "codex" ? "Codex" : "Cursor") \(lane)" }
     var sidebarLane: FleetAgentLane { FleetAgentLane(agent: harness, lane: lane) }
 }
 
@@ -170,8 +172,9 @@ private final class WorkspaceModel: ObservableObject {
     @Published var selectedPath: String?
     @Published var loadingFiles = Set<String>()
     @Published var fileErrors: [String: String] = [:]
-    @Published var selectedAgent = WorkspaceAgent(harness: "codex", lane: 1)
-    @Published private(set) var agents = [WorkspaceAgent(harness: "codex", lane: 1)]
+    @Published var selectedAgent: WorkspaceAgent?
+    @Published private(set) var agents: [WorkspaceAgent] = []
+    @Published private(set) var agentNames: [WorkspaceAgent: String] = [:]
     @Published private var drafts: [WorkspaceAgent: AgentDraft] = [:]
     @Published private var submitting = Set<WorkspaceAgent>()
     @Published private var conversations: [WorkspaceAgent: [WorkspaceTurn]] = [:]
@@ -183,6 +186,8 @@ private final class WorkspaceModel: ObservableObject {
     @Published private(set) var cursorSigningIn = false
     @Published private(set) var cursorLoginMessage: String?
     @Published private(set) var agentsLoaded = false
+    @Published private(set) var changingAgents = false
+    @Published var agentChangeError: String?
     @Published var stopping = Set<String>()
     @Published private(set) var answeringApprovals = Set<String>()
     @Published var notice: String?
@@ -207,15 +212,24 @@ private final class WorkspaceModel: ObservableObject {
     init(host: FleetHost) { self.host = host }
 
     var selectedBuffer: SourceBuffer? { buffers.first { $0.path == selectedPath } }
-    var turns: [WorkspaceTurn] { conversations[selectedAgent] ?? [] }
-    var tagPaths: Set<String> { drafts[selectedAgent]?.tags ?? [] }
-    var composerError: String? { composerErrors[selectedAgent] ?? streamErrors[selectedAgent] ?? settingsError }
-    var canSend: Bool { canSend(from: selectedAgent) }
-    var canReset: Bool { canReset(selectedAgent) }
+    var turns: [WorkspaceTurn] { selectedAgent.flatMap { conversations[$0] } ?? [] }
+    var tagPaths: Set<String> { selectedAgent.flatMap { drafts[$0]?.tags } ?? [] }
+    var composerError: String? { selectedAgent.flatMap { composerErrors[$0] ?? streamErrors[$0] } ?? settingsError }
+    var canSend: Bool { selectedAgent.map { canSend(from: $0) } ?? false }
+    var canReset: Bool { selectedAgent.map { canReset($0) } ?? false }
+    var sidebarAgentLabels: [FleetAgentLane: String]? {
+        guard agentsLoaded else { return nil }
+        return Dictionary(uniqueKeysWithValues: agents.map { ($0.sidebarLane, label(for: $0)) })
+    }
+
+    func label(for agent: WorkspaceAgent) -> String { agentNames[agent] ?? agent.sidebarLane.defaultLabel }
 
     func draftBinding<Value>(for agent: WorkspaceAgent, _ keyPath: WritableKeyPath<AgentDraft, Value>) -> Binding<Value> {
         Binding(get: { self.drafts[agent, default: AgentDraft()][keyPath: keyPath] },
-                set: { self.drafts[agent, default: AgentDraft()][keyPath: keyPath] = $0 })
+                set: {
+                    guard self.agents.contains(agent) else { return }
+                    self.drafts[agent, default: AgentDraft()][keyPath: keyPath] = $0
+                })
     }
 
     private func canSend(from agent: WorkspaceAgent) -> Bool {
@@ -235,11 +249,12 @@ private final class WorkspaceModel: ObservableObject {
         let state = if resetting.contains(agent) { "Switching session" }
         else if submitting.contains(agent) { "Starting" }
         else { conversations[agent]?.last?.status.capitalized ?? "Idle" }
-        return "\(agent.label) · \(state)\nModel: \(workspaceModels[agent.harness] ?? "CLI default")\nSession: \(sessions[agent] ?? "None")"
+        return "\(label(for: agent)) · \(state)\nModel: \(workspaceModels[agent.harness] ?? "CLI default")\nSession: \(sessions[agent] ?? "None")"
     }
 
     private func canReset(_ agent: WorkspaceAgent) -> Bool {
-        agentsLoaded && !submitting.contains(agent) && activeRun(agent) == nil && !resetting.contains(agent)
+        agentsLoaded && agents.contains(agent) && !submitting.contains(agent)
+            && activeRun(agent) == nil && !resetting.contains(agent)
     }
 
     func activeRun(_ agent: WorkspaceAgent) -> String? {
@@ -253,22 +268,60 @@ private final class WorkspaceModel: ObservableObject {
         return last.id
     }
 
-    func availableAgent(_ harness: String) -> WorkspaceAgent? {
-        (1...4).map { WorkspaceAgent(harness: harness, lane: $0) }.first { !agents.contains($0) }
+    func saveAgent(harness: String, name: String, renaming agent: WorkspaceAgent?) async throws {
+        guard agentsLoaded, !changingAgents, agent.map(agents.contains) ?? true else {
+            throw WorkspaceFailure("The workspace agents have changed. Reopen the agent form and try again.")
+        }
+        changingAgents = true
+        defer { changingAgents = false }
+        let provider = agent?.harness ?? harness
+        var request: [String: Any] = ["op": agent == nil ? "add_agent" : "rename_agent", "agent": provider, "name": name]
+        if let agent { request["lane"] = agent.lane }
+        let reply = try await FleetBridge.call(host, request)
+        guard let lane = reply["lane"] as? Int, lane > 0 else {
+            throw WorkspaceFailure("The workspace did not return the saved agent.")
+        }
+        let saved = WorkspaceAgent(harness: provider, lane: lane)
+        agentNames[saved] = reply["name"] as? String
+        if agent == nil {
+            if !agents.contains(saved) { agents.append(saved) }
+            selectedAgent = saved
+        }
     }
 
-    func addAgent(_ harness: String) {
-        guard agentsLoaded, let agent = availableAgent(harness) else { return }
-        agents.append(agent)
-        selectedAgent = agent
+    func deleteAgent(_ agent: WorkspaceAgent) async -> Bool {
+        guard !changingAgents, canReset(agent), let index = agents.firstIndex(of: agent) else { return false }
+        changingAgents = true
+        resetting.insert(agent)
+        defer {
+            resetting.remove(agent)
+            changingAgents = false
+        }
+        do {
+            _ = try await FleetBridge.call(host, ["op": "delete_agent", "agent": agent.harness, "lane": agent.lane])
+            if let run = conversations[agent]?.last?.id { pendingDetails.remove(run) }
+            agents.remove(at: index)
+            agentNames[agent] = nil
+            drafts[agent] = nil
+            sessions[agent] = nil
+            conversations[agent] = nil
+            streamErrors[agent] = nil
+            composerErrors[agent] = nil
+            if selectedAgent == agent {
+                selectedAgent = agents.isEmpty ? nil : agents[min(index, agents.count - 1)]
+            }
+            return true
+        } catch {
+            agentChangeError = error.localizedDescription
+            return false
+        }
     }
 
     func selectAgent(_ selection: FleetAgentLaneSelection?) {
-        guard let selection, selection.id != lastAgentSelection,
-              ["codex", "cursor"].contains(selection.agent), (1...4).contains(selection.lane) else { return }
-        lastAgentSelection = selection.id
+        guard let selection, selection.id != lastAgentSelection else { return }
         let agent = WorkspaceAgent(harness: selection.agent, lane: selection.lane)
-        if !agents.contains(agent) { agents.append(agent) }
+        guard agents.contains(agent) else { return }
+        lastAgentSelection = selection.id
         selectedAgent = agent
     }
 
@@ -460,6 +513,7 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func toggleTag(_ path: String) {
+        guard let selectedAgent else { return }
         if drafts[selectedAgent, default: AgentDraft()].tags.remove(path) == nil {
             drafts[selectedAgent, default: AgentDraft()].tags.insert(path)
         }
@@ -476,9 +530,10 @@ private final class WorkspaceModel: ObservableObject {
             }
             for instance in instances {
                 guard let harness = instance["agent"] as? String, ["codex", "cursor"].contains(harness),
-                      let lane = instance["lane"] as? Int, (1...4).contains(lane) else { continue }
+                      let lane = instance["lane"] as? Int, lane > 0 else { continue }
                 let agent = WorkspaceAgent(harness: harness, lane: lane)
                 if !agents.contains(agent) { agents.append(agent) }
+                agentNames[agent] = instance["name"] as? String
                 sessions[agent] = instance["session"] as? String
                 guard let run = instance["run"] as? [String: Any], let id = run["id"] as? String else { continue }
                 var turn = WorkspaceTurn(id: id, prompt: run["title"] as? String ?? "", reporting: run["view"] as? String ?? "actions")
@@ -489,10 +544,7 @@ private final class WorkspaceModel: ObservableObject {
                 conversations[agent] = [turn]
                 pendingDetails.insert(id)
             }
-            if lastAgentSelection == nil, turns.isEmpty, (drafts[selectedAgent]?.text ?? "").isEmpty, tagPaths.isEmpty,
-               let active = agents.first(where: { activeRun($0) != nil }) {
-                selectedAgent = active
-            }
+            selectedAgent = agents.first { activeRun($0) != nil } ?? agents.first
             agentsLoaded = true
         } catch is CancellationError {
             return
@@ -777,14 +829,17 @@ private final class WorkspaceModel: ObservableObject {
 private struct WorkspacePane: View {
     let host: FleetHost
     var monitorRuns: Bool
+    let showsFiles: Bool
+    let onOpenFiles: () -> Void
     @ObservedObject var model: WorkspaceModel
     let selectedAgentLane: FleetAgentLaneSelection?
-    let onAgentLanesChange: ([FleetAgentLane]) -> Void
-    let onActiveAgentLaneChange: (FleetAgentLane) -> Void
+    let onAgentLabelsChange: ([FleetAgentLane: String]?) -> Void
+    let onActiveAgentLaneChange: (FleetAgentLane?) -> Void
     @State private var closing: SourceBuffer?
     @State private var panel: WorkspacePanel?
     @State private var showingCommands: WorkspaceAgent?
     @State private var showingStatus: WorkspaceAgent?
+    @State private var deletingAgent: WorkspaceAgent?
     @State private var confirmingCursorTrust = false
     @State private var terminalError: String?
     @AppStorage("FleetExplorerVisible") private var explorerVisible = true
@@ -795,31 +850,41 @@ private struct WorkspacePane: View {
         VStack(spacing: 0) {
             header
             Divider()
-            HSplitView {
-                if explorerVisible { browser.frame(minWidth: 145, idealWidth: 188) }
-                editor.frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
-                composer.frame(minWidth: 255, idealWidth: 316)
+            if showsFiles {
+                HSplitView {
+                    if explorerVisible { browser.frame(minWidth: 145, idealWidth: 188) }
+                    editor.frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+                    agentPane.frame(minWidth: 255, idealWidth: 316)
+                }
+            } else {
+                agentPane
             }
         }
-        .task {
+        .task(id: showsFiles) {
+            guard showsFiles else { return }
             if model.folders[""] == nil { await model.loadFolder("") }
             await model.openWelcomeFile()
         }
         .task { await model.loadSettings() }
         .task { await model.loadAgents() }
         .onChange(of: selectedAgentLane, initial: true) { _, selection in model.selectAgent(selection) }
-        .onChange(of: model.agents, initial: true) { _, agents in onAgentLanesChange(agents.map(\.sidebarLane)) }
-        .onChange(of: model.selectedAgent, initial: true) { _, agent in onActiveAgentLaneChange(agent.sidebarLane) }
+        .onChange(of: model.agentsLoaded) { _, loaded in
+            if loaded { model.selectAgent(selectedAgentLane) }
+        }
+        .onChange(of: model.sidebarAgentLabels, initial: true) { _, labels in
+            onAgentLabelsChange(labels)
+        }
+        .onChange(of: model.selectedAgent, initial: true) { _, agent in onActiveAgentLaneChange(agent?.sidebarLane) }
         .onAppear { model.publishDirty(force: true) }
         .onDisappear { NotificationCenter.default.post(name: .init("FleetWorkspaceDirty"), object: false) }
         .onReceive(NotificationCenter.default.publisher(for: .init("FleetQuickOpen"))) { _ in
             panel = .quickOpen
         }
         .onReceive(NotificationCenter.default.publisher(for: .init("FleetToggleExplorer"))) { _ in
-            explorerVisible.toggle()
+            if showsFiles { explorerVisible.toggle() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .init("FleetCloseTab"))) { _ in
-            if let buffer = model.selectedBuffer { requestClose(buffer) }
+            if showsFiles, let buffer = model.selectedBuffer { requestClose(buffer) }
         }
         .sheet(item: $panel) { panel in
             switch panel {
@@ -834,6 +899,8 @@ private struct WorkspacePane: View {
                 AgentCommandPanel(host: host, agent: agent) {
                     Task { await model.loadModelOptions(for: agent.harness, refresh: true) }
                 }
+            case let .agentName(agent):
+                AgentNamePanel(model: model, agent: agent)
             }
         }
         .background {
@@ -856,6 +923,27 @@ private struct WorkspacePane: View {
             Button("Keep Editing", role: .cancel) { closing = nil }
         } message: { buffer in
             Text("The changes to \(buffer.name) will be lost.")
+        }
+        .alert("Delete Agent?", isPresented: Binding(
+            get: { deletingAgent != nil }, set: { if !$0 { deletingAgent = nil } }
+        ), presenting: deletingAgent) { agent in
+            Button("Delete Agent", role: .destructive) {
+                Task {
+                    guard await model.deleteAgent(agent) else { return }
+                    if showingCommands == agent { showingCommands = nil }
+                    if showingStatus == agent { showingStatus = nil }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { agent in
+            Text("Remove \(model.label(for: agent)) from this workspace and discard its prompt draft.")
+        }
+        .alert("Could Not Update Agents", isPresented: Binding(
+            get: { model.agentChangeError != nil }, set: { if !$0 { model.agentChangeError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(model.agentChangeError ?? "")
         }
         .alert("Trust This Workspace for Cursor?", isPresented: $confirmingCursorTrust) {
             Button("Cancel", role: .cancel) {}
@@ -905,29 +993,27 @@ private struct WorkspacePane: View {
                     .truncationMode(.middle)
             }
             Spacer()
-            Button { explorerVisible.toggle() } label: {
-                Image(systemName: explorerVisible ? "sidebar.left" : "sidebar.leading")
+            if showsFiles {
+                Button { explorerVisible.toggle() } label: {
+                    Image(systemName: explorerVisible ? "sidebar.left" : "sidebar.leading")
+                }
+                .help(explorerVisible ? "Hide Explorer (⌘B)" : "Show Explorer (⌘B)")
+                .accessibilityLabel(explorerVisible ? "Hide Explorer" : "Show Explorer")
+                Button { panel = .quickOpen } label: {
+                    Label("Quick Open", systemImage: "magnifyingglass")
+                }
+                .help("Find a file by name or path (⌘P)")
+            } else {
+                Button(action: onOpenFiles) { Label("Open Files", systemImage: "folder") }
             }
-            .help(explorerVisible ? "Hide Explorer (⌘B)" : "Show Explorer (⌘B)")
-            .accessibilityLabel(explorerVisible ? "Hide Explorer" : "Show Explorer")
-            Button { panel = .quickOpen } label: {
-                Label("Quick Open", systemImage: "magnifyingglass")
-            }
-            .help("Find a file by name or path (⌘P)")
-            Menu {
-                Button("Codex CLI") { model.addAgent("codex") }
-                    .disabled(model.availableAgent("codex") == nil)
-                Button("Cursor Agent") { model.addAgent("cursor") }
-                    .disabled(model.availableAgent("cursor") == nil)
-            } label: {
+            Button { panel = .agentName(nil) } label: {
                 Label("New Agent", systemImage: "plus").font(.callout.weight(.semibold))
             }
-            .menuStyle(.borderedButton)
-            .menuOrder(.fixed)
+            .buttonStyle(.bordered)
             .fixedSize()
             .help("Create an agent in \(host.label)")
             .accessibilityLabel("New Agent")
-            .disabled(!model.agentsLoaded || (model.availableAgent("codex") == nil && model.availableAgent("cursor") == nil))
+            .disabled(!model.agentsLoaded || model.changingAgents)
         }
         .padding(.horizontal, 15)
         .padding(.vertical, 10)
@@ -1065,12 +1151,38 @@ private struct WorkspacePane: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var composer: some View {
-        let agent = model.selectedAgent
+    private var agentPane: some View {
+        Group {
+            if let agent = model.selectedAgent {
+                composer(agent)
+            } else if let error = model.loadError {
+                ContentUnavailableView {
+                    Label("Agents unavailable", systemImage: "exclamationmark.circle")
+                } description: {
+                    Text(error)
+                } actions: {
+                    Button("Retry") { Task { await model.loadAgents() } }
+                }
+            } else if model.agentsLoaded && !model.changingAgents {
+                ContentUnavailableView {
+                    Label("No agents", systemImage: "bubble.left")
+                } description: {
+                    Text("Choose New Agent to add Codex or Cursor.")
+                } actions: {
+                    Button("Open Workspace Shell") { openTerminal() }
+                }
+            } else {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private func composer(_ agent: WorkspaceAgent) -> some View {
         let yolo = model.draftBinding(for: agent, \.yolo)
         return VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text(agent.label).font(.subheadline.weight(.semibold))
+                Text(model.label(for: agent)).font(.subheadline.weight(.semibold)).lineLimit(1)
                 let running = model.agents.filter { model.activeRun($0) != nil }.count
                 if running > 0 { Text("\(running) running").font(.caption).foregroundStyle(.secondary) }
                 Spacer()
@@ -1085,6 +1197,8 @@ private struct WorkspacePane: View {
                     .help("Stop this task")
                 }
                 Menu {
+                    Button("Rename Agent…") { panel = .agentName(agent) }
+                        .disabled(model.changingAgents)
                     Button("Edit Agent Command…") { panel = .command(agent) }
                     Button("Open Agent in Terminal") { openTerminal(agent: agent) }
                         .disabled(!model.canReset)
@@ -1114,6 +1228,9 @@ private struct WorkspacePane: View {
                         .disabled(!model.canReset)
                         .help(model.sessions[agent] == nil ? "New conversation" : "Start a fresh CLI session")
                     Button("Composer Commands") { showingCommands = agent }
+                    Divider()
+                    Button("Delete Agent…", role: .destructive) { deletingAgent = agent }
+                        .disabled(!model.canReset || model.changingAgents)
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
@@ -1159,6 +1276,7 @@ private struct WorkspacePane: View {
                             ForEach(model.tagPaths.sorted(), id: \.self) { path in
                                 HStack(spacing: 5) {
                                     Button {
+                                        if !showsFiles { onOpenFiles() }
                                         Task { await model.openFile(path) }
                                     } label: {
                                         Text((path as NSString).lastPathComponent)
@@ -1220,10 +1338,6 @@ private struct WorkspacePane: View {
                         Text(message).font(.caption).textSelection(.enabled)
                     }
                 }
-                if let error = model.loadError {
-                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
-                    Button("Retry Loading Agents") { Task { await model.loadAgents() } }
-                }
                 if let error = model.composerError {
                     Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
                 }
@@ -1233,7 +1347,6 @@ private struct WorkspacePane: View {
             }
             .padding(11)
         }
-        .background(Color(nsColor: .controlBackgroundColor))
         .task(id: agent.harness, priority: .utility) { await model.loadModelOptions(for: agent.harness) }
     }
 
@@ -1344,14 +1457,14 @@ private struct WorkspacePane: View {
 
     private var providerControls: some View {
         HStack(spacing: 5) {
-            Text("Provider").font(.caption).foregroundStyle(.secondary)
-            Picker("Provider", selection: $model.selectedAgent) {
+            Text("Agent").font(.caption).foregroundStyle(.secondary)
+            Picker("Agent", selection: $model.selectedAgent) {
                 ForEach(model.agents) { instance in
-                    Text(instance.label).tag(instance)
+                    Text(model.label(for: instance)).tag(Optional(instance))
                 }
             }
             .labelsHidden()
-            .accessibilityLabel("Provider and agent instance")
+            .accessibilityLabel("Agent")
         }
     }
 
@@ -1373,12 +1486,76 @@ private enum WorkspacePanel: Identifiable {
     case quickOpen
     case resume(WorkspaceAgent, String)
     case command(WorkspaceAgent)
+    case agentName(WorkspaceAgent?)
 
     var id: String {
         switch self {
         case .quickOpen: "open"
         case let .resume(agent, _): "resume-\(agent.harness)-\(agent.lane)"
         case let .command(agent): "command-\(agent.harness)"
+        case let .agentName(agent): agent.map { "name-\($0.harness)-\($0.lane)" } ?? "new-agent"
+        }
+    }
+}
+
+@MainActor
+private struct AgentNamePanel: View {
+    @ObservedObject var model: WorkspaceModel
+    let agent: WorkspaceAgent?
+    @Environment(\.dismiss) private var dismiss
+    @State private var harness = "codex"
+    @State private var name: String
+    @State private var saving = false
+    @State private var error: String?
+    @FocusState private var nameFocused: Bool
+
+    init(model: WorkspaceModel, agent: WorkspaceAgent?) {
+        self.model = model
+        self.agent = agent
+        _name = State(initialValue: agent.flatMap { model.agentNames[$0] } ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(agent == nil ? "New Agent" : "Rename Agent").font(.headline)
+            if agent == nil {
+                Picker("Provider", selection: $harness) {
+                    Text("Codex CLI").tag("codex")
+                    Text("Cursor Agent").tag("cursor")
+                }
+                .disabled(saving)
+            }
+            TextField("Name", text: $name, prompt: Text(agent?.sidebarLane.defaultLabel ?? "Optional"))
+                .focused($nameFocused)
+                .disabled(saving)
+            if let error { Text(error).font(.caption).foregroundStyle(.orange) }
+            HStack {
+                if saving { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(saving)
+                Button(agent == nil ? "Add Agent" : "Save") { Task { await save() } }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(saving)
+            }
+        }
+        .padding(18)
+        .frame(width: 340)
+        .interactiveDismissDisabled(saving)
+        .onAppear { nameFocused = true }
+    }
+
+    private func save() async {
+        guard !saving else { return }
+        saving = true
+        error = nil
+        defer { saving = false }
+        do {
+            try await model.saveAgent(harness: harness, name: name, renaming: agent)
+            dismiss()
+        } catch {
+            self.error = error.localizedDescription
         }
     }
 }
@@ -1475,7 +1652,7 @@ private struct ResumeSessionPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Resume Session in \(agent.label)").font(.headline)
+            Text("Resume Session in \(model.label(for: agent))").font(.headline)
             TextField("Session ID", text: $sessionID, prompt: Text("Enter a session ID or choose one below"))
                 .font(.system(.body, design: .monospaced))
                 .textFieldStyle(.roundedBorder)
@@ -1941,7 +2118,7 @@ private struct FileBranch: View {
             }
             .buttonStyle(.plain)
             .help(entry.path)
-            if !entry.isDirectory {
+            if !entry.isDirectory, model.selectedAgent != nil {
                 Button { model.toggleTag(entry.path) } label: {
                     Image(systemName: tagged ? "paperclip.circle.fill" : "paperclip")
                         .font(.system(size: 11))
@@ -2032,13 +2209,15 @@ private struct SourceEditor: View {
                 Spacer()
                 if buffer.isSaving { ProgressView().controlSize(.small) }
                 else if buffer.isDirty { Text("Unsaved").font(.caption).foregroundStyle(.secondary) }
-                Button {
-                    model.toggleTag(buffer.path)
-                } label: {
-                    Image(systemName: model.tagPaths.contains(buffer.path) ? "paperclip.circle.fill" : "paperclip")
+                if model.selectedAgent != nil {
+                    Button {
+                        model.toggleTag(buffer.path)
+                    } label: {
+                        Image(systemName: model.tagPaths.contains(buffer.path) ? "paperclip.circle.fill" : "paperclip")
+                    }
+                    .help(model.tagPaths.contains(buffer.path) ? "Detach file" : "Attach file to prompts")
+                    .accessibilityLabel(model.tagPaths.contains(buffer.path) ? "Detach file" : "Attach file to prompts")
                 }
-                .help(model.tagPaths.contains(buffer.path) ? "Detach file" : "Attach file to prompts")
-                .accessibilityLabel(model.tagPaths.contains(buffer.path) ? "Detach file" : "Attach file to prompts")
                 Button("Save") { Task { await model.save(buffer) } }
                     .disabled(!buffer.isDirty || buffer.isSaving || buffer.diskRevision != nil)
                     .keyboardShortcut("s", modifiers: .command)

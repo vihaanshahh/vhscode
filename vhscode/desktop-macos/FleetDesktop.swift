@@ -25,6 +25,10 @@ struct FleetAgentLaneSelection: Equatable {
 struct FleetAgentLane: Hashable {
     let agent: String
     let lane: Int
+    var defaultLabel: String {
+        let provider = agent == "codex" ? "Codex" : "Cursor"
+        return lane == 1 ? provider : "\(provider) \(lane)"
+    }
 }
 
 enum FleetBridge {
@@ -278,11 +282,11 @@ private struct FleetWindow: View {
         let status: String
         let title: String?
         let schedule: String?
+        let name: String?
         var id: String { schedule.map { "schedule-\($0)" } ?? "\(agent)-\(lane)" }
-        var name: String { agent == "codex" ? "Codex" : "Cursor" }
         var label: String {
-            if schedule != nil { return title ?? "\(name) schedule" }
-            return lane == 1 ? name : "\(name) \(lane)"
+            if schedule != nil { return title ?? (agent == "codex" ? "Codex schedule" : "Cursor schedule") }
+            return name ?? FleetAgentLane(agent: agent, lane: lane).defaultLabel
         }
         var statusLabel: String {
             switch status {
@@ -317,6 +321,7 @@ private struct FleetWindow: View {
     @State private var collapsedGroups = Set<String>()
     @State private var openedRepo: String?
     @State private var section = "Workspace"
+    @State private var activityAgentOpen = false
     @State private var draft: FleetHost?
     @State private var error = ""
     @State private var confirmingRemoval = false
@@ -324,7 +329,7 @@ private struct FleetWindow: View {
     @State private var expandedAgents: [String: Bool] = [:]
     @State private var sidebarAgents: [FleetHost: [SidebarAgent]] = [:]
     @State private var laneSelection: FleetAgentLaneSelection?
-    @State private var localAgentLanes: [FleetHost: [FleetAgentLane]] = [:]
+    @State private var localAgentLabels: [FleetHost: [FleetAgentLane: String]] = [:]
     @State private var activeAgentLane: [FleetHost: FleetAgentLane] = [:]
     private var current: FleetHost? {
         guard var host = hosts.first(where: { $0.id == selectedHost }) ?? hosts.first else { return nil }
@@ -334,9 +339,22 @@ private struct FleetWindow: View {
     private var sidebarQuery: SidebarQuery {
         SidebarQuery(active: scenePhase == .active, hosts: hosts.map(sidebarHost))
     }
+    private var activityAgents: [FleetActivityAgent] {
+        sidebarQuery.hosts.flatMap { host in
+            agentRows(host).compactMap { agent in
+                guard agent.schedule == nil else { return nil }
+                return FleetActivityAgent(host: host, lane: FleetAgentLane(agent: agent.agent, lane: agent.lane),
+                                          label: agent.label, status: agent.status, statusLabel: agent.statusLabel)
+            }
+        }
+    }
     private let sections = [("Activity", "waveform.path.ecg"), ("Schedules", "calendar.badge.clock"), ("Risks", "exclamationmark.triangle")]
 
     var body: some View {
+        let showsFiles = section == "Workspace"
+        let showsActivityAgent = section == "Activity" && activityAgentOpen && current != nil
+        let showsWorkspace = showsFiles || showsActivityAgent
+        let agents = section == "Activity" ? activityAgents : []
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 9) {
@@ -388,23 +406,35 @@ private struct FleetWindow: View {
             .frame(width: 164)
             .background(Color(red: 0.095, green: 0.103, blue: 0.117))
             Divider()
+            if !showsFiles {
+                let activeAgent = showsActivityAgent ? agents.first { $0.host == current && $0.lane == activeAgentLane[$0.host] } : nil
+                FleetOverview(hosts: hosts, section: section, agents: agents, activeAgentID: activeAgent?.id,
+                              showsAgent: showsActivityAgent, onOpen: { openWorkspace($0) }, onSelectAgent: {
+                    openWorkspace($0.host, lane: $0.lane, inActivity: true)
+                }, onShowRuns: { activityAgentOpen = false })
+                .frame(width: showsActivityAgent ? 350 : nil)
+                if showsActivityAgent { Divider() }
+            }
             ZStack {
                 if let host = current {
-                    WorkspaceView(host: host, monitorRuns: section == "Workspace" && scenePhase == .active, selectedAgentLane: laneSelection, onAgentLanesChange: { lanes in
-                        if localAgentLanes[host] != lanes { localAgentLanes[host] = lanes }
+                    WorkspaceView(host: host, monitorRuns: showsWorkspace && scenePhase == .active, showsFiles: showsFiles,
+                                  onOpenFiles: { openWorkspace(host) }, selectedAgentLane: laneSelection, onAgentLabelsChange: { labels in
+                        if localAgentLabels[host] != labels {
+                            localAgentLabels[host] = labels
+                            if labels != nil { sidebarAgents[host] = agentRows(host) }
+                        }
                     }, onActiveAgentLaneChange: { lane in
                         if activeAgentLane[host] != lane { activeAgentLane[host] = lane }
                     }).id(host)
-                        .opacity(section == "Workspace" ? 1 : 0)
-                        .allowsHitTesting(section == "Workspace")
-                        .accessibilityHidden(section != "Workspace")
-                } else if section == "Workspace" {
+                } else if showsFiles {
                     ProgressView()
                 }
-                if section != "Workspace" {
-                    FleetOverview(hosts: hosts, section: section, onOpen: openWorkspace)
-                }
-            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(width: showsWorkspace ? nil : 0)
+            .opacity(showsWorkspace ? 1 : 0)
+            .allowsHitTesting(showsWorkspace)
+            .accessibilityHidden(!showsWorkspace)
         }
         .background(Color(red: 0.075, green: 0.083, blue: 0.095))
         .frame(minWidth: 960, minHeight: 620)
@@ -509,10 +539,11 @@ private struct FleetWindow: View {
             if expanded {
                 ForEach(agentRows(workspace)) { agent in
                     let lane = FleetAgentLane(agent: agent.agent, lane: agent.lane)
-                    let focused = selected && agent.schedule == nil && activeAgentLane[workspace] == lane
+                    let focused = (selected || (section == "Activity" && activityAgentOpen && current == workspace))
+                        && agent.schedule == nil && activeAgentLane[workspace] == lane
                     Button {
                         if agent.schedule != nil { section = "Schedules" }
-                        else { openWorkspace(workspace, lane: lane) }
+                        else { openWorkspace(workspace, lane: lane, inActivity: section == "Activity") }
                     } label: {
                         HStack(spacing: 4) {
                             Circle().fill(agent.statusColor).frame(width: 5, height: 5)
@@ -528,7 +559,7 @@ private struct FleetWindow: View {
                     .buttonStyle(.plain)
                     .padding(.leading, 19)
                     .accessibilityLabel("\(agent.label), \(agent.statusLabel == "—" ? "status unavailable" : agent.statusLabel)")
-                    .help(agent.title ?? agent.label)
+                    .help(agent.label)
                 }
             }
         }
@@ -539,18 +570,19 @@ private struct FleetWindow: View {
     }
 
     private func agentRows(_ workspace: FleetHost) -> [SidebarAgent] {
-        let remote = sidebarAgents[workspace]
-        let local = localAgentLanes[workspace] ?? []
-        let manual = ["codex", "cursor"].flatMap { name -> [SidebarAgent] in
-            let known = (remote ?? []).filter { $0.schedule == nil && $0.agent == name && (1...4).contains($0.lane) }
-            let lanes = Set(known.map(\.lane) + local.filter { $0.agent == name }.map(\.lane))
-            return (lanes.isEmpty ? [1] : lanes.sorted()).map { lane in
-                known.first { $0.lane == lane } ?? SidebarAgent(agent: name, lane: lane,
-                                                               status: remote == nil ? "unknown" : "ready",
-                                                               title: nil, schedule: nil)
-            }
+        let remote = sidebarAgents[workspace] ?? []
+        let known = remote.filter { $0.schedule == nil && ["codex", "cursor"].contains($0.agent) && $0.lane > 0 }
+        guard current == workspace, let local = localAgentLabels[workspace] else {
+            return known + remote.filter { $0.schedule != nil }
         }
-        return manual + (remote ?? []).filter { $0.schedule != nil }
+        let knownByLane = Dictionary(uniqueKeysWithValues: known.map {
+            (FleetAgentLane(agent: $0.agent, lane: $0.lane), $0)
+        })
+        let manual = local.keys.sorted { ($0.agent, $0.lane) < ($1.agent, $1.lane) }.map { lane in
+            SidebarAgent(agent: lane.agent, lane: lane.lane, status: knownByLane[lane]?.status ?? "ready",
+                         title: knownByLane[lane]?.title, schedule: nil, name: local[lane])
+        }
+        return manual + remote.filter { $0.schedule != nil }
     }
 
     private func monitorSidebar(_ query: SidebarQuery) async {
@@ -568,6 +600,7 @@ private struct FleetWindow: View {
         guard let target = workspaces.first else { return }
         let repos = Set(workspaces.map(\.repo)).sorted()
         while !Task.isCancelled {
+            let requestedLabels = localAgentLabels
             let rows: [String: [SidebarAgent]]
             do {
                 let reply = try await FleetBridge.call(target, ["op": "sidebar_agents", "repos": repos])
@@ -578,7 +611,9 @@ private struct FleetWindow: View {
             }
             guard !Task.isCancelled, query == sidebarQuery else { return }
             var updated = sidebarAgents
-            for workspace in workspaces { updated[workspace] = rows[workspace.repo] }
+            for workspace in workspaces where requestedLabels[workspace] == localAgentLabels[workspace] {
+                updated[workspace] = rows[workspace.repo]
+            }
             if sidebarAgents != updated { sidebarAgents = updated }
             let running = rows.values.contains { $0.contains { $0.status == "running" } }
             do { try await Task.sleep(for: .seconds(running ? 3 : 8)) } catch { return }
@@ -599,11 +634,7 @@ private struct FleetWindow: View {
         }.buttonStyle(.plain)
     }
 
-    private func openWorkspace(_ host: FleetHost) {
-        openWorkspace(host, lane: nil)
-    }
-
-    private func openWorkspace(_ host: FleetHost, lane: FleetAgentLane?) {
+    private func openWorkspace(_ host: FleetHost, lane: FleetAgentLane? = nil, inActivity: Bool = false) {
         if current != host && dirty && !mayDiscardEdits() { return }
         if let lane {
             laneSelection = FleetAgentLaneSelection(agent: lane.agent, lane: lane.lane)
@@ -612,7 +643,8 @@ private struct FleetWindow: View {
         }
         openedRepo = host.repo
         selectedHost = host.id
-        section = "Workspace"
+        activityAgentOpen = inActivity
+        section = inActivity ? "Activity" : "Workspace"
     }
 
     private func loadHosts() async {

@@ -5,12 +5,23 @@ private let divider = Color.white.opacity(0.09)
 private let teal = Color(red: 0.43, green: 0.82, blue: 0.75)
 private let amber = Color(red: 0.91, green: 0.71, blue: 0.44)
 
+struct FleetActivityAgent: Identifiable {
+    let host: FleetHost
+    let lane: FleetAgentLane
+    let label: String
+    let status: String
+    let statusLabel: String
+
+    var id: String { "\(host.id)/\(lane.agent)/\(lane.lane)" }
+}
+
 private struct FleetRunRow: Identifiable {
     let host: FleetHost
     let key: String
     let title: String
     let repository: String
     let agent: String
+    let lane: Int?
     let view: String
     let status: String
     let started: Date
@@ -28,6 +39,7 @@ private struct FleetRunRow: Identifiable {
         title = value["title"] as? String ?? "Agent run"
         repository = value["repo"] as? String ?? host.repo
         agent = value["agent"] as? String ?? ""
+        lane = value["detached"] as? Int == 1 ? value["lane"] as? Int : nil
         view = value["view"] as? String ?? "actions"
         status = value["status"] as? String ?? "unknown"
         started = Date(timeIntervalSince1970: (value["started"] as? NSNumber)?.doubleValue ?? 0)
@@ -102,7 +114,12 @@ private struct ScheduleDraft: Identifiable {
 struct FleetOverview: View {
     let hosts: [FleetHost]
     let section: String
+    let agents: [FleetActivityAgent]
+    let activeAgentID: String?
+    let showsAgent: Bool
     let onOpen: (FleetHost) -> Void
+    let onSelectAgent: (FleetActivityAgent) -> Void
+    let onShowRuns: () -> Void
 
     @Environment(\.scenePhase) private var scenePhase
     @State private var snapshots: [String: FleetSnapshot] = [:]
@@ -140,11 +157,13 @@ struct FleetOverview: View {
         VStack(alignment: .leading, spacing: 17) {
             header
             if !hosts.isEmpty {
-                metrics
+                if !showsAgent { metrics }
                 connectionNotice
             }
             GeometryReader { geometry in
-                if geometry.size.width >= 735 {
+                if showsAgent {
+                    list
+                } else if geometry.size.width >= 735 {
                     HStack(spacing: 12) {
                         list.frame(minWidth: 370, maxWidth: .infinity)
                         detail.frame(width: min(380, geometry.size.width * 0.43))
@@ -223,6 +242,11 @@ struct FleetOverview: View {
             .help("Refresh hosts")
             .accessibilityLabel("Refresh hosts")
             .disabled(refreshing || hosts.isEmpty)
+            if showsAgent {
+                Button(action: onShowRuns) { Image(systemName: "sidebar.trailing") }
+                    .help("Show run details")
+                    .accessibilityLabel("Show run details")
+            }
             if schedulesOnly {
                 Button {
                     if let host = endpoints.first { draft = ScheduleDraft(host: host) }
@@ -289,23 +313,16 @@ struct FleetOverview: View {
 
     private var list: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(schedulesOnly ? "All Schedules" : risksOnly ? "Reported Risks" : "Recent Runs")
-                    .font(.system(size: 12, weight: .semibold))
-                Spacer()
-                Text((schedulesOnly ? schedules.count : runs.count), format: .number)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
+            if agents.isEmpty {
+                listHeading(schedulesOnly ? "All Schedules" : risksOnly ? "Reported Risks" : "Recent Runs",
+                            count: schedulesOnly ? schedules.count : runs.count)
             }
-            .padding(.horizontal, 13)
-            .padding(.vertical, 10)
-            Rectangle().fill(divider).frame(height: 1)
             if hosts.isEmpty {
                 empty("No hosts configured", "Add a host to view Fleet activity.", icon: "server.rack")
             } else if schedulesOnly, schedules.isEmpty {
                 empty(refreshing ? "Loading schedules…" : "No schedules yet",
                       refreshing ? "" : "Create a schedule to run a task at an interval.", icon: "calendar")
-            } else if !schedulesOnly, runs.isEmpty {
+            } else if !schedulesOnly, runs.isEmpty, agents.isEmpty {
                 empty(refreshing ? "Loading runs…" : risksOnly ? "No reported risks" : "No activity yet",
                       refreshing ? "" : risksOnly ? "Risks appear when a run flags a problem." : "Run an agent task to see it here.",
                       icon: risksOnly ? "checkmark.shield" : "waveform.path")
@@ -324,6 +341,15 @@ struct FleetOverview: View {
                                 ) { scheduleSelection = row.id }
                             }
                         } else {
+                            if !agents.isEmpty {
+                                listHeading("Agents", count: agents.count)
+                                ForEach(agents) { agent in
+                                    rowButton(agent.label, metadata: agent.host.label, note: "", status: agent.statusLabel,
+                                              color: statusColor(agent.status), active: activeAgentID == agent.id) { onSelectAgent(agent) }
+                                        .help(agent.host.repo)
+                                }
+                                listHeading("Recent Runs", count: runs.count)
+                            }
                             ForEach(runs) { row in
                                 rowButton(
                                     row.title,
@@ -336,6 +362,7 @@ struct FleetOverview: View {
                                 ) {
                                     runSelection = row.id
                                     showEvents = false
+                                    if showsAgent { onShowRuns() }
                                 }
                             }
                         }
@@ -345,6 +372,19 @@ struct FleetOverview: View {
             }
         }
         .fleetPanel()
+    }
+
+    private func listHeading(_ title: String, count: Int) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(title).font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text(count, format: .number).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 10)
+            Rectangle().fill(divider).frame(height: 1)
+        }
     }
 
     private func rowButton(_ title: String, metadata: String, note: String, markdownNote: Bool = false, status: String, color: Color,
@@ -433,11 +473,15 @@ struct FleetOverview: View {
             Rectangle().fill(divider).frame(height: 1)
             HStack {
                 Spacer()
-                Button { onOpen(hostForRepository(row.host, repo: row.repository)) } label: {
-                    Label("Open Workbench", systemImage: "terminal")
+                let host = hostForRepository(row.host, repo: row.repository)
+                if let agent = agents.first(where: { $0.host == host && $0.lane.agent == row.agent && $0.lane.lane == row.lane }) {
+                    Button { onSelectAgent(agent) } label: { Label("Open Agent", systemImage: "bubble.left") }
+                        .help("Open \(agent.label)’s current conversation")
+                } else {
+                    Button { onOpen(host) } label: { Label("Open Workspace", systemImage: "folder") }
                 }
-                .controlSize(.small)
             }
+            .controlSize(.small)
             .padding(9)
         }
     }

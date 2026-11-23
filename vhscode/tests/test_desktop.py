@@ -378,7 +378,9 @@ class DesktopBridgeTest(unittest.TestCase):
     def test_desktop_submits_and_resumes_both_cli_adapters(self):
         for agent, marker in (("codex", "git status"), ("cursor", "Architecture Guide.md")):
             with self.subTest(agent=agent):
-                first, events = self.finished_run(agent, prompt="logout")
+                yolo = agent == "codex"
+                prefix = "YOLO " if yolo else ""
+                first, events = self.finished_run(agent, prompt=prefix + "logout", yolo=yolo)
                 session = agent + "-fixture"
                 self.assertEqual((first["agent"], first["repo"], first["session"]), (agent, str(self.repo), session))
                 self.assertEqual(first["outcome"], f"{session} initial completed.")
@@ -386,12 +388,14 @@ class DesktopBridgeTest(unittest.TestCase):
                 self.assertEqual(self.success(self.request("workspace_settings"))[agent]["session"], session)
 
                 self.success(self.request("set_model", agent=agent, model=f"fixture-{agent}"))
-                follow_up, _ = self.finished_run(
-                    agent, prompt="Follow up", tags=[self.guide.relative_to(self.repo).as_posix()]
-                )
+                tags = [self.guide.relative_to(self.repo).as_posix()]
+                follow_up, _ = self.finished_run(agent, prompt=prefix + "Follow up", tags=tags, yolo=yolo)
                 self.assertNotEqual(first["id"], follow_up["id"])
                 self.assertEqual(follow_up["session"], session)
                 self.assertEqual(follow_up["outcome"], f"{session} follow-up completed.")
+                if yolo:
+                    ordinary, _ = self.finished_run(agent, prompt="Follow up", tags=tags)
+                    self.assertEqual(ordinary["session"], session)
 
     def test_markdown_survives_both_adapter_transcripts_without_duplicate_deltas(self):
         for agent in ("codex", "cursor"):
@@ -422,6 +426,43 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertEqual(settings, {"codex": {"model": "fixture-codex", "session": None}, "cursor": empty})
         self.success(self.request("set_model", agent="codex", model=None))
         self.assertEqual(self.success(self.request("workspace_settings"))["codex"], empty)
+
+    def test_workspace_agents_start_empty_and_stay_deleted(self):
+        def agents():
+            return self.success(self.request("workspace_agents"))["instances"]
+
+        def sidebar():
+            reply = self.success(self.request("sidebar_agents", repos=[self.host["repo"]]))
+            return reply["workspaces"][self.host["repo"]]
+
+        self.success(self.request("set_model", agent="cursor", model="fixture-cursor"))
+        self.assertEqual(agents(), [])
+        self.assertEqual(sidebar(), [])
+        for agent in ("codex", "cursor"):
+            self.assertEqual(self.success(self.request("add_agent", agent=agent))["lane"], 1)
+        self.assertEqual([row["status"] for row in sidebar()], ["ready", "ready"])
+        self.assertEqual(agents(), [
+            {"agent": agent, "lane": 1, "name": None, "session": None, "run": None} for agent in ("codex", "cursor")
+        ])
+
+        run, _ = self.finished_run("codex", prompt="logout")
+        self.success(self.request("delete_agent", agent="codex", lane=1))
+        self.assertEqual([row["agent"] for row in agents()], ["cursor"])
+        self.assertEqual([row["agent"] for row in sidebar()], ["cursor"])
+        self.assertIn("agent was deleted", self.request("submit", agent="codex", prompt="stale")["error"])
+        self.assertEqual(self.success(self.request("detail", id=run["id"]))["run"]["session"], run["session"])
+
+        self.assertEqual(self.success(self.request("add_agent", agent="codex"))["lane"], 1)
+        self.assertEqual(agents()[0], {"agent": "codex", "lane": 1, "name": None, "session": None, "run": None})
+        self.assertEqual(sidebar()[0]["status"], "ready")
+        self.assertEqual(self.success(self.request("resume_session", agent="codex", session=run["session"])),
+                         {"session": run["session"]})
+        for agent in ("codex", "cursor"):
+            self.success(self.request("delete_agent", agent=agent, lane=1))
+        self.assertEqual(agents(), [])
+        self.assertEqual(sidebar(), [])
+        models = self.success(self.request("workspace_settings"))
+        self.assertEqual(models["cursor"]["model"], "fixture-cursor")
 
     def test_user_bin_cli_and_child_interpreter_work_without_inherited_path_entries(self):
         home = Path(self.environment["HOME"])
@@ -512,17 +553,6 @@ class DesktopBridgeTest(unittest.TestCase):
                 return
             time.sleep(0.1)
         self.fail("Codex did not resume after the approval decision")
-
-    def test_codex_yolo_applies_only_to_requested_turns(self):
-        first, _ = self.finished_run("codex", prompt="YOLO logout", yolo=True)
-        self.assertEqual(first["outcome"], "codex-fixture initial completed.")
-        self.success(self.request("set_model", agent="codex", model="fixture-codex"))
-        tags = [self.guide.relative_to(self.repo).as_posix()]
-        resumed, _ = self.finished_run("codex", prompt="YOLO Follow up", tags=tags, yolo=True)
-        self.assertEqual(resumed["session"], first["session"])
-        self.assertEqual(resumed["outcome"], "codex-fixture follow-up completed.")
-        ordinary, _ = self.finished_run("codex", prompt="Follow up", tags=tags)
-        self.assertEqual(ordinary["session"], first["session"])
 
     def test_approval_cards_restore_workspace_sandbox_after_yolo(self):
         full_access, _ = self.finished_run("codex", prompt="YOLO logout", yolo=True)
