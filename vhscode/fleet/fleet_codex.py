@@ -1,4 +1,4 @@
-"""Run a desktop Codex turn over app-server and relay its approval requests."""
+"""Run a desktop Codex turn over app-server and relay approvals and follow-ups."""
 
 import json
 import os
@@ -6,12 +6,14 @@ from selectors import DefaultSelector, EVENT_WRITE
 import subprocess
 from time import monotonic
 
-from fleet_harness import _stop
-from fleet_jobs import approval_decisions, expire_approval, request_approval
+from fleet_harness import _stop, prompt_with_tags
+from fleet_jobs import approval_decisions, claim_steer, expire_approval, request_approval, settle_steer
 
 
 def run_approval_turn(root, argv, environment, prompt, session, stream, model, run_id):
     thread_id = turn_id = status = None
+    steering = None
+    next_steer_poll = 0
     waiting = {}
     process = subprocess.Popen(
         [*argv, "app-server", "--listen", "stdio://"], cwd=root, env=environment,
@@ -39,6 +41,7 @@ def run_approval_turn(root, argv, environment, prompt, session, stream, model, r
         send({"id": identifier, "result": result})
 
     def poll():
+        nonlocal steering, next_steer_poll
         if status is not None:
             return True
         if waiting:
@@ -46,10 +49,22 @@ def run_approval_turn(root, argv, environment, prompt, session, stream, model, r
                 if decision in ("accept", "decline") and identifier in waiting:
                     request_id, response_key = waiting.pop(identifier)
                     reply(request_id, response_key, decision)
+        if turn_id and steering is None and monotonic() >= next_steer_poll:
+            next_steer_poll = monotonic() + 0.25
+            if (row := claim_steer(run_id)) is not None:
+                steering = row["id"]
+                try:
+                    send({"id": f"steer-{steering}", "method": "turn/steer", "params": {
+                        "threadId": thread_id, "expectedTurnId": turn_id,
+                        "input": [{"type": "text", "text": prompt_with_tags(row["prompt"], json.loads(row["tags"]))}],
+                    }})
+                except BrokenPipeError:
+                    settle_steer(run_id, steering, False)
+                    steering = None
         return False
 
     def on_line(line, *, error=False):
-        nonlocal thread_id, turn_id, status
+        nonlocal thread_id, turn_id, status, steering
         if error:
             stream.on_line(line, error=True)
             return
@@ -75,6 +90,11 @@ def run_approval_turn(root, argv, environment, prompt, session, stream, model, r
                 return
             card = request_approval(run_id, stream.redact(title)[:120], stream.redact(detail))
             waiting[card] = (identifier, response_key)
+            return
+        if steering is not None and identifier == f"steer-{steering}":
+            result = message.get("result")
+            settle_steer(run_id, steering, isinstance(result, dict) and result.get("turnId") == turn_id)
+            steering = None
             return
         if type(identifier) is int and identifier in (1, 2, 3):
             result = message.get("result")

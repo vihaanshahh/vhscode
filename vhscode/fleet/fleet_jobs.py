@@ -19,6 +19,7 @@ MAX_EVENTS = 80
 MAX_TEXT = 4096
 MAX_RESULT_TEXT = 64 * 1024
 MAX_SCHEDULES = 100
+MAX_STEERS = 16
 SLOTS = 2
 POLL_SECONDS = 1
 RUN_TIMEOUT = 30 * 60
@@ -29,12 +30,12 @@ MANUAL_LOCKS = {}
 RUNTIME = str(Path(__file__).resolve())
 RUNS_VIEW = """
     WITH display AS (
-        SELECT id, agent, repo, status, started, ended, view, action, risk, title, session, detached, lane, generation,
+        SELECT id, agent, repo, status, started, ended, view, action, risk, title, session, detached, lane, generation, steerable,
                CASE WHEN status IN ('failed', 'cancelled')
                     THEN COALESCE(diagnostic, outcome) ELSE outcome END AS outcome
         FROM runs
     )
-    SELECT id, agent, repo, status, started, ended, view, outcome, session, detached, lane, generation,
+    SELECT id, agent, repo, status, started, ended, view, outcome, session, detached, lane, generation, steerable,
            CASE WHEN ended IS NULL THEN action ELSE COALESCE(outcome, action) END AS action,
            COALESCE(risk, '') AS risk, title
     FROM display
@@ -100,6 +101,14 @@ def _database(directory):
                 decision TEXT
             );
             CREATE INDEX IF NOT EXISTS run_approvals ON approvals(run_id);
+            CREATE TABLE IF NOT EXISTS run_steers (
+                id INTEGER PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                prompt TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'queued'
+            );
+            CREATE INDEX IF NOT EXISTS run_steers_by_run ON run_steers(run_id);
             CREATE TABLE IF NOT EXISTS scheduler (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 runtime TEXT NOT NULL
@@ -114,6 +123,7 @@ def _database(directory):
                     "outcome": "TEXT", "diagnostic": "TEXT", "title": "TEXT NOT NULL DEFAULT ''",
                     "session": "TEXT", "detached": "INTEGER NOT NULL DEFAULT 0",
                     "lane": "INTEGER NOT NULL DEFAULT 1", "generation": "INTEGER NOT NULL DEFAULT 0",
+                    "steerable": "INTEGER NOT NULL DEFAULT 0",
                 }),
             ):
                 existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
@@ -195,6 +205,10 @@ def _finish(db, run_id, status, error=None, session=None):
     )
     if not result.rowcount:
         return
+    db.execute("""
+        UPDATE run_steers SET state = CASE state WHEN 'queued' THEN 'unsent' ELSE 'unconfirmed' END
+        WHERE run_id=? AND state IN ('queued', 'sending')
+    """, (run_id,))
     if error is not None:
         _record(db, run_id, "error", error)
     db.execute(
@@ -205,7 +219,8 @@ def _finish(db, run_id, status, error=None, session=None):
     )
 
 
-def begin_run(repo, agent, prompt, view="actions", *, session=None, detached=False, known_session=False, lane=1, generation=0):
+def begin_run(repo, agent, prompt, view="actions", *, session=None, detached=False, known_session=False,
+              lane=1, generation=0, steerable=False):
     if not isinstance(view, str) or view not in VIEWS:
         raise ValueError("Choose an actions, summary, or risks view")
     run_id = uuid4().hex
@@ -234,9 +249,9 @@ def begin_run(repo, agent, prompt, view="actions", *, session=None, detached=Fal
                 if not known_session and not any(row["status"] == "completed" for row in previous):
                     raise ValueError("Choose a completed session from this agent and repository")
             db.execute(
-                """INSERT INTO runs(id, agent, repo, prompt, status, started, view, title, session, detached, lane, generation)
-                   VALUES (?, ?, ?, '', 'running', ?, ?, ?, ?, ?, ?, ?)""",
-                (run_id, agent, str(repo), time.time(), view, _title(prompt), session, detached, lane, generation),
+                """INSERT INTO runs(id, agent, repo, prompt, status, started, view, title, session, detached, lane, generation, steerable)
+                   VALUES (?, ?, ?, '', 'running', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, agent, str(repo), time.time(), view, _title(prompt), session, detached, lane, generation, steerable),
             )
             _record(db, run_id, "prompt", prompt)
     except BaseException:
@@ -276,6 +291,38 @@ def expire_approval(run_id, identifier):
     with _connect() as db:
         db.execute("UPDATE approvals SET decision='expired' WHERE run_id=? AND id=? AND decision IS NULL",
                    (run_id, identifier))
+
+
+def queue_steer(repo, run_id, prompt, tags):
+    _reap_manual()
+    with _connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        if not db.execute("""
+            SELECT 1 FROM runs WHERE id=? AND repo=? AND steerable=1 AND status='running' AND cancel_requested=0
+        """, (run_id, str(repo))).fetchone():
+            raise ValueError("This run is no longer accepting mid-turn messages.")
+        if db.execute("SELECT count(*) FROM run_steers WHERE run_id=?", (run_id,)).fetchone()[0] >= MAX_STEERS:
+            raise ValueError("This run reached its mid-turn message limit.")
+        row = db.execute("INSERT INTO run_steers(run_id, prompt, tags) VALUES (?, ?, ?)", (run_id, prompt, tags))
+        return {"id": row.lastrowid}
+
+
+def claim_steer(run_id):
+    with _connect() as db:
+        row = db.execute("""
+            SELECT id, prompt, tags FROM run_steers WHERE run_id=? AND state='queued' ORDER BY id LIMIT 1
+        """, (run_id,)).fetchone()
+        if row is not None and db.execute("""
+            UPDATE run_steers SET state='sending' WHERE id=? AND state='queued'
+            AND EXISTS (SELECT 1 FROM runs WHERE id=? AND status='running' AND cancel_requested=0)
+        """, (row["id"], run_id)).rowcount:
+            return row
+
+
+def settle_steer(run_id, identifier, accepted):
+    with _connect() as db:
+        db.execute("UPDATE run_steers SET state=? WHERE run_id=? AND id=? AND state='sending'",
+                   ("sent" if accepted else "unsent", run_id, identifier))
 
 
 def end_run(run_id, status, *, error=None, session=None):
@@ -332,7 +379,7 @@ def rpc(request):
         from fleet_models import workspace
         from fleet_hosts import workspace_root
         return workspace(workspace_root(request["repo"]), request)
-    if op in {"files", "read_file", "save_file", "find_files", "submit", "git_status", "git_diff", "git_fetch"}:
+    if op in {"files", "read_file", "save_file", "find_files", "submit", "steer", "git_status", "git_diff", "git_fetch"}:
         from fleet_desktop import workspace
 
         return workspace(request)
@@ -358,10 +405,14 @@ def rpc(request):
             approvals = db.execute(
                 "SELECT id, title, detail, decision FROM approvals WHERE run_id=? ORDER BY rowid", (run_id,)
             ).fetchall()
+            steers = db.execute(
+                "SELECT id, prompt, state FROM run_steers WHERE run_id=? ORDER BY id", (run_id,)
+            ).fetchall()
             revision = None
             if "revision" in request and run is not None:
                 sequence = db.execute("SELECT MAX(seq) FROM events WHERE run_id=?", (run_id,)).fetchone()[0]
                 revision = f"{run['status']}:{sequence}:{len(approvals)}:{sum(row['decision'] is not None for row in approvals)}"
+                revision += ":" + ",".join(row["state"] for row in steers)
                 if revision == request["revision"]:
                     return {"unchanged": True}
             rows = db.execute(
@@ -371,6 +422,8 @@ def rpc(request):
         reply = {"events": [dict(row) for row in rows], "run": metadata}
         if approvals:
             reply["approvals"] = [dict(row) for row in approvals]
+        if steers:
+            reply["steers"] = [dict(row) for row in steers]
         if revision is not None:
             reply["revision"] = revision
         return reply

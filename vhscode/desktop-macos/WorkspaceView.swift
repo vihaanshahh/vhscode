@@ -86,16 +86,34 @@ private struct AgentApproval: Identifiable {
     let decision: String?
 }
 
+private struct MidTurnMessage: Identifiable {
+    let id: Int
+    let prompt: String
+    let state: String
+
+    var status: String {
+        switch state {
+        case "queued": "Queued"
+        case "sending": "Sending"
+        case "sent": "Sent to Codex"
+        case "unsent": "Not sent"
+        default: "Delivery unconfirmed"
+        }
+    }
+}
+
 private struct WorkspaceTurn: Identifiable {
     let id: String
     var prompt: String
     let reporting: String
+    var steerable = false
     var status = "queued"
     var action = ""
     var risk = ""
     var outcome = ""
     var events: [AgentEvent] = []
     var approvals: [AgentApproval] = []
+    var steers: [MidTurnMessage] = []
     var isActive: Bool { ["queued", "running"].contains(status) }
     var requiresCursorTrust: Bool {
         events.contains { ["error", "risk"].contains($0.kind) && $0.text.localizedCaseInsensitiveContains("Workspace Trust Required") }
@@ -233,9 +251,10 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     private func canSend(from agent: WorkspaceAgent) -> Bool {
-        canReset(agent) && !savingModels.contains(agent.harness)
+        guard !submitting.contains(agent), drafts[agent]?.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else { return false }
+        if steeringRun(agent) != nil { return true }
+        return canReset(agent) && !savingModels.contains(agent.harness)
             && (agent.harness != "cursor" || !savingCursorTrust)
-            && drafts[agent]?.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
     func input(for agent: WorkspaceAgent) -> String { drafts[agent]?.text ?? "" }
@@ -259,6 +278,11 @@ private final class WorkspaceModel: ObservableObject {
 
     func activeRun(_ agent: WorkspaceAgent) -> String? {
         guard let last = conversations[agent]?.last, last.isActive else { return nil }
+        return last.id
+    }
+
+    func steeringRun(_ agent: WorkspaceAgent) -> String? {
+        guard let last = conversations[agent]?.last, last.isActive, last.steerable, !stopping.contains(last.id) else { return nil }
         return last.id
     }
 
@@ -539,7 +563,8 @@ private final class WorkspaceModel: ObservableObject {
                 agentNames[agent] = instance["name"] as? String
                 sessions[agent] = instance["session"] as? String
                 guard let run = instance["run"] as? [String: Any], let id = run["id"] as? String else { continue }
-                var turn = WorkspaceTurn(id: id, prompt: run["title"] as? String ?? "", reporting: run["view"] as? String ?? "actions")
+                var turn = WorkspaceTurn(id: id, prompt: run["title"] as? String ?? "", reporting: run["view"] as? String ?? "actions",
+                                         steerable: run["steerable"] as? Bool == true)
                 turn.status = run["status"] as? String ?? "queued"
                 turn.action = run["action"] as? String ?? ""
                 turn.risk = run["risk"] as? String ?? ""
@@ -704,27 +729,33 @@ private final class WorkspaceModel: ObservableObject {
         composerErrors[agent] = nil
     }
 
-    func submit(from agent: WorkspaceAgent, approvalCards: Bool) async {
-        guard canSend(from: agent), let draft = drafts[agent] else { return }
+    func submit(from agent: WorkspaceAgent, approvalCards: Bool, steer: String?) async {
+        guard canSend(from: agent), steer != nil || canReset(agent), let draft = drafts[agent] else { return }
         let prompt = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard ComposerCommand.parse(prompt) == nil else { return }
-        let yolo = agent.harness == "codex" && draft.yolo
-        let request: [String: Any] = [
-            "op": "submit", "agent": agent.harness, "lane": agent.lane, "prompt": prompt,
-            "tags": draft.tags.sorted(), "view": draft.reporting, "filter": draft.filterProgress,
-            "approval_cards": agent.harness == "codex" && approvalCards && !yolo, "yolo": yolo,
-        ]
         submitting.insert(agent)
         composerErrors[agent] = nil
         streamErrors[agent] = nil
         defer { submitting.remove(agent) }
         do {
-            let reply = try await FleetBridge.call(host, request)
+            if let steer {
+                _ = try await FleetBridge.call(host, ["op": "steer", "id": steer, "prompt": prompt, "tags": draft.tags.sorted()])
+                if drafts[agent]?.text == draft.text { drafts[agent]?.text = "" }
+                return
+            }
+            let yolo = agent.harness == "codex" && draft.yolo
+            let showsApprovals = agent.harness == "codex" && approvalCards && !yolo
+            let reply = try await FleetBridge.call(host, [
+                "op": "submit", "agent": agent.harness, "lane": agent.lane, "prompt": prompt,
+                "tags": draft.tags.sorted(), "view": draft.reporting, "filter": draft.filterProgress,
+                "approval_cards": showsApprovals, "yolo": yolo,
+            ])
             guard let id = reply["id"] as? String else {
                 throw WorkspaceFailure("The workspace did not return the new run.")
             }
             if let previousID = conversations[agent]?.last?.id { pendingDetails.remove(previousID) }
-            conversations[agent, default: []].append(WorkspaceTurn(id: id, prompt: prompt, reporting: draft.reporting))
+            conversations[agent, default: []].append(WorkspaceTurn(id: id, prompt: prompt, reporting: draft.reporting,
+                                                                    steerable: showsApprovals))
             let count = conversations[agent]?.count ?? 0
             if count > 24 { conversations[agent]?.removeFirst(count - 24) }
             if drafts[agent]?.text == draft.text { drafts[agent]?.text = "" }
@@ -784,6 +815,12 @@ private final class WorkspaceModel: ObservableObject {
                     turn.action = run["action"] as? String ?? ""
                     turn.risk = run["risk"] as? String ?? ""
                     turn.outcome = run["outcome"] as? String ?? ""
+                    turn.steerable = run["steerable"] as? Bool == true
+                    turn.steers = (reply["steers"] as? [[String: Any]] ?? []).compactMap { row in
+                        guard let id = row["id"] as? Int, let prompt = row["prompt"] as? String,
+                              let state = row["state"] as? String else { return nil }
+                        return MidTurnMessage(id: id, prompt: prompt, state: state)
+                    }
                     turn.approvals = (reply["approvals"] as? [[String: Any]] ?? []).compactMap { row in
                         guard let id = row["id"] as? String, let title = row["title"] as? String,
                               let detail = row["detail"] as? String else { return nil }
@@ -1291,7 +1328,7 @@ private struct WorkspacePane: View {
                     .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary))
                     .overlay(alignment: .topLeading) {
                         if model.input(for: agent).isEmpty {
-                            Text("Type a prompt or / for commands")
+                            Text(model.steeringRun(agent) == nil ? "Type a prompt or / for commands" : "Send a follow-up to the active turn")
                                 .foregroundStyle(.tertiary)
                                 .padding(.leading, 11).padding(.top, 6)
                                 .allowsHitTesting(false).accessibilityHidden(true)
@@ -1332,6 +1369,7 @@ private struct WorkspacePane: View {
 
     private func composerControls(_ agent: WorkspaceAgent) -> some View {
         let isCommand = ComposerCommand.parse(model.input(for: agent)) != nil
+        let action = isCommand ? "Run command" : model.steeringRun(agent) != nil ? "Send to active turn" : "Send prompt"
         return HStack(alignment: .bottom, spacing: 7) {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 6) {
@@ -1359,8 +1397,8 @@ private struct WorkspacePane: View {
             .fixedSize()
             .disabled(!model.canSend && !isCommand)
             .keyboardShortcut(.return, modifiers: .command)
-            .help(isCommand ? "Run command (⌘↩)" : "Send prompt (⌘↩)")
-            .accessibilityLabel(isCommand ? "Run command" : "Send prompt")
+            .help("\(action) (⌘↩)")
+            .accessibilityLabel(action)
         }
     }
 
@@ -1396,7 +1434,8 @@ private struct WorkspacePane: View {
         showingCommands = nil
         showingStatus = nil
         guard let invocation = ComposerCommand.parse(input) else {
-            Task { await model.submit(from: agent, approvalCards: codexApprovalCards) }
+            let steer = model.steeringRun(agent)
+            Task { await model.submit(from: agent, approvalCards: codexApprovalCards, steer: steer) }
             return
         }
         if invocation.command != .resume, !invocation.argument.isEmpty {
@@ -2299,6 +2338,15 @@ private struct TurnCard: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(8)
                 .background(FleetPalette.accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
+            ForEach(turn.steers) { message in
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(message.status).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(message.prompt).font(.callout).textSelection(.enabled)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(FleetPalette.accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 7))
+            }
             HStack(spacing: 6) {
                 if turn.isActive { ProgressView().controlSize(.small) }
                 Text(turn.status.capitalized).font(.caption.weight(.semibold))

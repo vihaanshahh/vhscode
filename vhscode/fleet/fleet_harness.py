@@ -56,6 +56,13 @@ class HarnessError(RuntimeError):
     """A silent run could not complete successfully."""
 
 
+def prompt_with_tags(prompt, tags):
+    if not tags:
+        return prompt
+    paths = "\n".join(f"- {json.dumps(path, ensure_ascii=True)}" for path in sorted(set(tags)))
+    return f"{prompt}\n\nRepository-relative context paths:\n{paths}"
+
+
 def run(
     root: Path, agent: str, prompt: str, tags: set[str], session: str | None, quiet: bool,
     *, on_event: Callable[[str, str], None] | None = None, detailed: bool = False, silent: bool = False,
@@ -69,9 +76,7 @@ def run(
     failure = ""
     try:
         command, environment = _require_harness(root, agent)
-        if tags:
-            paths = "\n".join(f"- {json.dumps(path, ensure_ascii=True)}" for path in sorted(tags))
-            prompt = f"{prompt}\n\nRepository-relative context paths:\n{paths}"
+        prompt = prompt_with_tags(prompt, tags)
         if interactive_run is not None and agent == "codex":
             from fleet_codex import run_approval_turn
 

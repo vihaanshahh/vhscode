@@ -28,7 +28,7 @@ MAX_GIT_DIFF_BYTES = 64 * 1024
 MAX_GIT_CHANGES = 1500
 WORKSPACE_OPS = {
     "git_status", "git_diff", "git_fetch",
-    "files", "find_files", "read_file", "save_file", "submit",
+    "files", "find_files", "read_file", "save_file", "submit", "steer",
     "workspace_settings", "workspace_agents", "add_agent", "rename_agent", "delete_agent",
     "set_model", "models", "reset_session", "list_sessions", "resume_session",
     "cursor_trust_status", "set_cursor_trust",
@@ -479,6 +479,11 @@ def workspace(request):
         return {}
     if op == "submit":
         return _submit(root, request)
+    if op == "steer":
+        from fleet_jobs import queue_steer
+
+        prompt, tags = _prompt(root, request)
+        return queue_steer(root, request.get("id"), prompt, json.dumps(tags))
     parts = _parts(request.get("path"))
     if op == "read_file":
         with _directory(root, parts[:-1]) as fd:
@@ -489,18 +494,29 @@ def workspace(request):
     raise ValueError("Unknown Fleet workspace operation")
 
 
-def _submit(root, request):
-    from fleet_jobs import MANUAL_LOCKS, _reap_manual, begin_run, end_run
-
-    agent, prompt = request.get("agent"), request.get("prompt")
-    view, session = request.get("view", "actions"), request.get("session")
-    tags, quiet = request.get("tags", []), request.get("filter", False)
-    if agent not in ("codex", "cursor"):
-        raise ValueError("Choose Codex or Cursor")
+def _prompt(root, request):
+    prompt, tags = request.get("prompt"), request.get("tags", [])
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32000 or "\0" in prompt:
         raise ValueError("Enter a prompt of up to 32,000 characters")
     if not isinstance(tags, list) or len(tags) > 32:
         raise ValueError("Choose up to 32 repository context paths")
+    for tag in tags:
+        parts = _parts(tag)
+        with _directory(root, parts[:-1]) as fd:
+            mode = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False).st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                raise ValueError(f"Choose context inside the repository: {tag}")
+    return prompt, tags
+
+
+def _submit(root, request):
+    from fleet_jobs import MANUAL_LOCKS, _reap_manual, begin_run, end_run
+
+    agent = request.get("agent")
+    view, session = request.get("view", "actions"), request.get("session")
+    quiet = request.get("filter", False)
+    if agent not in ("codex", "cursor"):
+        raise ValueError("Choose Codex or Cursor")
     if session is not None and (not isinstance(session, str) or not 1 <= len(session) <= 512 or not session.isprintable()):
         raise ValueError("Choose a valid session to continue")
     approval_cards = request.get("approval_cards", False)
@@ -511,12 +527,8 @@ def _submit(root, request):
         raise ValueError("YOLO mode requires Codex with Approval Cards off")
     if type(quiet) is not bool:
         raise ValueError("Invalid classifier setting")
-    for tag in tags:
-        parts = _parts(tag)
-        with _directory(root, parts[:-1]) as fd:
-            mode = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False).st_mode
-            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-                raise ValueError(f"Choose context inside the repository: {tag}")
+    prompt, tags = _prompt(root, request)
+    approval_cards = approval_cards and agent == "codex"
 
     from fleet_models import agent_lane, get
     lane = agent_lane(request.get("lane", 1))
@@ -525,7 +537,8 @@ def _submit(root, request):
         session = settings["session"]
     _reap_manual()
     run_id = begin_run(root, agent, prompt, view, session=session, detached=True,
-                       known_session=session == settings["session"], lane=lane, generation=settings["generation"])
+                       known_session=session == settings["session"], lane=lane, generation=settings["generation"],
+                       steerable=approval_cards)
     fd = MANUAL_LOCKS[run_id]
     try:
         with tempfile.TemporaryFile() as payload:
@@ -533,7 +546,7 @@ def _submit(root, request):
                 "repo": str(root), "agent": agent, "prompt": prompt, "view": view,
                 "session": session, "tags": tags, "filter": quiet,
                 "model": settings["model"], "generation": settings["generation"], "lane": lane,
-                "approval_cards": approval_cards and agent == "codex", "yolo": yolo,
+                "approval_cards": approval_cards, "yolo": yolo,
             }).encode("ascii"))
             payload.seek(0)
             subprocess.Popen(

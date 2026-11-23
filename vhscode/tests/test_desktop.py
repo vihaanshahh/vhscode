@@ -103,6 +103,19 @@ if name == "codex" and arguments == ["app-server", "--listen", "stdio://"]:
             "id": "command-approval", "method": "item/commandExecution/requestApproval",
             "params": {**context, "command": "gh issue view 123", "cwd": str(Path.cwd())},
         }), flush=True)
+        for text in ("First steer", "Second steer", "Rejected steer"):
+            steer = json.loads(sys.stdin.readline())
+            assert steer["method"] == "turn/steer", steer
+            expected = text
+            if text == "First steer":
+                expected += "\\n\\nRepository-relative context paths:\\n- " + json.dumps("Sources and notes/Architecture Guide.md")
+            assert steer["params"] == {
+                "threadId": thread_id, "expectedTurnId": turn_id, "input": [{"type": "text", "text": expected}],
+            }, steer
+            response = {"error": {"code": -32600, "message": "Fixture rejected message"}} if text == "Rejected steer" else {
+                "result": {"turnId": turn_id},
+            }
+            print(json.dumps({"id": steer["id"], **response}), flush=True)
         assert json.loads(sys.stdin.readline()) == {
             "id": "command-approval", "result": {"decision": "accept"},
         }
@@ -513,7 +526,7 @@ class DesktopBridgeTest(unittest.TestCase):
         self.success(self.request("set_cli_command", agent="cursor", command=""))
         self.assertIn("returned status 99", self.request("test_cli_command", agent="cursor", command="")["error"])
 
-    def test_codex_approval_cards_wait_for_one_time_decisions(self):
+    def test_codex_steers_active_turn_and_waits_for_approval_decisions(self):
         run_id = self.success(self.request(
             "submit", agent="codex", prompt="Approval fixture", approval_cards=True,
         ))["id"]
@@ -534,6 +547,25 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertIsNone(command["decision"])
         self.assertEqual(self.success(self.request("detail", id=run_id, revision=first_detail["revision"])),
                          {"unchanged": True})
+        self.assertIn("no longer accepting", self.bridge({
+            "host": {**self.host, "repo": str(self.root)},
+            "request": {"op": "steer", "id": run_id, "prompt": "Wrong workspace"},
+        })["error"])
+        tags = [self.guide.relative_to(self.repo).as_posix()]
+        messages = [
+            {"id": self.success(self.request("steer", id=run_id, prompt=prompt, tags=tags if index == 0 else []))["id"],
+             "prompt": prompt, "state": state}
+            for index, (prompt, state) in enumerate((("First steer", "sent"), ("Second steer", "sent"), ("Rejected steer", "unsent")))
+        ]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            detail, pending = wait_for_approval(1)
+            if detail.get("steers") == messages:
+                break
+            time.sleep(0.1)
+        self.assertEqual(detail.get("steers"), messages)
+        self.assertIsNone(pending["decision"])
+        self.assertNotEqual(detail["revision"], first_detail["revision"])
         self.success(self.request("decide_approval", id=run_id, approval=command["id"], decision="accept"))
         self.assertIn("no longer pending", self.request(
             "decide_approval", id=run_id, approval=command["id"], decision="decline",
@@ -550,6 +582,7 @@ class DesktopBridgeTest(unittest.TestCase):
                 self.assertEqual(detail["run"]["status"], "completed", detail)
                 self.assertEqual(detail["run"]["outcome"], "Approval choices delivered.")
                 self.assertEqual(detail["approvals"][1]["decision"], "decline")
+                self.assertIn("no longer accepting", self.request("steer", id=run_id, prompt="Too late")["error"])
                 return
             time.sleep(0.1)
         self.fail("Codex did not resume after the approval decision")
