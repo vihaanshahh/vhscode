@@ -14,9 +14,9 @@ New workspaces open with no agents, and you can edit files immediately. Use **Ne
 
 Each agent keeps its own prompt, file attachments, and native CLI session. You can add more agents and run them in parallel. Click an agent in the sidebar to view its progress or stop its run.
 
-In **Activity**, select an agent to open its conversation beside the agent and run list. Send follow-up prompts, respond to approvals, or stop an active run there. Select a recent run to read its details, or choose **Open Files** to return to the workspace editor.
+**Activity** shows working agents first, with their current tasks and latest reported actions across connected workspaces. Select an agent to open its conversation alongside the dashboard. Choose **Runs** to browse run history, or **Open Files** in a conversation to return to the workspace editor.
 
-Choose **Agent options → Delete Agent…** to remove an agent from the workspace. Stop any active run first. Its finished runs are available in **Activity**, and you can resume its native session from another agent.
+Use the pencil or trash button on an agent’s card or in its conversation header to rename or delete it. You can also right-click the agent in the workspace sidebar. Stop any active run before deleting an agent. Its finished runs remain in run history, and you can resume its native session from another agent.
 
 Type `/resume` in the composer to choose an existing session for this workspace, or use **Agent options → Resume Session…**. Fleet can resume a conversation started by the standalone CLI. Use `/new` for a fresh conversation in the current agent, `/status` to inspect it, and `/help` to see composer commands.
 

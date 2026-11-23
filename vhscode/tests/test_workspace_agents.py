@@ -18,6 +18,7 @@ session = args[-2] if 'resume' in args else 'thread-' + prompt
 def emit(kind, **fields):
     print(json.dumps(dict(type=kind, **fields)), flush=True)
 emit('thread.started', thread_id=session)
+emit('item.started', item={'type': 'command_execution', 'command': 'git status'})
 for _ in range(600):
     if pathlib.Path('release').exists(): break
     time.sleep(.03)
@@ -87,7 +88,16 @@ class WorkspaceAgentsTests(unittest.TestCase):
             for lane, name in enumerate(("Build", "Docs", "Vérification"), start=3):
                 self.assertEqual(call("add_agent", agent="codex", name=f" {name} "), {"lane": lane, "name": name})
                 extra_runs.append(call("submit", agent="codex", lane=lane, prompt=name)["id"])
-            listings = call("sidebar_agents", repos=[host["repo"]])["workspaces"][host["repo"]]
+            for _ in range(50):
+                dashboard = call("sidebar_agents", repos=[host["repo"]], live=True)
+                listings = dashboard["workspaces"][host["repo"]]
+                if listings[0]["action"] == "Run git status":
+                    break
+                time.sleep(.04)
+            self.assertEqual(listings[0]["action"], "Run git status")
+            self.assertEqual(dashboard["live_runs"], [])
+            self.assertEqual({row["id"] for row in call("sidebar_agents", repos=[], live=True)["live_runs"]},
+                             {first, second, *extra_runs})
             self.assertEqual([(row["lane"], row["name"], row["status"]) for row in listings], [
                 (1, "Implementation", "running"), (2, "Review API", "running"), (3, "Build", "running"),
                 (4, "Docs", "running"), (5, "Vérification", "running"),

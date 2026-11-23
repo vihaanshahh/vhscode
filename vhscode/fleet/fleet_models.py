@@ -197,9 +197,9 @@ def _instances(roots, runs, settings):
     return instances
 
 
-def sidebar_agents(repos):
+def sidebar_agents(repos, live=False):
     from fleet_hosts import workspace_root
-    from fleet_jobs import _connect, _reap_manual, _title
+    from fleet_jobs import _connect, _ensure_daemon, _reap_manual, _title
 
     if not isinstance(repos, list) or len(repos) > 256 or not all(isinstance(path, str) for path in repos):
         raise ValueError("Choose up to 256 workspace folders.")
@@ -211,23 +211,31 @@ def sidebar_agents(repos):
         except (ValueError, OSError):
             continue
     roots = set(mapped.values())
-    if not roots:
+    if not roots and not live:
         return {"workspaces": workspaces}
+    if live:
+        _ensure_daemon()
     _reap_manual()
     placeholders = ','.join('?' for _ in roots)
     with _connect() as db, closing(_database()) as settings:
-        instances = _instances(roots, db, settings)
+        db.execute("BEGIN")
+        instances = _instances(roots, db, settings) if roots else {}
         schedules = db.execute(
             f"""SELECT s.repo,s.id AS schedule,s.agent,s.prompt,s.enabled,
                     EXISTS(SELECT 1 FROM runs WHERE schedule_id=s.id AND status='running') AS running
-                FROM schedules s WHERE repo IN ({','.join('?' for _ in roots)}) ORDER BY s.rowid""",
+                FROM schedules s WHERE repo IN ({placeholders}) ORDER BY s.rowid""",
             tuple(roots),
-        ).fetchall()
+        ).fetchall() if roots else []
+        live_runs = db.execute(
+            """SELECT id, agent, repo, title, substr(action, 1, 320) AS action, schedule_id AS schedule
+               FROM runs WHERE status='running' ORDER BY started DESC, id DESC"""
+        ).fetchall() if live else []
     for repo, root in mapped.items():
         rows = [
             {"agent": instance["agent"], "lane": instance["lane"], "name": instance["name"],
              "status": run["status"] if (run := instance["run"]) else "ready",
-             "title": run["title"] if run else ""}
+             "title": run["title"] if run else "",
+             "action": (run["action"] or "")[:320] if run and run["status"] == "running" else ""}
             for instance in instances.get(root, [])
         ]
         rows.extend({
@@ -235,6 +243,9 @@ def sidebar_agents(repos):
             "status": "running" if row["running"] else ("scheduled" if row["enabled"] else "paused"),
         } for row in schedules if row["repo"] == root)
         workspaces[repo] = rows
+    if live:
+        listed_runs = {row["run"]["id"] for rows in instances.values() for row in rows if row["run"]}
+        return {"workspaces": workspaces, "live_runs": [dict(row) for row in live_runs if row["id"] not in listed_runs]}
     return {"workspaces": workspaces}
 
 

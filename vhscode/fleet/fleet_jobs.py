@@ -369,7 +369,7 @@ def rpc(request):
         return browse_folders(request)
     if op == "sidebar_agents":
         from fleet_models import sidebar_agents
-        return sidebar_agents(request.get("repos"))
+        return sidebar_agents(request.get("repos"), live=request.get("live") is True)
     if op in {"cursor_trust_status", "set_cursor_trust"}:
         from fleet_cursor_trust import workspace_trust
         from fleet_hosts import workspace_root

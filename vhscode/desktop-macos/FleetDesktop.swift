@@ -20,6 +20,7 @@ struct FleetAgentLaneSelection: Equatable {
     let id = UUID()
     let agent: String
     let lane: Int
+    var action: FleetAgentAction? = nil
 }
 
 struct FleetAgentLane: Hashable {
@@ -288,6 +289,7 @@ private struct FleetWindow: View {
         let lane: Int
         let status: String
         let title: String?
+        let action: String?
         let schedule: String?
         let name: String?
         var id: String { schedule.map { "schedule-\($0)" } ?? "\(agent)-\(lane)" }
@@ -319,7 +321,19 @@ private struct FleetWindow: View {
 
     private struct SidebarQuery: Equatable {
         let active: Bool
+        let dashboard: Bool
+        let revision: UUID
         let hosts: [FleetHost]
+    }
+
+    private struct SidebarRoster: Decodable {
+        let workspaces: [String: [SidebarAgent]]
+        let liveRuns: [FleetLiveRun]?
+
+        enum CodingKeys: String, CodingKey {
+            case workspaces
+            case liveRuns = "live_runs"
+        }
     }
 
     @Environment(\.workbenchPalette) private var palette
@@ -330,14 +344,18 @@ private struct FleetWindow: View {
     @State private var openedRepo: String?
     @State private var section = "Workspace"
     @State private var activityAgentOpen = false
+    @State private var activityRunsOpen = false
+    @State private var activityRunID: String?
     @State private var draft: FleetHost?
     @State private var error = ""
     @State private var confirmingRemoval = false
     @State private var dirty = false
     @State private var expandedAgents: [String: Bool] = [:]
     @State private var sidebarAgents: [FleetHost: [SidebarAgent]] = [:]
+    @State private var liveRuns: [String: [FleetLiveRun]] = [:]
+    @State private var reachable: [String: Bool] = [:]
     @State private var laneSelection: FleetAgentLaneSelection?
-    @State private var localAgentLabels: [FleetHost: [FleetAgentLane: String]] = [:]
+    @State private var rosterRevision = UUID()
     @State private var activeAgentLane: [FleetHost: FleetAgentLane] = [:]
     private var current: FleetHost? {
         guard var host = hosts.first(where: { $0.id == selectedHost }) ?? hosts.first else { return nil }
@@ -345,24 +363,31 @@ private struct FleetWindow: View {
         return host
     }
     private var sidebarQuery: SidebarQuery {
-        SidebarQuery(active: scenePhase == .active, hosts: hosts.map(sidebarHost))
+        SidebarQuery(active: scenePhase == .active, dashboard: section == "Activity" && !activityRunsOpen,
+                     revision: rosterRevision, hosts: hosts.map(sidebarHost))
     }
     private var activityAgents: [FleetActivityAgent] {
         sidebarQuery.hosts.flatMap { host in
             agentRows(host).compactMap { agent in
                 guard agent.schedule == nil else { return nil }
                 return FleetActivityAgent(host: host, lane: FleetAgentLane(agent: agent.agent, lane: agent.lane),
-                                          label: agent.label, status: agent.status, statusLabel: agent.statusLabel)
+                                          label: agent.label, status: agent.status, statusLabel: agent.statusLabel,
+                                          title: agent.title, action: agent.action, reachable: reachable[host.ssh] != false)
             }
         }
     }
+    private var activityHosts: [FleetHost] {
+        var seen = Set<String>()
+        return hosts.filter { seen.insert($0.ssh).inserted }
+    }
+
     private let sections = [("Activity", "waveform.path.ecg"), ("Schedules", "calendar.badge.clock"), ("Risks", "exclamationmark.triangle")]
 
     var body: some View {
         let showsFiles = section == "Workspace"
-        let showsActivityAgent = section == "Activity" && activityAgentOpen && current != nil
+        let showsDashboard = section == "Activity" && !activityRunsOpen
+        let showsActivityAgent = showsDashboard && activityAgentOpen && current != nil
         let showsWorkspace = showsFiles || showsActivityAgent
-        let agents = section == "Activity" ? activityAgents : []
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 6) {
@@ -375,7 +400,10 @@ private struct FleetWindow: View {
                 .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
                 .padding(.bottom, 6)
                 ForEach(sections, id: \.0) { item in
-                    railButton(item.0, item.1, selected: section == item.0) { section = item.0 }
+                    railButton(item.0, item.1, selected: section == item.0) {
+                        if item.0 == "Activity" { activityRunsOpen = false }
+                        section = item.0
+                    }
                 }
                 HStack {
                     Text("WORKSPACES").font(.system(size: 10, weight: .semibold)).tracking(1.5).foregroundStyle(.secondary)
@@ -426,23 +454,18 @@ private struct FleetWindow: View {
             .frame(width: 180)
             .background(palette.navigation)
             palette.separator.frame(width: 1)
-            if !showsFiles {
-                let activeAgent = showsActivityAgent ? agents.first { $0.host == current && $0.lane == activeAgentLane[$0.host] } : nil
-                FleetOverview(hosts: hosts, section: section, agents: agents, activeAgentID: activeAgent?.id,
-                              showsAgent: showsActivityAgent, onOpen: { openWorkspace($0) }, onSelectAgent: {
-                    openWorkspace($0.host, lane: $0.lane, inActivity: true)
-                }, onShowRuns: { activityAgentOpen = false })
-                .frame(width: showsActivityAgent ? 350 : nil)
-                if showsActivityAgent { Divider() }
+            if showsDashboard {
+                dashboard(showsAgent: showsActivityAgent)
+                    .frame(width: showsActivityAgent ? 360 : nil)
+                if showsActivityAgent { palette.separator.frame(width: 1) }
+            } else if !showsFiles {
+                overview
             }
             ZStack {
                 if let host = current {
                     WorkspaceView(host: host, monitorRuns: showsWorkspace && scenePhase == .active, showsFiles: showsFiles,
                                   onOpenFiles: { openWorkspace(host) }, selectedAgentLane: laneSelection, onAgentLabelsChange: { labels in
-                        if localAgentLabels[host] != labels {
-                            localAgentLabels[host] = labels
-                            if labels != nil { sidebarAgents[host] = agentRows(host) }
-                        }
+                        if labels != nil { rosterRevision = UUID() }
                     }, onActiveAgentLaneChange: { lane in
                         if activeAgentLane[host] != lane { activeAgentLane[host] = lane }
                     }).id(host)
@@ -523,6 +546,31 @@ private struct FleetWindow: View {
         } catch { self.error = error.localizedDescription }
     }
 
+    private func dashboard(showsAgent: Bool) -> some View {
+        let agents = activityAgents
+        let activeAgent = showsAgent ? agents.first { $0.host == current && $0.lane == activeAgentLane[$0.host] } : nil
+        let endpoints = activityHosts
+        let running = endpoints.filter { reachable[$0.ssh] == true }.flatMap { host in
+            (liveRuns[host.ssh] ?? []).map { (host, $0) }
+        }
+        return ActivityDashboard(agents: agents, runs: running,
+                                 unavailable: endpoints.filter { reachable[$0.ssh] == false }.map(\.label),
+                                 loading: endpoints.contains { reachable[$0.ssh] == nil },
+                                 selectedAgentID: activeAgent?.id, onOpenAgent: { agent, action in
+            openWorkspace(agent.host, lane: agent.lane, inActivity: true, action: action)
+        }, onOpenRun: { showRuns($0) }, onShowRuns: { showRuns(nil) },
+           onCloseAgent: showsAgent ? { activityAgentOpen = false } : nil)
+    }
+
+    private var overview: some View {
+        FleetOverview(hosts: hosts, section: section == "Activity" ? "Runs" : section, agents: activityAgents,
+                      requestedRunID: section == "Activity" ? activityRunID : nil,
+                      onShowAgents: section == "Activity" ? { activityRunsOpen = false } : nil,
+                      onOpen: { openWorkspace($0) }, onSelectAgent: {
+            openWorkspace($0.host, lane: $0.lane, inActivity: true)
+        })
+    }
+
     private func hostRow(_ host: FleetHost) -> some View {
         let workspace = sidebarHost(host)
         let selected = section == "Workspace" && workspace.id == selectedHost
@@ -580,6 +628,17 @@ private struct FleetWindow: View {
                     .padding(.leading, 19)
                     .accessibilityLabel("\(agent.label), \(agent.statusLabel == "—" ? "status unavailable" : agent.statusLabel)")
                     .help(agent.label)
+                    .contextMenu {
+                        if agent.schedule == nil {
+                            Button("Rename Agent…") {
+                                openWorkspace(workspace, lane: lane, inActivity: section == "Activity", action: .rename)
+                            }
+                            Button("Delete Agent…", role: .destructive) {
+                                openWorkspace(workspace, lane: lane, inActivity: section == "Activity", action: .delete)
+                            }
+                            .disabled(agent.status == "running")
+                        }
+                    }
                 }
             }
         }
@@ -590,25 +649,18 @@ private struct FleetWindow: View {
     }
 
     private func agentRows(_ workspace: FleetHost) -> [SidebarAgent] {
-        let remote = sidebarAgents[workspace] ?? []
-        let known = remote.filter { $0.schedule == nil && ["codex", "cursor"].contains($0.agent) && $0.lane > 0 }
-        guard current == workspace, let local = localAgentLabels[workspace] else {
-            return known + remote.filter { $0.schedule != nil }
+        (sidebarAgents[workspace] ?? []).filter {
+            $0.schedule != nil || (["codex", "cursor"].contains($0.agent) && $0.lane > 0)
         }
-        let knownByLane = Dictionary(uniqueKeysWithValues: known.map {
-            (FleetAgentLane(agent: $0.agent, lane: $0.lane), $0)
-        })
-        let manual = local.keys.sorted { ($0.agent, $0.lane) < ($1.agent, $1.lane) }.map { lane in
-            SidebarAgent(agent: lane.agent, lane: lane.lane, status: knownByLane[lane]?.status ?? "ready",
-                         title: knownByLane[lane]?.title, schedule: nil, name: local[lane])
-        }
-        return manual + remote.filter { $0.schedule != nil }
     }
 
     private func monitorSidebar(_ query: SidebarQuery) async {
         guard query.active, !query.hosts.isEmpty else { return }
         let currentHosts = Set(query.hosts)
         sidebarAgents = sidebarAgents.filter { currentHosts.contains($0.key) }
+        let destinations = Set(query.hosts.map(\.ssh))
+        reachable = reachable.filter { destinations.contains($0.key) }
+        liveRuns = liveRuns.filter { destinations.contains($0.key) }
         await withTaskGroup(of: Void.self) { group in
             for workspaces in Dictionary(grouping: query.hosts, by: \.ssh).values {
                 group.addTask { await monitorSidebarDestination(workspaces, query: query) }
@@ -620,23 +672,25 @@ private struct FleetWindow: View {
         guard let target = workspaces.first else { return }
         let repos = Set(workspaces.map(\.repo)).sorted()
         while !Task.isCancelled {
-            let requestedLabels = localAgentLabels
-            let rows: [String: [SidebarAgent]]
+            let roster: SidebarRoster?
             do {
-                let reply = try await FleetBridge.call(target, ["op": "sidebar_agents", "repos": repos])
-                let data = try JSONSerialization.data(withJSONObject: reply["workspaces"] ?? NSNull(), options: .fragmentsAllowed)
-                rows = try JSONDecoder().decode([String: [SidebarAgent]].self, from: data)
+                let reply = try await FleetBridge.call(target, ["op": "sidebar_agents", "repos": repos, "live": query.dashboard])
+                roster = try JSONDecoder().decode(SidebarRoster.self, from: JSONSerialization.data(withJSONObject: reply))
             } catch {
-                rows = [:]
+                roster = nil
             }
             guard !Task.isCancelled, query == sidebarQuery else { return }
-            var updated = sidebarAgents
-            for workspace in workspaces where requestedLabels[workspace] == localAgentLabels[workspace] {
-                updated[workspace] = rows[workspace.repo]
+            if reachable[target.ssh] != (roster != nil) { reachable[target.ssh] = roster != nil }
+            if let roster {
+                var updated = sidebarAgents
+                for workspace in workspaces {
+                    updated[workspace] = roster.workspaces[workspace.repo]
+                }
+                if sidebarAgents != updated { sidebarAgents = updated }
+                if let runs = roster.liveRuns, liveRuns[target.ssh] != runs { liveRuns[target.ssh] = runs }
             }
-            if sidebarAgents != updated { sidebarAgents = updated }
-            let running = rows.values.contains { $0.contains { $0.status == "running" } }
-            do { try await Task.sleep(for: .seconds(running ? 3 : 8)) } catch { return }
+            let running = roster?.workspaces.values.contains { $0.contains { $0.status == "running" } } == true
+            do { try await Task.sleep(for: .seconds(query.dashboard ? 2 : running ? 3 : 8)) } catch { return }
         }
     }
 
@@ -654,16 +708,24 @@ private struct FleetWindow: View {
         }.buttonStyle(.plain)
     }
 
-    private func openWorkspace(_ host: FleetHost, lane: FleetAgentLane? = nil, inActivity: Bool = false) {
+    private func showRuns(_ id: String?) {
+        activityRunID = id
+        activityRunsOpen = true
+        activityAgentOpen = false
+    }
+
+    private func openWorkspace(_ host: FleetHost, lane: FleetAgentLane? = nil,
+                               inActivity: Bool = false, action: FleetAgentAction? = nil) {
         if current != host && dirty && !mayDiscardEdits() { return }
         if let lane {
-            laneSelection = FleetAgentLaneSelection(agent: lane.agent, lane: lane.lane)
+            laneSelection = FleetAgentLaneSelection(agent: lane.agent, lane: lane.lane, action: action)
         } else if current != host {
             laneSelection = nil
         }
         openedRepo = host.repo
         selectedHost = host.id
         activityAgentOpen = inActivity
+        if inActivity { activityRunsOpen = false }
         section = inActivity ? "Activity" : "Workspace"
     }
 

@@ -314,7 +314,7 @@ private final class WorkspaceModel: ObservableObject {
     }
 
     func deleteAgent(_ agent: WorkspaceAgent) async -> Bool {
-        guard !changingAgents, canReset(agent), let index = agents.firstIndex(of: agent) else { return false }
+        guard canDelete(agent), let index = agents.firstIndex(of: agent) else { return false }
         changingAgents = true
         resetting.insert(agent)
         defer {
@@ -341,12 +341,15 @@ private final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func selectAgent(_ selection: FleetAgentLaneSelection?) {
-        guard let selection, selection.id != lastAgentSelection else { return }
+    func canDelete(_ agent: WorkspaceAgent) -> Bool { !changingAgents && canReset(agent) }
+
+    func selectAgent(_ selection: FleetAgentLaneSelection?) -> WorkspaceAgent? {
+        guard let selection, selection.id != lastAgentSelection else { return nil }
         let agent = WorkspaceAgent(harness: selection.agent, lane: selection.lane)
-        guard agents.contains(agent) else { return }
+        guard agents.contains(agent) else { return nil }
         lastAgentSelection = selection.id
         selectedAgent = agent
+        return agent
     }
 
     func loadFolder(_ directory: String, direction: FolderNavigation = .first) async {
@@ -546,8 +549,8 @@ private final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func loadAgents() async {
-        guard !agentsLoaded else { return }
+    func loadAgents(refresh: Bool = false) async {
+        guard !agentsLoaded || (refresh && !changingAgents) else { return }
         loadError = nil
         do {
             let reply = try await FleetBridge.call(host, ["op": "workspace_agents"])
@@ -559,8 +562,9 @@ private final class WorkspaceModel: ObservableObject {
                 guard let harness = instance["agent"] as? String, ["codex", "cursor"].contains(harness),
                       let lane = instance["lane"] as? Int, lane > 0 else { continue }
                 let agent = WorkspaceAgent(harness: harness, lane: lane)
-                if !agents.contains(agent) { agents.append(agent) }
                 agentNames[agent] = instance["name"] as? String
+                if agents.contains(agent) { continue }
+                agents.append(agent)
                 sessions[agent] = instance["session"] as? String
                 guard let run = instance["run"] as? [String: Any], let id = run["id"] as? String else { continue }
                 var turn = WorkspaceTurn(id: id, prompt: run["title"] as? String ?? "", reporting: run["view"] as? String ?? "actions",
@@ -572,7 +576,7 @@ private final class WorkspaceModel: ObservableObject {
                 conversations[agent] = [turn]
                 pendingDetails.insert(id)
             }
-            selectedAgent = agents.first { activeRun($0) != nil } ?? agents.first
+            if selectedAgent == nil { selectedAgent = agents.first { activeRun($0) != nil } ?? agents.first }
             agentsLoaded = true
         } catch is CancellationError {
             return
@@ -910,9 +914,15 @@ private struct WorkspacePane: View {
         }
         .task { await model.loadSettings() }
         .task { await model.loadAgents() }
-        .onChange(of: selectedAgentLane, initial: true) { _, selection in model.selectAgent(selection) }
+        .task(id: selectedAgentLane?.id) {
+            guard model.agentsLoaded, let selection = selectedAgentLane else { return }
+            if selection.action == .rename || !model.agents.contains(WorkspaceAgent(harness: selection.agent, lane: selection.lane)) {
+                await model.loadAgents(refresh: true)
+            }
+            if !Task.isCancelled { applyAgentSelection() }
+        }
         .onChange(of: model.agentsLoaded) { _, loaded in
-            if loaded { model.selectAgent(selectedAgentLane) }
+            if loaded { applyAgentSelection() }
         }
         .onChange(of: model.sidebarAgentLabels, initial: true) { _, labels in
             onAgentLabelsChange(labels)
@@ -1017,6 +1027,22 @@ private struct WorkspacePane: View {
     private func requestClose(_ buffer: SourceBuffer) {
         guard !buffer.isSaving else { return }
         if buffer.isDirty { closing = buffer } else { model.close(buffer) }
+    }
+
+    private func applyAgentSelection() {
+        guard let agent = model.selectAgent(selectedAgentLane) else { return }
+        switch selectedAgentLane?.action {
+        case .rename:
+            panel = .agentName(agent)
+        case .delete:
+            if model.canDelete(agent) {
+                deletingAgent = agent
+            } else {
+                model.agentChangeError = "Wait for this agent to become idle before deleting it."
+            }
+        case nil:
+            break
+        }
     }
 
     private var header: some View {
@@ -1218,6 +1244,20 @@ private struct WorkspacePane: View {
                     .disabled(model.stopping.contains(id))
                     .help("Stop this task")
                 }
+                Button { panel = .agentName(agent) } label: {
+                    Image(systemName: "pencil").frame(width: 22, height: 22).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(model.changingAgents)
+                .help("Rename Agent")
+                .accessibilityLabel("Rename Agent")
+                Button(role: .destructive) { deletingAgent = agent } label: {
+                    Image(systemName: "trash").frame(width: 22, height: 22).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.canDelete(agent))
+                .help(model.activeRun(agent) == nil ? "Delete Agent" : "Stop this agent before deleting it")
+                .accessibilityLabel("Delete Agent")
                 Menu {
                     Button("Rename Agent…") { panel = .agentName(agent) }
                         .disabled(model.changingAgents)
@@ -1252,7 +1292,7 @@ private struct WorkspacePane: View {
                     Button("Composer Commands") { showingCommands = agent }
                     Divider()
                     Button("Delete Agent…", role: .destructive) { deletingAgent = agent }
-                        .disabled(!model.canReset || model.changingAgents)
+                        .disabled(!model.canDelete(agent))
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }

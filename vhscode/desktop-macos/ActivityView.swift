@@ -1,15 +1,5 @@
 import SwiftUI
 
-struct FleetActivityAgent: Identifiable {
-    let host: FleetHost
-    let lane: FleetAgentLane
-    let label: String
-    let status: String
-    let statusLabel: String
-
-    var id: String { "\(host.id)/\(lane.agent)/\(lane.lane)" }
-}
-
 private struct FleetRunRow: Identifiable {
     let host: FleetHost
     let key: String
@@ -110,11 +100,10 @@ struct FleetOverview: View {
     let hosts: [FleetHost]
     let section: String
     let agents: [FleetActivityAgent]
-    let activeAgentID: String?
-    let showsAgent: Bool
+    var requestedRunID: String? = nil
+    var onShowAgents: (() -> Void)? = nil
     let onOpen: (FleetHost) -> Void
     let onSelectAgent: (FleetActivityAgent) -> Void
-    let onShowRuns: () -> Void
 
     @Environment(\.workbenchPalette) private var palette
     @Environment(\.scenePhase) private var scenePhase
@@ -153,13 +142,11 @@ struct FleetOverview: View {
         VStack(alignment: .leading, spacing: 17) {
             header
             if !hosts.isEmpty {
-                if !showsAgent { metrics }
+                if schedulesOnly || risksOnly { metrics }
                 connectionNotice
             }
             GeometryReader { geometry in
-                if showsAgent {
-                    list
-                } else if geometry.size.width >= 735 {
+                if geometry.size.width >= 735 {
                     HStack(spacing: 12) {
                         list.frame(minWidth: 370, maxWidth: .infinity)
                         detail.frame(width: min(380, geometry.size.width * 0.43))
@@ -185,6 +172,9 @@ struct FleetOverview: View {
         }
         .task(id: schedulesOnly ? nil : selectedRun.map { "\($0.id):\($0.status)" }) {
             await loadEvents()
+        }
+        .onChange(of: requestedRunID, initial: true) { _, id in
+            if let id { runSelection = id }
         }
         .onChange(of: section) { showEvents = false }
         .sheet(item: $draft) { draft in
@@ -218,11 +208,12 @@ struct FleetOverview: View {
                 Text(section)
                     .font(.system(size: 28, weight: .semibold))
                     .accessibilityAddTraits(.isHeader)
-                Text(schedulesOnly ? "Manage recurring work on your Fleet hosts."
-                     : risksOnly ? "Inspect failures and breakage reported by agents."
-                     : "Track agent work across your Fleet hosts.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+                if schedulesOnly || risksOnly {
+                    Text(schedulesOnly ? "Manage recurring work on your Fleet hosts."
+                         : "Inspect failures and breakage reported by agents.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 4)
             if refreshing {
@@ -238,10 +229,8 @@ struct FleetOverview: View {
             .help("Refresh hosts")
             .accessibilityLabel("Refresh hosts")
             .disabled(refreshing || hosts.isEmpty)
-            if showsAgent {
-                Button(action: onShowRuns) { Image(systemName: "sidebar.trailing") }
-                    .help("Show run details")
-                    .accessibilityLabel("Show run details")
+            if let onShowAgents {
+                Button(action: onShowAgents) { Label("Back to Activity", systemImage: "arrow.left") }
             }
             if schedulesOnly {
                 Button {
@@ -263,10 +252,6 @@ struct FleetOverview: View {
             } else if risksOnly {
                 metric("Flagged runs", runs.count, icon: "exclamationmark.triangle", color: palette.caution)
                 metric("Failed", runs.filter { $0.status == "failed" }.count, icon: "xmark.circle", color: palette.negative)
-            } else {
-                metric("Running", allRuns.filter { $0.status == "running" }.count, icon: "bolt", color: palette.tint)
-                metric("Completed", allRuns.filter { $0.status == "completed" }.count, icon: "checkmark.circle", color: .secondary)
-                metric("Flagged", allRuns.filter(\.hasRisk).count, icon: "exclamationmark.triangle", color: palette.caution)
             }
         }
     }
@@ -309,16 +294,14 @@ struct FleetOverview: View {
 
     private var list: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if agents.isEmpty {
-                listHeading(schedulesOnly ? "All Schedules" : risksOnly ? "Reported Risks" : "Recent Runs",
-                            count: schedulesOnly ? schedules.count : runs.count)
-            }
+            listHeading(schedulesOnly ? "All Schedules" : risksOnly ? "Reported Risks" : "Recent Runs",
+                        count: schedulesOnly ? schedules.count : runs.count)
             if hosts.isEmpty {
                 empty("No hosts configured", "Add a host to view Fleet activity.", icon: "server.rack")
             } else if schedulesOnly, schedules.isEmpty {
                 empty(refreshing ? "Loading schedules…" : "No schedules yet",
                       refreshing ? "" : "Create a schedule to run a task at an interval.", icon: "calendar")
-            } else if !schedulesOnly, runs.isEmpty, agents.isEmpty {
+            } else if !schedulesOnly, runs.isEmpty {
                 empty(refreshing ? "Loading runs…" : risksOnly ? "No reported risks" : "No activity yet",
                       refreshing ? "" : risksOnly ? "Risks appear when a run flags a problem." : "Run an agent task to see it here.",
                       icon: risksOnly ? "checkmark.shield" : "waveform.path")
@@ -337,15 +320,6 @@ struct FleetOverview: View {
                                 ) { scheduleSelection = row.id }
                             }
                         } else {
-                            if !agents.isEmpty {
-                                listHeading("Agents", count: agents.count)
-                                ForEach(agents) { agent in
-                                    rowButton(agent.label, metadata: agent.host.label, note: "", status: agent.statusLabel,
-                                              color: statusColor(agent.status), active: activeAgentID == agent.id) { onSelectAgent(agent) }
-                                        .help(agent.host.repo)
-                                }
-                                listHeading("Recent Runs", count: runs.count)
-                            }
                             ForEach(runs) { row in
                                 rowButton(
                                     row.title,
@@ -358,7 +332,6 @@ struct FleetOverview: View {
                                 ) {
                                     runSelection = row.id
                                     showEvents = false
-                                    if showsAgent { onShowRuns() }
                                 }
                             }
                         }
