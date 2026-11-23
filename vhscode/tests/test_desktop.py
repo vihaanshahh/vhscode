@@ -75,6 +75,37 @@ if name == "codex" and arguments == ["app-server", "--listen", "stdio://"]:
             result = {"thread": next((item for item in threads if item["id"] == request["params"]["threadId"]), None)}
         print(json.dumps({"id": request["id"], "result": result}), flush=True)
         sys.exit()
+    if request["method"] in ("thread/start", "thread/resume"):
+        assert request["params"]["approvalPolicy"] == "on-request", request
+        thread_id = "approval-thread"
+        print(json.dumps({"id": request["id"], "result": {"thread": {"id": thread_id}}}), flush=True)
+        request = json.loads(sys.stdin.readline())
+        assert request["method"] == "turn/start" and request["params"]["threadId"] == thread_id, request
+        turn_id = "approval-turn"
+        print(json.dumps({"id": request["id"], "result": {"turn": {"id": turn_id}}}), flush=True)
+        context = {"threadId": thread_id, "turnId": turn_id}
+        print(json.dumps({
+            "id": "command-approval", "method": "item/commandExecution/requestApproval",
+            "params": {**context, "command": "gh issue view 123", "cwd": str(Path.cwd())},
+        }), flush=True)
+        assert json.loads(sys.stdin.readline()) == {
+            "id": "command-approval", "result": {"decision": "accept"},
+        }
+        print(json.dumps({
+            "id": 2, "method": "mcpServer/elicitation/request",
+            "params": {**context, "mode": "form", "serverName": "GitHub",
+                       "message": "Review issue 123", "requestedSchema": {"type": "object", "properties": {}}},
+        }), flush=True)
+        assert json.loads(sys.stdin.readline()) == {
+            "id": 2, "result": {"action": "decline", "content": None, "_meta": None},
+        }
+        print(json.dumps({"method": "item/completed", "params": {**context, "item": {
+            "type": "agentMessage", "id": "answer", "phase": "final_answer", "text": "Approval choices delivered.",
+        }}}), flush=True)
+        print(json.dumps({"method": "turn/completed", "params": {
+            "threadId": thread_id, "turn": {"id": turn_id, "status": "completed"},
+        }}), flush=True)
+        sys.exit()
     assert request["method"] == "model/list" and not request["params"]["includeHidden"], request
     print(json.dumps({"id": request["id"], "result": {"data": [
         {"id": "fixture-alias", "model": "fixture-codex", "displayName": "Fixture Codex"},
@@ -421,6 +452,47 @@ class DesktopBridgeTest(unittest.TestCase):
         self.assertEqual(native.stdout.strip(), "Native Cursor resumed")
         self.success(self.request("set_cli_command", agent="cursor", command=""))
         self.assertIn("returned status 99", self.request("test_cli_command", agent="cursor", command="")["error"])
+
+    def test_codex_approval_cards_wait_for_one_time_decisions(self):
+        run_id = self.success(self.request(
+            "submit", agent="codex", prompt="Approval fixture", approval_cards=True,
+        ))["id"]
+
+        def wait_for_approval(count):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                detail = self.success(self.request("detail", id=run_id, revision=""))
+                self.assertEqual(detail["run"]["status"], "running", detail)
+                cards = detail.get("approvals", [])
+                if len(cards) == count:
+                    return detail, cards[-1]
+                time.sleep(0.1)
+            self.fail(f"Approval {count} did not arrive")
+
+        first_detail, command = wait_for_approval(1)
+        self.assertIn("gh issue view 123", command["detail"])
+        self.assertIsNone(command["decision"])
+        self.assertEqual(self.success(self.request("detail", id=run_id, revision=first_detail["revision"])),
+                         {"unchanged": True})
+        self.success(self.request("decide_approval", id=run_id, approval=command["id"], decision="accept"))
+        self.assertIn("no longer pending", self.request(
+            "decide_approval", id=run_id, approval=command["id"], decision="decline",
+        )["error"])
+        second_detail, github = wait_for_approval(2)
+        self.assertNotEqual(first_detail["revision"], second_detail["revision"])
+        self.assertEqual(second_detail["approvals"][0]["decision"], "accept")
+        self.assertEqual(github["title"], "Approve GitHub request")
+        self.success(self.request("decide_approval", id=run_id, approval=github["id"], decision="decline"))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            detail = self.success(self.request("detail", id=run_id))
+            if detail["run"]["status"] != "running":
+                self.assertEqual(detail["run"]["status"], "completed", detail)
+                self.assertEqual(detail["run"]["outcome"], "Approval choices delivered.")
+                self.assertEqual(detail["approvals"][1]["decision"], "decline")
+                return
+            time.sleep(0.1)
+        self.fail("Codex did not resume after the approval decision")
 
     def test_cursor_catalog_reports_host_authentication_and_network_errors(self):
         for error, expected in (

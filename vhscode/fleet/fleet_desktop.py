@@ -373,6 +373,9 @@ def _submit(root, request):
         raise ValueError("Choose up to 32 repository context paths")
     if session is not None and (not isinstance(session, str) or not 1 <= len(session) <= 512 or not session.isprintable()):
         raise ValueError("Choose a valid session to continue")
+    approval_cards = request.get("approval_cards", False)
+    if type(approval_cards) is not bool:
+        raise ValueError("Invalid approval card setting")
     if type(quiet) is not bool:
         raise ValueError("Invalid classifier setting")
     for tag in tags:
@@ -402,6 +405,7 @@ def _submit(root, request):
                     "repo": str(root), "agent": agent, "prompt": prompt, "view": view,
                     "session": session, "tags": tags, "filter": quiet,
                     "model": settings["model"], "generation": settings["generation"], "lane": lane,
+                    "approval_cards": approval_cards and agent == "codex",
                 }).encode("ascii"))
                 payload.seek(0)
                 subprocess.Popen(
@@ -448,6 +452,7 @@ def _run(run_id, fd):
             Path(request["repo"]), request["agent"], request["prompt"], set(request["tags"]),
             request["session"], request["filter"], on_event=on_event, detailed=True, silent=True,
             view=request["view"], model=request["model"],
+            interactive_run=run_id if request.get("approval_cards") else None,
         )
         if session and status == "completed":
             from fleet_models import remember

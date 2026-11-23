@@ -59,7 +59,7 @@ class HarnessError(RuntimeError):
 def run(
     root: Path, agent: str, prompt: str, tags: set[str], session: str | None, quiet: bool,
     *, on_event: Callable[[str, str], None] | None = None, detailed: bool = False, silent: bool = False,
-    view: str = "actions", model: str | None = None,
+    view: str = "actions", model: str | None = None, interactive_run: str | None = None,
 ) -> str | None:
     """Run one turn and report public events, ending with one status event."""
     if view not in ("actions", "summary", "risks"):
@@ -69,7 +69,15 @@ def run(
     failure = ""
     try:
         command, environment = _require_harness(root, agent)
-        code = _run_process(root, agent, command, environment, prompt, tags, session, stream, model)
+        if tags:
+            paths = "\n".join(f"- {json.dumps(path, ensure_ascii=True)}" for path in sorted(tags))
+            prompt = f"{prompt}\n\nRepository-relative context paths:\n{paths}"
+        if interactive_run is not None and agent == "codex":
+            from fleet_codex import run_approval_turn
+
+            code = run_approval_turn(root, command, environment, prompt, session, stream, model, interactive_run)
+        else:
+            code = _run_process(root, agent, command, environment, prompt, session, stream, model)
         if code:
             failure = f"{agent} exited with status {code}."
         elif stream.failed:
@@ -94,12 +102,7 @@ def run(
 
 
 def _run_process(root: Path, agent: str, command: list[str], environment: dict[str, str],
-                 prompt: str, tags: set[str], session: str | None, stream: _Stream, model: str | None) -> int:
-
-    if tags:
-        paths = "\n".join(f"- {json.dumps(path, ensure_ascii=True)}" for path in sorted(tags))
-        prompt = f"{prompt}\n\nRepository-relative context paths:\n{paths}"
-
+                 prompt: str, session: str | None, stream: _Stream, model: str | None) -> int:
     if agent == "codex":
         args = ["exec", "resume"] if session else ["exec"]
         args.append("--json")
@@ -364,22 +367,25 @@ class _Stream:
                 # The optional filter is a presentation aid.
                 pass
 
-    def consume(self, stdout, stderr) -> None:
+    def consume(self, stdout, stderr, *, on_line=None, poll=None) -> None:
+        on_line = on_line or self.on_line
         with DefaultSelector() as selector:
             for pipe in (stdout, stderr):
                 selector.register(pipe, EVENT_READ)
             lines = {pipe: bytearray() for pipe in (stdout, stderr)}
             oversized = set()
             while selector.get_map():
+                if poll is not None and poll():
+                    return
                 self.flush_progress()
-                for key, _ in selector.select(0.05 if self.pending else None):
+                for key, _ in selector.select(0.05 if self.pending else 0.25 if poll else None):
                     pipe = key.fileobj
                     chunk = os.read(key.fd, 64 * 1024)
                     buffer = lines[pipe]
                     if not chunk:
                         selector.unregister(pipe)
                         if buffer:
-                            self.on_line(buffer.decode("utf-8", errors="replace"), error=pipe is stderr)
+                            on_line(buffer.decode("utf-8", errors="replace"), error=pipe is stderr)
                         continue
                     while chunk:
                         part, newline, chunk = chunk.partition(b"\n")
@@ -394,7 +400,7 @@ class _Stream:
                             else:
                                 buffer.extend(part)
                                 if newline:
-                                    self.on_line(buffer.decode("utf-8", errors="replace"), error=pipe is stderr)
+                                    on_line(buffer.decode("utf-8", errors="replace"), error=pipe is stderr)
                                     buffer.clear()
                         if newline:
                             oversized.discard(pipe)
@@ -427,14 +433,17 @@ class _Stream:
             return False
         return True
 
-    def emit(self, kind: str, text: str, *, progress: bool = False, visible: bool = True) -> None:
+    def redact(self, text: str) -> str:
         for credential in self.credentials:
             text = text.replace(credential, "[redacted]")
+        return _clean(text).rstrip("\r\n")
+
+    def emit(self, kind: str, text: str, *, progress: bool = False, visible: bool = True) -> None:
         limit = MAX_TOOL_PREVIEW
         if kind == "result" and self.silent:
             from fleet_jobs import MAX_RESULT_TEXT
             limit = MAX_RESULT_TEXT
-        text = _preview(_clean(text).rstrip("\r\n"), limit)
+        text = _preview(self.redact(text), limit)
         if not text.strip():
             return
         if self.silent:

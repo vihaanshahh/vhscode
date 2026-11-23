@@ -92,6 +92,14 @@ def _database(directory):
                 at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS run_events ON events(run_id, seq);
+            CREATE TABLE IF NOT EXISTS approvals (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                decision TEXT
+            );
+            CREATE INDEX IF NOT EXISTS run_approvals ON approvals(run_id);
             CREATE TABLE IF NOT EXISTS scheduler (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 runtime TEXT NOT NULL
@@ -245,6 +253,31 @@ def event(run_id, kind, text):
             _record(db, run_id, kind, text)
 
 
+def request_approval(run_id, title, detail):
+    with _connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        count = db.execute("SELECT COUNT(*) FROM approvals WHERE run_id=?", (run_id,)).fetchone()[0]
+        if count >= MAX_EVENTS:
+            raise ValueError("This run reached Fleet's approval limit.")
+        identifier = uuid4().hex
+        db.execute("INSERT INTO approvals(id, run_id, title, detail) VALUES (?, ?, ?, ?)",
+                   (identifier, run_id, title, detail))
+    return identifier
+
+
+def approval_decisions(run_id):
+    with _connect() as db:
+        return {row["id"]: row["decision"] for row in db.execute(
+            "SELECT id, decision FROM approvals WHERE run_id=? AND decision IS NOT NULL", (run_id,)
+        )}
+
+
+def expire_approval(run_id, identifier):
+    with _connect() as db:
+        db.execute("UPDATE approvals SET decision='expired' WHERE run_id=? AND id=? AND decision IS NULL",
+                   (run_id, identifier))
+
+
 def end_run(run_id, status, *, error=None, session=None):
     if status not in TERMINAL:
         raise ValueError("Invalid run status")
@@ -322,10 +355,13 @@ def rpc(request):
         with _connect() as db:
             db.execute("BEGIN")
             run = db.execute(RUNS_VIEW + " WHERE id = ?", (run_id,)).fetchone()
+            approvals = db.execute(
+                "SELECT id, title, detail, decision FROM approvals WHERE run_id=? ORDER BY rowid", (run_id,)
+            ).fetchall()
             revision = None
             if "revision" in request and run is not None:
                 sequence = db.execute("SELECT MAX(seq) FROM events WHERE run_id=?", (run_id,)).fetchone()[0]
-                revision = f"{run['status']}:{sequence}"
+                revision = f"{run['status']}:{sequence}:{len(approvals)}:{sum(row['decision'] is not None for row in approvals)}"
                 if revision == request["revision"]:
                     return {"unchanged": True}
             rows = db.execute(
@@ -333,9 +369,25 @@ def rpc(request):
             ).fetchall()
         metadata = dict(run, detached=bool(run["detached"])) if run is not None else None
         reply = {"events": [dict(row) for row in rows], "run": metadata}
+        if approvals:
+            reply["approvals"] = [dict(row) for row in approvals]
         if revision is not None:
             reply["revision"] = revision
         return reply
+    if op == "decide_approval":
+        decision = request.get("decision")
+        if decision not in ("accept", "decline"):
+            raise ValueError("Choose whether to approve or decline this request.")
+        with _connect() as db:
+            result = db.execute("""
+                UPDATE approvals SET decision=?
+                WHERE id=? AND run_id=? AND decision IS NULL
+                AND EXISTS (SELECT 1 FROM runs WHERE runs.id=approvals.run_id
+                            AND detached=1 AND status='running' AND cancel_requested=0)
+            """, (decision, request.get("approval"), request.get("id")))
+            if not result.rowcount:
+                raise ValueError("This approval is no longer pending.")
+        return {}
     if op == "cancel":
         with _connect() as db:
             result = db.execute(

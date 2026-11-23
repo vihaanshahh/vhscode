@@ -76,6 +76,13 @@ private struct AgentEvent: Identifiable {
     let text: String
 }
 
+private struct AgentApproval: Identifiable {
+    let id: String
+    let title: String
+    let detail: String
+    let decision: String?
+}
+
 private struct WorkspaceTurn: Identifiable {
     let id: String
     var prompt: String
@@ -85,6 +92,7 @@ private struct WorkspaceTurn: Identifiable {
     var risk = ""
     var outcome = ""
     var events: [AgentEvent] = []
+    var approvals: [AgentApproval] = []
     var isActive: Bool { ["queued", "running"].contains(status) }
     var requiresCursorTrust: Bool {
         events.contains { ["error", "risk"].contains($0.kind) && $0.text.localizedCaseInsensitiveContains("Workspace Trust Required") }
@@ -175,6 +183,7 @@ private final class WorkspaceModel: ObservableObject {
     @Published private(set) var cursorLoginMessage: String?
     @Published private(set) var agentsLoaded = false
     @Published var stopping = Set<String>()
+    @Published private(set) var answeringApprovals = Set<String>()
     @Published var notice: String?
     @Published private(set) var workspaceModels: [String: String] = [:]
     @Published private(set) var savingModels = Set<String>()
@@ -639,13 +648,14 @@ private final class WorkspaceModel: ObservableObject {
         composerErrors[agent] = nil
     }
 
-    func submit(from agent: WorkspaceAgent) async {
+    func submit(from agent: WorkspaceAgent, approvalCards: Bool) async {
         guard canSend(from: agent), let draft = drafts[agent] else { return }
         let prompt = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard ComposerCommand.parse(prompt) == nil else { return }
         let request: [String: Any] = [
             "op": "submit", "agent": agent.harness, "lane": agent.lane, "prompt": prompt,
             "tags": draft.tags.sorted(), "view": draft.reporting, "filter": draft.filterProgress,
+            "approval_cards": agent.harness == "codex" && approvalCards,
         ]
         submitting.insert(agent)
         composerErrors[agent] = nil
@@ -677,6 +687,26 @@ private final class WorkspaceModel: ObservableObject {
         }
     }
 
+    func answerApproval(_ approval: AgentApproval, run: String, agent: WorkspaceAgent, accept: Bool) async {
+        guard activeRun(agent) == run, answeringApprovals.insert(approval.id).inserted else { return }
+        composerErrors[agent] = nil
+        defer { answeringApprovals.remove(approval.id) }
+        do {
+            _ = try await FleetBridge.call(host, [
+                "op": "decide_approval", "id": run, "approval": approval.id,
+                "decision": accept ? "accept" : "decline",
+            ])
+            if let index = conversations[agent]?.firstIndex(where: { $0.id == run }),
+               let card = conversations[agent]?[index].approvals.firstIndex(where: { $0.id == approval.id }) {
+                conversations[agent]?[index].approvals[card] = AgentApproval(
+                    id: approval.id, title: approval.title, detail: approval.detail, decision: accept ? "accept" : "decline"
+                )
+            }
+        } catch {
+            composerErrors[agent] = error.localizedDescription
+        }
+    }
+
     func monitor(_ id: String?, agent: WorkspaceAgent) async {
         guard let id else { return }
         var revision = ""
@@ -697,6 +727,11 @@ private final class WorkspaceModel: ObservableObject {
                     turn.action = run["action"] as? String ?? ""
                     turn.risk = run["risk"] as? String ?? ""
                     turn.outcome = run["outcome"] as? String ?? ""
+                    turn.approvals = (reply["approvals"] as? [[String: Any]] ?? []).compactMap { row in
+                        guard let id = row["id"] as? String, let title = row["title"] as? String,
+                              let detail = row["detail"] as? String else { return nil }
+                        return AgentApproval(id: id, title: title, detail: detail, decision: row["decision"] as? String)
+                    }
                     let visibleKinds: Set<String>? = switch turn.reporting {
                     case "summary": ["result", "error", "risk"]
                     case "risks": ["error", "risk"]
@@ -751,6 +786,7 @@ private struct WorkspacePane: View {
     @State private var confirmingCursorTrust = false
     @State private var terminalError: String?
     @AppStorage("FleetExplorerVisible") private var explorerVisible = true
+    @AppStorage("FleetCodexApprovalCards") private var codexApprovalCards = true
     private let accent = Color(nsColor: .systemTeal)
 
     var body: some View {
@@ -1051,6 +1087,9 @@ private struct WorkspacePane: View {
                         .disabled(!model.canReset)
                     Button("Open Workspace Shell") { openTerminal() }
                     Divider()
+                    if agent.harness == "codex" {
+                        Toggle("Approval Cards", isOn: $codexApprovalCards)
+                    }
                     if agent.harness == "cursor" {
                         Button("Sign In to Cursor…") { Task { await model.signInToCursor() } }
                             .disabled(model.cursorSigningIn)
@@ -1090,7 +1129,10 @@ private struct WorkspacePane: View {
                     ForEach(model.turns) { turn in
                         let offerTrust = agent.harness == "cursor" && !model.cursorTrusted && turn.requiresCursorTrust
                         TurnCard(turn: turn, trustWorkspace: offerTrust ? { confirmingCursorTrust = true } : nil,
-                                 openTerminal: turn.status == "failed" && model.canReset ? { openTerminal(agent: agent) } : nil)
+                                 openTerminal: turn.status == "failed" && model.canReset ? { openTerminal(agent: agent) } : nil,
+                                 answering: model.answeringApprovals) { approval, accept in
+                            Task { await model.answerApproval(approval, run: turn.id, agent: agent, accept: accept) }
+                        }
                     }
                 }
                 .padding(12)
@@ -1249,7 +1291,7 @@ private struct WorkspacePane: View {
         showingCommands = nil
         showingStatus = nil
         guard let invocation = ComposerCommand.parse(input) else {
-            Task { await model.submit(from: agent) }
+            Task { await model.submit(from: agent, approvalCards: codexApprovalCards) }
             return
         }
         if invocation.command != .resume, !invocation.argument.isEmpty {
@@ -2002,6 +2044,8 @@ private struct TurnCard: View {
     let turn: WorkspaceTurn
     var trustWorkspace: (() -> Void)?
     var openTerminal: (() -> Void)?
+    let answering: Set<String>
+    let answer: (AgentApproval, Bool) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -2045,6 +2089,30 @@ private struct TurnCard: View {
                             .textSelection(.enabled)
                     }
                 }
+            }
+            ForEach(turn.approvals) { approval in
+                VStack(alignment: .leading, spacing: 7) {
+                    Label(approval.title, systemImage: "hand.raised.fill")
+                        .font(.caption.weight(.semibold))
+                    Text(approval.detail)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                    if approval.decision == nil && turn.isActive {
+                        HStack {
+                            Button("Decline") { answer(approval, false) }
+                            Button("Approve Once") { answer(approval, true) }.buttonStyle(.borderedProminent)
+                        }
+                        .disabled(answering.contains(approval.id))
+                    } else {
+                        Text(approval.decision == "accept" ? "Approved" : approval.decision == "decline" ? "Declined" : "Request ended")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.orange.opacity(0.35)))
             }
             if let trustWorkspace {
                 Button("Trust Workspace for Cursor…", action: trustWorkspace)

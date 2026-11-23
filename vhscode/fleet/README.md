@@ -20,6 +20,8 @@ Choose **Agent options → Edit Agent Command…** or type `/command` in the com
 
 Choose **Open Agent in Terminal** or type `/native` to use the CLI interactively in the workspace and resume the current session when available. Use this to respond to Codex or Cursor trust and approval prompts. **Open Workspace Shell** or `/shell` opens a login shell for checking the installation, signing in manually, or running a CLI command directly. For SSH workspaces, Terminal connects to the workspace machine using your OpenSSH settings. You can also launch a shell from the SSH workspace settings while troubleshooting a connection.
 
+Codex desktop runs show approval cards for shell commands and supported GitHub or other MCP confirmations when Codex requests a decision. Review the command or confirmation and choose **Approve Once** or **Decline** in the conversation. **Agent options → Approval Cards** controls this behavior for new desktop runs. Use **Open Agent in Terminal** for other interactive requests.
+
 ### Running from a source checkout
 
 Use the fork's launcher from this checkout. Fleet runs on macOS or Linux with Python 3.10+ and a terminal. Install and authenticate the Codex or Cursor CLI on each machine where you want that agent to work.
